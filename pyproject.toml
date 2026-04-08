@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolip-svae"
+version = "0.1.0"
+description = "Spectral Variational Autoencoder — Omega Tokens on S^15"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "AbstractPhil", email = ""},
+]
+keywords = ["svd", "autoencoder", "geometric-deep-learning", "spectral", "omega-tokens"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "numpy>=1.24.0",
+    "huggingface-hub>=0.20.0",
+    "geolip-core @ git+https://github.com/AbstractEyes/geolip-core.git",
+]
+
+[project.optional-dependencies]
+diagnostic = [
+    "datasets>=2.16.0",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.65.0",
+]
+all = ["geolip-svae[diagnostic]"]
+
+[project.urls]
+Homepage = "https://github.com/AbstractEyes/geolip-svae"
+Repository = "https://github.com/AbstractEyes/geolip-svae"
+Models = "https://huggingface.co/AbstractPhil/geolip-SVAE"
+
+[tool.setuptools.packages.find]
+include = ["geolip_svae*"]
