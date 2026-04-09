@@ -95,12 +95,12 @@ def gen_known_noise(t, s, rng=None):
         alpha = rng.uniform(0.2, 0.8)
         return alpha * torch.randn(3, s, s) + (1 - alpha) * (torch.rand(3, s, s) * 2 - 1)
     elif t == 12:
-        img = torch.zeros(3, s, s); h2 = s // 2
-        img[:, :h2, :h2] = torch.randn(3, h2, h2)
-        img[:, :h2, h2:] = torch.rand(3, h2, h2) * 2 - 1
-        img[:, h2:, :h2] = _pink((3, h2, h2)) / 2
-        img[:, h2:, h2:] = torch.where(torch.rand(3, h2, h2) > 0.5,
-                                         torch.ones(3, h2, h2), -torch.ones(3, h2, h2))
+        img = torch.zeros(3, s, s); h2 = s // 2; w2 = s // 2
+        img[:, :h2, :w2] = torch.randn(3, h2, w2)
+        img[:, :h2, w2:s] = (torch.rand(3, h2, s - w2) * 2 - 1)
+        img[:, h2:s, :w2] = _pink((3, s - h2, w2)) / 2
+        img[:, h2:s, w2:s] = torch.where(torch.rand(3, s - h2, s - w2) > 0.5,
+                                           torch.ones(3, s - h2, s - w2), -torch.ones(3, s - h2, s - w2))
         return img
     elif t == 13:
         return torch.tan(math.pi * (torch.rand(3, s, s) - 0.5)).clamp(-3, 3)
