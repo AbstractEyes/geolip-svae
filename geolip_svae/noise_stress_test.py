@@ -15,7 +15,9 @@ Tests:
 
 Usage:
     python freckles_stress_test.py --checkpoint /path/to/best.pt
-    python freckles_stress_test.py --model v40_freckles_noise
+
+Colab:
+    !python -m geolip_svae.noise_stress_test --model v41_freckles_256
 """
 
 import os
