@@ -248,7 +248,10 @@ class PatchSVAE(nn.Module):
     """Patch-based Spectral Variational Autoencoder.
 
     Encodes images as omega tokens — singular value vectors on S^{D-1}.
-    Each 16×16 patch produces D=16 singular values at 48:1 compression.
+
+    Supports multiple regimes:
+        Fresnel/Johanna: V=256, D=16, ps=16, hidden=768 (17M params)
+        Freckles:        V=48,  D=4,  ps=4,  hidden=384 (2.5M params)
 
     Args:
         V: rows per encoded matrix (default 256)
@@ -257,15 +260,26 @@ class PatchSVAE(nn.Module):
         hidden: MLP hidden dimension (default 768)
         depth: number of residual blocks (default 4)
         n_cross: number of spectral cross-attention layers (default 2)
+        n_heads: attention heads (default: min(4, D) for D>=4, else 1)
+        smooth_mid: BoundarySmooth hidden channels (default: 16 for ps>=16, else 8)
     """
     def __init__(self, V: int = 256, D: int = 16, ps: int = 16,
-                 hidden: int = 768, depth: int = 4, n_cross: int = 2):
+                 hidden: int = 768, depth: int = 4, n_cross: int = 2,
+                 n_heads: int = None, smooth_mid: int = None):
         super().__init__()
         self.matrix_v = V
         self.D = D
         self.patch_size = ps
         self.patch_dim = 3 * ps * ps
         self.mat_dim = V * D
+
+        # Resolve regime-dependent defaults
+        if n_heads is None:
+            # D=4 (Freckles): 2 heads of dim 2
+            # D=16 (Fresnel/Johanna): 4 heads of dim 4
+            n_heads = 2 if D <= 8 else min(4, D)
+        if smooth_mid is None:
+            smooth_mid = 16 if ps >= 16 else 8
 
         # Encoder
         self.enc_in = nn.Linear(self.patch_dim, hidden)
@@ -294,12 +308,12 @@ class PatchSVAE(nn.Module):
 
         # Spectral cross-attention
         self.cross_attn = nn.ModuleList([
-            SpectralCrossAttention(D, n_heads=min(4, D))
+            SpectralCrossAttention(D, n_heads=n_heads)
             for _ in range(n_cross)
         ])
 
         # Boundary smoothing
-        self.boundary_smooth = BoundarySmooth(channels=3, mid=16)
+        self.boundary_smooth = BoundarySmooth(channels=3, mid=smooth_mid)
 
     def _svd(self, A: torch.Tensor):
         """SVD via Gram-eigh in fp64. Non-negotiable precision."""

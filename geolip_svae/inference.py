@@ -27,14 +27,25 @@ HF_REPO = "AbstractPhil/geolip-SVAE"
 
 # Known versions and their descriptions
 VERSIONS = {
-    'v12_imagenet128':      'Fresnel-small 128×128 (ImageNet, 50 ep)',
-    'v13_imagenet256':      'Fresnel-base 256×256 (ImageNet, 20 ep, MSE=0.000061)',
-    'v14_noise':            'Johanna-small Gaussian 128×128 (200 ep)',
-    'v16_johanna_omega':    'Johanna-small omega 128×128 (16 types, 59 ep)',
+    # ── Fresnel (images) ──
+    'v12_imagenet128':        'Fresnel-small 128×128 (ImageNet, 50 ep, MSE=0.0000734)',
+    'v13_imagenet256':        'Fresnel-base 256×256 (ImageNet, 20 ep, MSE=0.000061)',
+    'v19_fresnel_tiny':       'Fresnel-tiny 64×64 (TinyImageNet, 300 ep)',
+
+    # ── Johanna (noise, D=16) ──
+    'v14_noise':              'Johanna-small Gaussian 128×128 (200 ep)',
+    'v16_johanna_omega':      'Johanna-small omega 128×128 (16 types, 380 ep, MSE=0.008)',
     'v18_johanna_curriculum': 'Johanna-tiny curriculum 64×64 (16 types, 300 ep)',
-    'v19_fresnel_tiny':     'Fresnel-tiny 64×64 (TinyImageNet)',
-    'v20_johanna_base':     'Johanna-base 256×256 (scheduled curriculum, 30 ep)',
-    'v22_alexandria_small': 'Alexandria-small 128×128 (Wikipedia text, 100 ep)',
+    'v20_johanna_base':       'Johanna-base 256×256 (scheduled curriculum, 60 ep)',
+
+    # ── Alexandria (text) ──
+    'v22_alexandria_small':   'Alexandria-small 128×128 (Wikipedia text, 100 ep)',
+
+    # ── Grandmaster (denoiser) ──
+    'v30_grandmaster':        'Grandmaster 128×128 (ImageNet, Johanna→denoiser, 50 ep)',
+
+    # ── Freckles (D=4, 4×4 patches) ──
+    'v40_freckles_noise':     'Freckles 64×64 (16 noise types, 100 ep, MSE=5e-6, 2.5M params)',
 }
 
 
@@ -92,11 +103,14 @@ def load_model(hf_version: str = None, checkpoint_path: str = None,
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     cfg = ckpt['config']
 
-    # Build model
+    # Build model — handle backward-compatible configs
+    # Old checkpoints may not have n_heads or smooth_mid
     model = PatchSVAE(
         V=cfg['V'], D=cfg['D'], ps=cfg['patch_size'],
         hidden=cfg['hidden'], depth=cfg['depth'],
         n_cross=cfg['n_cross_layers'],
+        n_heads=cfg.get('n_heads', None),       # None → auto from D
+        smooth_mid=cfg.get('smooth_mid', None),  # None → auto from ps
     )
     model.load_state_dict(ckpt['model_state_dict'], strict=True)
     model = model.to(device).eval()
