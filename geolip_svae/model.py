@@ -18,6 +18,10 @@ Proven configurations:
     Fresnel-base  256×256: 256 patches, MSE=0.0000610 (ImageNet-256)
     Johanna-small 128×128:  64 patches, MSE=0.029 (16 noise types)
     Johanna-base  256×256: 256 patches, MSE=0.027 (16 noise types, scheduled)
+
+Solver modes:
+    solver='default'  — standard FLEigh (no telemetry)
+    solver='conduit'  — FLEighConduit (emits ConduitPacket via last_conduit_packet)
 """
 
 import math
@@ -29,6 +33,7 @@ import torch.nn.functional as F
 # ── SVD Backend ──────────────────────────────────────────────────
 
 from geolip_core.linalg.eigh import FLEigh, _FL_MAX_N
+from geolip_core.linalg.conduit import FLEighConduit, ConduitPacket
 
 
 def gram_eigh_svd(A: torch.Tensor):
@@ -71,6 +76,43 @@ def gram_eigh_svd(A: torch.Tensor):
         U = torch.bmm(A_d, V) / S.unsqueeze(1).clamp(min=1e-16)
         Vh = V.transpose(-2, -1).contiguous()
     return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
+
+
+def gram_eigh_svd_conduit(A: torch.Tensor, conduit_solver: FLEighConduit):
+    """Thin SVD via Gram eigendecomposition WITH conduit telemetry.
+
+    Identical arithmetic to gram_eigh_svd. Additionally returns the
+    ConduitPacket capturing friction, settle, extraction_order, and
+    other adjudication evidence from the ACTUAL decomposition.
+
+    Args:
+        A: (B, M, N) tensor, M >= N
+        conduit_solver: FLEighConduit instance (on correct device)
+
+    Returns:
+        U:      (B, M, N)  left singular vectors
+        S:      (B, N)     singular values (descending)
+        Vh:     (B, N, N)  right singular vectors
+        packet: ConduitPacket — telemetry from the real decomposition
+    """
+    B, M, N = A.shape
+    orig_dtype = A.dtype
+
+    with torch.amp.autocast('cuda', enabled=False):
+        A_d = A.double()
+        G = torch.bmm(A_d.transpose(1, 2), A_d)
+
+        # FLEighConduit on the actual Gram matrix
+        packet = conduit_solver(G.float())
+
+        eigenvalues = packet.eigenvalues.double().flip(-1)
+        V = packet.eigenvectors.double().flip(-1)
+
+        S = torch.sqrt(eigenvalues.clamp(min=1e-24))
+        U = torch.bmm(A_d, V) / S.unsqueeze(1).clamp(min=1e-16)
+        Vh = V.transpose(-2, -1).contiguous()
+
+    return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype), packet
 
 
 # ── Cayley-Menger Geometric Monitoring ───────────────────────────
@@ -253,6 +295,10 @@ class PatchSVAE(nn.Module):
         Fresnel/Johanna: V=256, D=16, ps=16, hidden=768 (17M params)
         Freckles:        V=48,  D=4,  ps=4,  hidden=384 (2.5M params)
 
+    Solver modes:
+        solver='default'  — standard FLEigh (production, no telemetry)
+        solver='conduit'  — FLEighConduit (captures ConduitPacket per forward)
+
     Args:
         V: rows per encoded matrix (default 256)
         D: columns / spectral dimensions (default 16)
@@ -262,10 +308,12 @@ class PatchSVAE(nn.Module):
         n_cross: number of spectral cross-attention layers (default 2)
         n_heads: attention heads (default: min(4, D) for D>=4, else 1)
         smooth_mid: BoundarySmooth hidden channels (default: 16 for ps>=16, else 8)
+        solver: 'default' or 'conduit'
     """
     def __init__(self, V: int = 256, D: int = 16, ps: int = 16,
                  hidden: int = 768, depth: int = 4, n_cross: int = 2,
-                 n_heads: int = None, smooth_mid: int = None):
+                 n_heads: int = None, smooth_mid: int = None,
+                 solver: str = 'default'):
         super().__init__()
         self.matrix_v = V
         self.D = D
@@ -273,10 +321,13 @@ class PatchSVAE(nn.Module):
         self.patch_dim = 3 * ps * ps
         self.mat_dim = V * D
 
+        # Solver configuration
+        self.solver = solver
+        self.last_conduit_packet = None
+        self._conduit_solver = None  # lazy init
+
         # Resolve regime-dependent defaults
         if n_heads is None:
-            # D=4 (Freckles): 2 heads of dim 2
-            # D=16 (Fresnel/Johanna): 4 heads of dim 4
             n_heads = 2 if D <= 8 else min(4, D)
         if smooth_mid is None:
             smooth_mid = 16 if ps >= 16 else 8
@@ -315,9 +366,30 @@ class PatchSVAE(nn.Module):
         # Boundary smoothing
         self.boundary_smooth = BoundarySmooth(channels=3, mid=smooth_mid)
 
+    def _get_conduit_solver(self):
+        """Lazy-init conduit solver on correct device."""
+        if self._conduit_solver is None:
+            self._conduit_solver = FLEighConduit()
+        # Ensure on same device as model
+        device = self.enc_in.weight.device
+        if next(iter([]), None) is None:  # no params to check on FLEighConduit
+            self._conduit_solver = self._conduit_solver.to(device)
+        return self._conduit_solver
+
     def _svd(self, A: torch.Tensor):
-        """SVD via Gram-eigh in fp64. Non-negotiable precision."""
-        return gram_eigh_svd(A)
+        """SVD via Gram-eigh. Routes to conduit if configured.
+
+        solver='default': standard FLEigh, no telemetry
+        solver='conduit': FLEighConduit, stores ConduitPacket in self.last_conduit_packet
+        """
+        if self.solver == 'conduit':
+            conduit_solver = self._get_conduit_solver()
+            U, S, Vh, packet = gram_eigh_svd_conduit(A, conduit_solver)
+            self.last_conduit_packet = packet
+            return U, S, Vh
+        else:
+            self.last_conduit_packet = None
+            return gram_eigh_svd(A)
 
     def encode_patches(self, patches: torch.Tensor) -> dict:
         """Encode patches to omega tokens.
@@ -345,7 +417,7 @@ class PatchSVAE(nn.Module):
         M = self.enc_out(h).reshape(B * N, self.matrix_v, self.D)
         M = F.normalize(M, dim=-1)  # rows → S^{D-1}
 
-        # Exact SVD decomposition
+        # Exact SVD decomposition (routes through _svd)
         U, S, Vt = self._svd(M)
 
         # Reshape for cross-attention
