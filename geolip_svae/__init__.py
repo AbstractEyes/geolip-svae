@@ -9,7 +9,7 @@ spectral cross-attention and sphere-normalized encoding.
     out = model(images)  # out['recon'], out['svd']
 
     from geolip_svae import PatchSVAEv2
-    v2 = PatchSVAEv2.from_v1(model)  # conduit-forced decoder
+    v2 = PatchSVAEv2()  # inverse cascade decoder
 
     from geolip_svae import SpectralTokenizer, build_codebook
     codebook = build_codebook(save_path='codebook.json')
@@ -17,7 +17,7 @@ spectral cross-attention and sphere-normalized encoding.
     image, ids, strings = tokenizer.text_to_image("Hello, world!")
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from geolip_svae.model import (
     PatchSVAE,
@@ -31,8 +31,8 @@ from geolip_svae.model import (
 )
 from geolip_svae.model_v2 import (
     PatchSVAEv2,
-    ConduitDecoder,
-    ModeProcessor,
+    InverseCascadeDecoder,
+    InversePhaseBlock,
 )
 from geolip_svae.inference import load_model, load_model_v2, encode, decode, reconstruct
 from geolip_svae.spectral_codebook import (
@@ -51,10 +51,10 @@ __all__ = [
     "cv_of",
     "extract_patches",
     "stitch_patches",
-    # v2 model (conduit-forced decoder)
+    # v2 model (inverse cascade decoder)
     "PatchSVAEv2",
-    "ConduitDecoder",
-    "ModeProcessor",
+    "InverseCascadeDecoder",
+    "InversePhaseBlock",
     # Inference
     "load_model",
     "load_model_v2",
