@@ -37,7 +37,7 @@ from geolip_svae.model_v2 import (
     DecoderStage,
     GroupAttention,
 )
-from geolip_svae.inference import load_model, load_model_v2, encode, decode, reconstruct
+from geolip_svae.inference import load_model, encode, decode, reconstruct
 from geolip_svae.spectral_codebook import (
     SpectralTokenizer,
     build_codebook,
@@ -63,7 +63,6 @@ __all__ = [
     "GroupAttention",
     # Inference
     "load_model",
-    "load_model_v2",
     "encode",
     "decode",
     "reconstruct",

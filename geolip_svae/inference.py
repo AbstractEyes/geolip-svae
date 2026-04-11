@@ -9,18 +9,9 @@ Supports both v1 (PatchSVAE) and v2 (PatchSVAEv2) models.
 Usage:
     from geolip_svae import load_model, encode, decode, reconstruct
 
-    # v1 model
     model, cfg = load_model(hf_version='v50_fresnel_64')
     omega = encode(model, images)
     recon = reconstruct(model, images)
-
-    # v2 model (conduit-forced decoder)
-    from geolip_svae import load_model_v2
-    v2, cfg = load_model_v2(hf_version='v50_fresnel_64')  # init from v1 weights
-    out = v2(images)  # conduit telemetry in out['svd']['conduit_packet']
-
-    # Or load a trained v2 checkpoint directly
-    v2, cfg = load_model(hf_version='v51_fresnel_conduit')
 """
 
 import os
@@ -34,7 +25,6 @@ from geolip_svae.model_v2 import PatchSVAEv2
 
 HF_REPO = "AbstractPhil/geolip-SVAE"
 
-# Known versions and their descriptions
 VERSIONS = {
     # ── Fresnel (images) ──
     'v12_imagenet128':        'Fresnel-small 128×128 (ImageNet, 50 ep, MSE=0.0000734)',
@@ -113,16 +103,20 @@ def load_model(hf_version: str = None, checkpoint_path: str = None,
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     cfg = ckpt['config']
 
-    # Detect model type from config
     model_type = cfg.get('model_type', 'v1')
 
     if model_type == 'v2':
         model = PatchSVAEv2(
-            V=cfg['V'], D=cfg['D'], ps=cfg['patch_size'],
-            hidden=cfg['hidden'], depth=cfg['depth'],
-            n_cross=cfg['n_cross_layers'],
-            n_heads=cfg.get('n_heads', None),
-            smooth_mid=cfg.get('smooth_mid', None),
+            V=cfg.get('V', 48),
+            D=cfg.get('D', 4),
+            ps=cfg.get('patch_size', 4),
+            enc_hidden=cfg.get('enc_hidden', cfg.get('hidden', 384)),
+            enc_depth=cfg.get('enc_depth', cfg.get('depth', 4)),
+            stage_hidden=cfg.get('stage_hidden', 128),
+            stage_V=cfg.get('stage_V', 16),
+            dec_depth=cfg.get('dec_depth', 3),
+            n_cross=cfg.get('n_cross_layers', cfg.get('n_cross', 2)),
+            smooth_mid=cfg.get('smooth_mid', 8),
         )
     else:
         model = PatchSVAE(
@@ -136,106 +130,64 @@ def load_model(hf_version: str = None, checkpoint_path: str = None,
     model.load_state_dict(ckpt['model_state_dict'], strict=True)
     model = model.to(device).eval()
 
-    # Attach metadata
     cfg['_epoch'] = ckpt.get('epoch')
-    cfg['_test_mse'] = ckpt.get('test_mse')
+    cfg['_test_mse'] = ckpt.get('test_mse') or ckpt.get('val_mse')
     cfg['_path'] = path
     cfg['_model_type'] = model_type
 
     return model, cfg
 
 
-def load_model_v2(hf_version: str = None, checkpoint_path: str = None,
-                  hf_file: str = None, device: str = None,
-                  repo_id: str = HF_REPO,
-                  freeze_encoder: bool = False) -> tuple:
-    """Load a v1 checkpoint and initialize PatchSVAEv2 from it.
-
-    Copies encoder, cross-attention, and boundary smoothing from v1.
-    Decoder is NEW (conduit-forced, random init). Must be retrained.
-
-    Args:
-        hf_version: v1 checkpoint to initialize from
-        checkpoint_path: local v1 .pt file
-        hf_file: specific v1 file in HF repo
-        device: 'cuda', 'cpu', or None
-        repo_id: HuggingFace repository ID
-        freeze_encoder: if True, freeze all encoder parameters
-
-    Returns:
-        model: PatchSVAEv2 on device (train mode — decoder needs training)
-        cfg: dict of model config
-    """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Load v1 model first
-    v1_model, cfg = load_model(
-        hf_version=hf_version, checkpoint_path=checkpoint_path,
-        hf_file=hf_file, device=device, repo_id=repo_id)
-
-    # Convert to v2
-    v2_model = PatchSVAEv2.from_v1(v1_model)
-    v2_model = v2_model.to(device)
-
-    # Optionally freeze encoder
-    if freeze_encoder:
-        for name, param in v2_model.named_parameters():
-            if name.startswith(('enc_in', 'enc_blocks', 'enc_out')):
-                param.requires_grad = False
-        n_frozen = sum(1 for p in v2_model.parameters() if not p.requires_grad)
-        n_total = sum(1 for p in v2_model.parameters())
-        print(f"  Encoder frozen: {n_frozen}/{n_total} parameter groups")
-
-    cfg['_model_type'] = 'v2'
-    cfg['_v1_source'] = cfg.get('_path', hf_version)
-
-    return v2_model, cfg
-
-
 # ── Encode / Decode ──────────────────────────────────────────────
 
 @torch.no_grad()
 def encode(model, images: torch.Tensor) -> dict:
-    """Encode images to omega tokens. Works for both v1 and v2.
+    """Encode images to spectral representation.
+
+    For v1: returns SVD components from patch encoder.
+    For v2: runs full hierarchical forward, returns level 0 SVD + hierarchy.
 
     Args:
         model: PatchSVAE or PatchSVAEv2 in eval mode
-        images: (B, 3, H, W) — normalized, on same device as model
+        images: (B, 3, H, W) on same device as model
 
     Returns:
-        dict with S, S_orig, U, Vt, M, gh, gw
-        (v2 also includes conduit_packet)
+        dict with S, S_orig, U, Vt, M at minimum
     """
     model.eval()
-    from geolip_svae.model import extract_patches
-    patches, gh, gw = extract_patches(images, model.patch_size)
-    svd = model.encode_patches(patches)
-    svd['gh'] = gh
-    svd['gw'] = gw
+    out = model(images)
+    svd = out['svd']
+    ps = model.patch_size
+    _, _, H, W = images.shape
+    svd['gh'] = H // ps
+    svd['gw'] = W // ps
     return svd
 
 
 @torch.no_grad()
 def decode(model, svd: dict) -> torch.Tensor:
-    """Decode omega tokens back to images. Works for both v1 and v2.
+    """Decode spectral representation back to images.
+
+    For v1: reconstructs from U, S, Vt.
+    For v2: not supported standalone — use reconstruct() instead.
+           v2 decoder requires full hierarchical state.
 
     Args:
-        model: PatchSVAE or PatchSVAEv2 in eval mode
+        model: PatchSVAE in eval mode
         svd: dict from encode()
 
     Returns:
         images: (B, 3, H, W)
     """
     model.eval()
-    from geolip_svae.model import stitch_patches
 
     if isinstance(model, PatchSVAEv2):
-        decoded = model.decode_patches(
-            svd['U'], svd['S'], svd['Vt'], svd['conduit_packet'])
-    else:
-        decoded = model.decode_patches(svd['U'], svd['S'], svd['Vt'])
+        raise NotImplementedError(
+            "v2 decode requires full hierarchical state. "
+            "Use reconstruct(model, images) for full round-trip.")
 
+    from geolip_svae.model import stitch_patches
+    decoded = model.decode_patches(svd['U'], svd['S'], svd['Vt'])
     recon = stitch_patches(decoded, svd['gh'], svd['gw'], model.patch_size)
     return model.boundary_smooth(recon)
 
