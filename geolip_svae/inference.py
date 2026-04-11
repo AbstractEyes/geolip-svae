@@ -110,13 +110,13 @@ def load_model(hf_version: str = None, checkpoint_path: str = None,
             V=cfg.get('V', 48),
             D=cfg.get('D', 4),
             ps=cfg.get('patch_size', 4),
-            enc_hidden=cfg.get('enc_hidden', cfg.get('hidden', 384)),
-            enc_depth=cfg.get('enc_depth', cfg.get('depth', 4)),
+            hidden=cfg.get('hidden', 384),
+            depth=cfg.get('depth', 4),
+            n_cross=cfg.get('n_cross_layers', cfg.get('n_cross', 2)),
+            n_heads=cfg.get('n_heads', None),
+            smooth_mid=cfg.get('smooth_mid', None),
             stage_hidden=cfg.get('stage_hidden', 128),
             stage_V=cfg.get('stage_V', 16),
-            dec_depth=cfg.get('dec_depth', 3),
-            n_cross=cfg.get('n_cross_layers', cfg.get('n_cross', 2)),
-            smooth_mid=cfg.get('smooth_mid', 8),
         )
     else:
         model = PatchSVAE(

@@ -31,10 +31,7 @@ from geolip_svae.model import (
 )
 from geolip_svae.model_v2 import (
     PatchSVAEv2,
-    PatchEncoder,
-    PatchDecoder,
-    EncoderStage,
-    DecoderStage,
+    HierarchyStage,
     GroupAttention,
 )
 from geolip_svae.inference import load_model, encode, decode, reconstruct
@@ -54,12 +51,9 @@ __all__ = [
     "cv_of",
     "extract_patches",
     "stitch_patches",
-    # v2 model (hierarchical spectral cascade)
+    # v2 model (hierarchical spectral cascade, v1 interface)
     "PatchSVAEv2",
-    "PatchEncoder",
-    "PatchDecoder",
-    "EncoderStage",
-    "DecoderStage",
+    "HierarchyStage",
     "GroupAttention",
     # Inference
     "load_model",
