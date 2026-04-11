@@ -1,34 +1,29 @@
 """
-PatchSVAE v2 — Inverse Cascade Spectral Autoencoder
-=====================================================
-The decoder mirrors the forward decomposition IN REVERSE.
-Each forward FL phase has a corresponding inverse decoder phase.
-Conduit evidence enters at the phase where it was created.
+PatchSVAE v2 — Hierarchical Spectral Cascade
+==============================================
+SVD + conduit at EVERY level of the spatial hierarchy.
+Conduit difficulty trickles stage by stage from patches to manifold.
 
-Forward FLEigh phases:
-  1. FL polynomial:    M → G → Mstore[k], char_coeffs c[]
-  2. Laguerre roots:   c[] → eigenvalues λ, friction, settle, order
-  3. Adjugate vectors: λ + Mstore → raw eigenvectors
-  4. Newton-Schulz:    raw V → orthogonalized V, refinement_residual
-  5. Rayleigh refine:  V, G → final (λ, V)
+Encoder hierarchy (16×16 grid, D=4 at every level):
+  Level 0: 256 patches → encode → SVD+conduit₀ → 256 spectral tokens
+  Level 1: group 2×2 → 64 cells  → attend → SVD+conduit₁ → 64 tokens
+  Level 2: group 2×2 → 16 blocks → attend → SVD+conduit₂ → 16 tokens
+  Level 3: group 2×2 → 4 groups  → attend → SVD+conduit₃ → 4 tokens
 
-Inverse decoder phases (reverse order):
-  5'. InvRayleigh:     Vt + refinement_residual → h₅
-  4'. InvNewtonSchulz: h₅ + eigenvalues → h₄
-  3'. InvAdjugate:     h₄ + char_coeffs → h₃
-  2'. InvLaguerre:     h₃ + friction + settle + order → h₂
-  1'. InvFL:           h₂ + U → patch pixels
+Each level captures decomposition difficulty at its spatial scale:
+  Level 0: pixel-level spectral structure (edges, textures)
+  Level 1: local patch interactions (2×2 neighborhoods)
+  Level 2: meso-scale structure (4×4 regions)
+  Level 3: global composition (full quadrants)
 
-Each inverse phase is a residual block that takes:
-  - Previous phase's hidden state (the cascade)
-  - Its corresponding conduit evidence (the key)
+Decoder reverses the hierarchy (spectral U-Net):
+  Each decoder level receives skip from its encoder level
+  with the FULL stored SVD + conduit from that scale.
+  Every conduit element is architecturally load-bearing at its level.
 
-The decoder CANNOT shortcut because:
-  - Eigenvalues enter at phase 4', not alongside U
-  - Friction enters at phase 2', not alongside eigenvectors
-  - U enters LAST at phase 1'
-  - Each phase transforms the hidden state before the next evidence arrives
-  - The model must learn the inverse of each theorem to pass information through
+Spectral token (propagates between levels):
+  S[4] + log_friction[4] + settle[4] + char_coeffs[4] = 16 values
+  = the spectral signature + conditioning at that resolution
 """
 
 import math
@@ -40,9 +35,9 @@ from geolip_core.linalg.eigh import FLEigh, _FL_MAX_N
 from geolip_core.linalg.conduit import FLEighConduit, ConduitPacket
 
 
-# ── SVD Backends (same as v1) ───────────────────────────────────
+# ── SVD Backends ─────────────────────────────────────────────────
 
-def gram_eigh_svd(A: torch.Tensor):
+def gram_eigh_svd(A):
     B, M, N = A.shape
     orig_dtype = A.dtype
     if N <= _FL_MAX_N and A.is_cuda:
@@ -69,7 +64,7 @@ def gram_eigh_svd(A: torch.Tensor):
     return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
 
 
-def gram_eigh_svd_conduit(A: torch.Tensor, conduit_solver: FLEighConduit):
+def gram_eigh_svd_conduit(A, conduit_solver):
     B, M, N = A.shape
     orig_dtype = A.dtype
     with torch.amp.autocast('cuda', enabled=False):
@@ -84,9 +79,9 @@ def gram_eigh_svd_conduit(A: torch.Tensor, conduit_solver: FLEighConduit):
     return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype), packet
 
 
-# ── Patch Utilities ──────────────────────────────────────────────
+# ── Utilities ────────────────────────────────────────────────────
 
-def extract_patches(images, patch_size=16):
+def extract_patches(images, patch_size=4):
     B, C, H, W = images.shape
     gh, gw = H // patch_size, W // patch_size
     p = images.reshape(B, C, gh, patch_size, gw, patch_size)
@@ -94,28 +89,351 @@ def extract_patches(images, patch_size=16):
     return p.reshape(B, gh * gw, C * patch_size * patch_size), gh, gw
 
 
-def stitch_patches(patches, gh, gw, patch_size=16):
+def stitch_patches(patches, gh, gw, patch_size=4):
     B = patches.shape[0]
     p = patches.reshape(B, gh, gw, 3, patch_size, patch_size)
     return p.permute(0, 3, 1, 4, 2, 5).reshape(B, 3, gh * patch_size, gw * patch_size)
 
 
+def spatial_group_2x2(x, gh, gw):
+    """Group 2×2 spatial neighbors. (B, gh*gw, C) → (B, gh//2*gw//2, 4, C)"""
+    B, N, C = x.shape
+    x = x.reshape(B, gh, gw, C)
+    x = x.reshape(B, gh // 2, 2, gw // 2, 2, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # (B, gh//2, gw//2, 2, 2, C)
+    return x.reshape(B, (gh // 2) * (gw // 2), 4, C)
+
+
+def spatial_ungroup_2x2(x, gh, gw):
+    """Ungroup back to spatial grid. (B, gh*gw, 4, C) → (B, gh*2*gw*2, C)"""
+    B, N, four, C = x.shape
+    x = x.reshape(B, gh, gw, 2, 2, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # (B, gh, 2, gw, 2, C)
+    return x.reshape(B, gh * 2 * gw * 2, C)
+
+
 class BoundarySmooth(nn.Module):
-    def __init__(self, channels=3, mid=16):
+    def __init__(self, channels=3, mid=8):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(channels, mid, 3, padding=1), nn.GELU(),
             nn.Conv2d(mid, channels, 3, padding=1))
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+
     def forward(self, x):
         return x + self.net(x)
 
 
-# ── Spectral Cross-Attention (unchanged) ────────────────────────
+# ── Spectral Token ───────────────────────────────────────────────
+
+TOKEN_DIM = 16  # S[4] + log_friction[4] + settle[4] + char_coeffs[4]
+D = 4
+
+
+def make_spectral_token(S, packet):
+    """Build compact spectral token from SVD output + conduit.
+
+    Token = [S, log1p(friction), settle, char_coeffs]
+    All conduit values detached — no gradients through piecewise dynamics.
+    S retains gradients for encoder training.
+
+    Args:
+        S: (BN, D) — singular values (gradient-carrying)
+        packet: ConduitPacket from FLEighConduit
+
+    Returns:
+        token: (BN, TOKEN_DIM=16)
+    """
+    friction = torch.log1p(packet.friction.detach())  # (BN, D)
+    settle = packet.settle.detach()                    # (BN, D)
+    char_c = packet.char_coeffs.detach()               # (BN, D)
+    return torch.cat([S, friction, settle, char_c], dim=-1)
+
+
+# ── Local Group Attention ────────────────────────────────────────
+
+class GroupAttention(nn.Module):
+    """Attention within groups of 4 elements.
+
+    Each group attends internally — 4 spectral tokens interact.
+    Lightweight: operates on token_dim directly.
+    """
+    def __init__(self, dim, n_heads=2):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert dim % n_heads == 0
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x):
+        """x: (B, N_groups, 4, dim) → (B, N_groups, 4, dim)"""
+        B, N, four, C = x.shape
+        x_flat = x.reshape(B * N, four, C)
+        x_n = self.norm(x_flat)
+        qkv = self.qkv(x_n).reshape(B * N, four, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B * N, four, C)
+        return x_flat + self.out(out)  # residual
+        # Reshape handled by caller
+
+
+# ── Encoder Stage ────────────────────────────────────────────────
+
+class EncoderStage(nn.Module):
+    """One level of hierarchical encoding.
+
+    Groups 4 tokens from previous level → attend →
+    MLP → M matrix → SVD+conduit → spectral token.
+
+    Stores full SVD decomposition for decoder skip connection.
+    """
+    def __init__(self, input_dim, V_stage, D, hidden):
+        super().__init__()
+        self.V = V_stage
+        self.D = D
+
+        # Attention over 4 grouped tokens
+        self.group_attn = GroupAttention(input_dim, n_heads=2)
+
+        # MLP: 4 tokens concatenated → hidden → matrix
+        self.mlp_in = nn.Linear(4 * input_dim, hidden)
+        self.mlp_block = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.mlp_out = nn.Linear(hidden, V_stage * D)
+        nn.init.orthogonal_(self.mlp_out.weight)
+
+    def forward(self, grouped, conduit_solver):
+        """
+        grouped: (B, N_groups, 4, input_dim) — groups of 4 tokens
+        Returns:
+            tokens: (B, N_groups, TOKEN_DIM) — spectral tokens
+            svd_state: dict with U, S, Vt, packet for decoder
+        """
+        B, N, four, C = grouped.shape
+
+        # Attend within each group
+        attended = self.group_attn(grouped)  # (B*N, 4, C)
+
+        # Flatten group → MLP → matrix
+        flat = attended.reshape(B * N, 4 * C)
+        h = F.gelu(self.mlp_in(flat))
+        h = h + self.mlp_block(h)
+        M = F.normalize(
+            self.mlp_out(h).reshape(B * N, self.V, self.D), dim=-1)
+
+        # SVD + conduit
+        U, S, Vt, packet = gram_eigh_svd_conduit(M, conduit_solver)
+
+        # Build spectral token for next level
+        token = make_spectral_token(S, packet)  # (B*N, TOKEN_DIM)
+
+        return token.reshape(B, N, TOKEN_DIM), {
+            'U': U.reshape(B, N, self.V, self.D),
+            'S': S.reshape(B, N, self.D),
+            'Vt': Vt.reshape(B, N, self.D, self.D),
+            'M': M.reshape(B, N, self.V, self.D),
+            'packet': packet,
+        }
+
+
+# ── Decoder Stage ────────────────────────────────────────────────
+
+class DecoderStage(nn.Module):
+    """One level of hierarchical decoding.
+
+    Takes parent tokens from above, expands to 4 children,
+    injects stored SVD+conduit from corresponding encoder level,
+    attends within group, refines.
+    """
+    def __init__(self, parent_dim, child_dim, V_stage, D, hidden):
+        super().__init__()
+        self.D = D
+        self.V = V_stage
+
+        # Expand 1 parent → 4 children
+        self.expand = nn.Linear(parent_dim, 4 * hidden)
+
+        # Inject stored conduit: hidden + S + friction + settle + char_c + Vt_flat
+        conduit_dim = D + D + D + D + D * D  # S + fric + settle + char_c + Vt
+        self.inject = nn.Linear(hidden + conduit_dim, hidden)
+        self.inject_norm = nn.LayerNorm(hidden)
+
+        # Attention over 4 children
+        self.group_attn = GroupAttention(hidden, n_heads=2)
+
+        # Refine → output token
+        self.refine = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, child_dim),
+        )
+
+    def forward(self, parent_tokens, enc_svd_state):
+        """
+        parent_tokens: (B, N_parent, parent_dim)
+        enc_svd_state: dict with U, S, Vt, packet from encoder
+
+        Returns: (B, N_parent*4, child_dim) — expanded child tokens
+        """
+        B, N, _ = parent_tokens.shape
+        packet = enc_svd_state['packet']
+
+        # Expand each parent to 4 children
+        expanded = self.expand(parent_tokens)  # (B, N, 4*hidden)
+        hidden = expanded.shape[-1] // 4
+        children = expanded.reshape(B * N, 4, hidden)  # (B*N, 4, hidden)
+
+        # Build conduit evidence from stored encoder state
+        S = enc_svd_state['S'].reshape(B * N, self.D)
+        Vt = enc_svd_state['Vt'].reshape(B * N, self.D * self.D)
+        friction = torch.log1p(packet.friction.detach()).reshape(B * N, self.D)
+        settle = packet.settle.detach().reshape(B * N, self.D)
+        char_c = packet.char_coeffs.detach().reshape(B * N, self.D)
+
+        # Conduit is the SAME for all 4 children in a group
+        # (it describes the group-level decomposition)
+        conduit_ev = torch.cat([S, friction, settle, char_c, Vt], dim=-1)  # (B*N, conduit_dim)
+        conduit_ev = conduit_ev.unsqueeze(1).expand(-1, 4, -1)  # (B*N, 4, conduit_dim)
+
+        # Inject conduit into each child
+        fused = torch.cat([children, conduit_ev], dim=-1)  # (B*N, 4, hidden+conduit_dim)
+        fused = self.inject_norm(F.gelu(self.inject(fused)))  # (B*N, 4, hidden)
+
+        # Attend within group of 4 children
+        fused = fused.reshape(B, N, 4, hidden)
+        attended = self.group_attn(fused)  # (B*N, 4, hidden)
+
+        # Refine to child tokens
+        out = self.refine(attended)  # (B*N, 4, child_dim)
+        return out.reshape(B, N * 4, -1)
+
+
+# ── Patch Encoder (Level 0) ─────────────────────────────────────
+
+class PatchEncoder(nn.Module):
+    """Level 0: individual patches → SVD+conduit → spectral tokens."""
+
+    def __init__(self, patch_dim, V, D, hidden, depth):
+        super().__init__()
+        self.V = V
+        self.D = D
+        self.enc_in = nn.Linear(patch_dim, hidden)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+            ) for _ in range(depth)
+        ])
+        self.enc_out = nn.Linear(hidden, V * D)
+        nn.init.orthogonal_(self.enc_out.weight)
+
+    def forward(self, patches, conduit_solver):
+        """
+        patches: (B, N, patch_dim)
+        Returns:
+            tokens: (B, N, TOKEN_DIM)
+            svd_state: dict with U, S, Vt, M, packet
+        """
+        B, N, _ = patches.shape
+        flat = patches.reshape(B * N, -1)
+
+        h = F.gelu(self.enc_in(flat))
+        for block in self.blocks:
+            h = h + block(h)
+
+        M = F.normalize(
+            self.enc_out(h).reshape(B * N, self.V, self.D), dim=-1)
+        U, S, Vt, packet = gram_eigh_svd_conduit(M, conduit_solver)
+
+        token = make_spectral_token(S, packet)
+
+        return token.reshape(B, N, TOKEN_DIM), {
+            'U': U.reshape(B, N, self.V, self.D),
+            'S': S.reshape(B, N, self.D),
+            'Vt': Vt.reshape(B, N, self.D, self.D),
+            'M': M.reshape(B, N, self.V, self.D),
+            'packet': packet,
+        }
+
+
+# ── Patch Decoder (Level 0) ─────────────────────────────────────
+
+class PatchDecoder(nn.Module):
+    """Level 0 decoder: spectral tokens + stored conduit → pixel patches.
+
+    Uses stored U, S, Vt, and conduit from encoder level 0
+    to reconstruct patch pixels. Conduit enters as required context.
+    """
+    def __init__(self, token_dim, V, D, hidden, depth, patch_dim):
+        super().__init__()
+        self.V = V
+        self.D = D
+
+        # Input: token from level 1 decoder + stored SVD + conduit
+        conduit_dim = D + D + D + D + D * D + V * D
+        # S + friction + settle + char_c + Vt_flat + U_flat
+        self.fuse_in = nn.Linear(token_dim + conduit_dim, hidden)
+        self.fuse_norm = nn.LayerNorm(hidden)
+
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+            ) for _ in range(depth)
+        ])
+        self.out = nn.Linear(hidden, patch_dim)
+
+    def forward(self, child_tokens, enc_svd_state):
+        """
+        child_tokens: (B, N_patches, token_dim) — from level 1 decoder
+        enc_svd_state: dict from level 0 encoder
+        Returns: (B, N_patches, patch_dim)
+        """
+        B, N, C = child_tokens.shape
+        packet = enc_svd_state['packet']
+
+        # Build conduit evidence from stored level 0 state
+        S = enc_svd_state['S'].reshape(B * N, self.D)
+        Vt = enc_svd_state['Vt'].reshape(B * N, self.D * self.D)
+        U = enc_svd_state['U'].reshape(B * N, self.V * self.D)
+        friction = torch.log1p(packet.friction.detach()).reshape(B * N, self.D)
+        settle = packet.settle.detach().reshape(B * N, self.D)
+        char_c = packet.char_coeffs.detach().reshape(B * N, self.D)
+
+        conduit_ev = torch.cat([S, friction, settle, char_c, Vt, U], dim=-1)
+
+        # Fuse token + full conduit
+        flat_tokens = child_tokens.reshape(B * N, C)
+        fused = torch.cat([flat_tokens, conduit_ev], dim=-1)
+        h = self.fuse_norm(F.gelu(self.fuse_in(fused)))
+
+        for block in self.blocks:
+            h = h + block(h)
+
+        return self.out(h).reshape(B, N, -1)
+
+
+# ── Cross-Attention (top level) ──────────────────────────────────
 
 class SpectralCrossAttention(nn.Module):
-    def __init__(self, D, n_heads=4, max_alpha=0.2, alpha_init=-2.0):
+    """Cross-attention over the final 4 spectral tokens at the top level."""
+    def __init__(self, D, n_heads=2, max_alpha=0.2, alpha_init=-2.0):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = D // n_heads
@@ -145,282 +463,149 @@ class SpectralCrossAttention(nn.Module):
         return S * (1.0 + alpha * gate)
 
 
-# ── Inverse Phase Block ─────────────────────────────────────────
-
-class InversePhaseBlock(nn.Module):
-    """Single phase of the inverse cascade.
-
-    Takes hidden state from previous phase + conduit evidence
-    from this phase's corresponding forward step.
-    Produces hidden state for the next inverse phase.
-
-    input_dim = hidden (from previous phase) + evidence_dim (conduit for this phase)
-    output_dim = hidden (for next phase)
-    """
-    def __init__(self, hidden: int, evidence_dim: int):
-        super().__init__()
-        self.inject = nn.Linear(hidden + evidence_dim, hidden)
-        self.norm = nn.LayerNorm(hidden)
-        self.block = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-        )
-
-    def forward(self, h: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
-        """
-        h: (BN, hidden) — cascade state from previous phase
-        evidence: (BN, evidence_dim) — conduit evidence for this phase
-        """
-        fused = F.gelu(self.inject(torch.cat([h, evidence], dim=-1)))
-        fused = self.norm(fused)
-        return fused + self.block(fused)
-
-
-# ── Inverse Cascade Decoder ─────────────────────────────────────
-
-class InverseCascadeDecoder(nn.Module):
-    """Decoder structured as the inverse of the forward FL decomposition.
-
-    Five inverse phases, each receiving conduit evidence from its
-    corresponding forward phase:
-
-      5' InvRayleigh:     Vt(D²) + refinement_residual(1) → h₅
-      4' InvNewtonSchulz: h₅ + eigenvalues(D) → h₄
-      3' InvAdjugate:     h₄ + char_coeffs(D) → h₃
-      2' InvLaguerre:     h₃ + friction(D) + settle(D) + order(D) → h₂
-      1' InvFL:           h₂ + U(V×D) → patch pixels
-
-    The cascade forces sequential processing. The decoder cannot
-    see U until phase 1' — it must first process the spectral
-    structure through phases 5'-2' using only conduit evidence.
-    """
-    def __init__(self, V: int, D: int, hidden: int, patch_dim: int):
-        super().__init__()
-        self.V = V
-        self.D = D
-        self.hidden = hidden
-
-        # Phase 5': InvRayleigh — starts the cascade from eigenvectors
-        # Input: Vt flattened (D²) + refinement_residual (1) = D²+1
-        self.phase5 = InversePhaseBlock(hidden, evidence_dim=D * D + 1)
-        # Need an initial projection since there's no previous hidden state
-        self.phase5_init = nn.Linear(D * D + 1, hidden)
-
-        # Phase 4': InvNewtonSchulz — adds eigenvalue magnitudes
-        # Evidence: eigenvalues (D)
-        self.phase4 = InversePhaseBlock(hidden, evidence_dim=D)
-
-        # Phase 3': InvAdjugate — adds polynomial structure
-        # Evidence: char_coeffs (D)
-        self.phase3 = InversePhaseBlock(hidden, evidence_dim=D)
-
-        # Phase 2': InvLaguerre — adds dynamic conditioning evidence
-        # Evidence: friction(D) + settle(D) + extraction_order(D) = 3D
-        self.phase2 = InversePhaseBlock(hidden, evidence_dim=3 * D)
-
-        # Phase 1': InvFL — adds spatial content, produces pixels
-        # Evidence: U flattened (V×D)
-        self.phase1 = InversePhaseBlock(hidden, evidence_dim=V * D)
-
-        # Final projection to patch pixel space
-        self.out = nn.Linear(hidden, patch_dim)
-
-    def forward(self, U: torch.Tensor, S: torch.Tensor,
-                Vt: torch.Tensor, packet: ConduitPacket) -> torch.Tensor:
-        """Inverse cascade reconstruction.
-
-        Args:
-            U:  (BN, V, D) — left singular vectors
-            S:  (BN, D)    — singular values
-            Vt: (BN, D, D) — right singular vectors
-            packet: ConduitPacket with all telemetry
-
-        Returns:
-            patches: (BN, patch_dim)
-        """
-        BN = U.shape[0]
-        device = U.device
-
-        # Detach all conduit evidence — no gradients through piecewise dynamics
-        friction = torch.log1p(packet.friction.detach().to(device))  # log-compress
-        settle = packet.settle.detach().to(device)
-        char_coeffs = packet.char_coeffs.detach().to(device)
-        ext_order = packet.extraction_order.detach().to(device)
-        refine_res = packet.refinement_residual.detach().to(device)
-
-        # ── Phase 5': InvRayleigh ──
-        # Start cascade from eigenvector structure + refinement quality
-        vt_flat = Vt.reshape(BN, -1)                          # (BN, D²)
-        ev5 = torch.cat([vt_flat, refine_res.unsqueeze(-1)], dim=-1)  # (BN, D²+1)
-        h = F.gelu(self.phase5_init(ev5))                     # (BN, hidden) — initial state
-        h = self.phase5(h, ev5)                                # (BN, hidden)
-
-        # ── Phase 4': InvNewtonSchulz ──
-        # Add eigenvalue magnitudes — the decoder now knows directions + magnitudes
-        h = self.phase4(h, S)                                  # (BN, hidden)
-
-        # ── Phase 3': InvAdjugate ──
-        # Add polynomial invariants — connects eigenvalues to polynomial structure
-        h = self.phase3(h, char_coeffs)                        # (BN, hidden)
-
-        # ── Phase 2': InvLaguerre ──
-        # Add dynamic conditioning — how the polynomial was solved
-        ev2 = torch.cat([friction, settle, ext_order], dim=-1)  # (BN, 3D)
-        h = self.phase2(h, ev2)                                # (BN, hidden)
-
-        # ── Phase 1': InvFL ──
-        # Add spatial content — the original M's left singular vectors
-        u_flat = U.reshape(BN, -1)                             # (BN, V*D)
-        h = self.phase1(h, u_flat)                             # (BN, hidden)
-
-        # ── Reconstruct patch ──
-        return self.out(h)
-
-
-# ── PatchSVAE v2 ────────────────────────────────────────────────
+# ── PatchSVAE v2 — Hierarchical Spectral Cascade ────────────────
 
 class PatchSVAEv2(nn.Module):
-    """Inverse Cascade Spectral Autoencoder.
+    """Hierarchical spectral autoencoder with conduit trickle.
 
-    Encoder identical to v1. Decoder is an inverse cascade that
-    mirrors the forward FL decomposition in reverse, with conduit
-    evidence entering at each corresponding inverse phase.
+    SVD + conduit at 4 spatial scales. Decoder uses stored
+    conduit at each level for reconstruction.
+
+    16×16 grid → 4 levels:
+      256 patches → 64 cells → 16 blocks → 4 groups
 
     Args:
-        V: rows per encoded matrix (default 48)
-        D: spectral dimensions (default 4)
-        ps: patch size (default 4)
-        hidden: MLP hidden dimension (default 384)
-        depth: encoder residual blocks (default 4)
-        n_cross: spectral cross-attention layers (default 2)
-        n_heads: attention heads (default: auto from D)
-        smooth_mid: boundary smooth channels (default: auto from ps)
+        V: patch matrix rows (48 for ps=4)
+        D: spectral modes (4 — constant at all levels)
+        ps: patch size (4)
+        enc_hidden: patch encoder hidden (384)
+        enc_depth: patch encoder residual blocks (4)
+        stage_hidden: hierarchical stage hidden (128)
+        stage_V: matrix rows at levels 1-3 (16)
+        dec_depth: patch decoder residual blocks (3)
+        n_cross: cross-attention layers at top (2)
+        smooth_mid: boundary smooth channels (8)
     """
-    def __init__(self, V: int = 48, D: int = 4, ps: int = 4,
-                 hidden: int = 384, depth: int = 4, n_cross: int = 2,
-                 n_heads: int = None, smooth_mid: int = None):
+    def __init__(self, V=48, D=4, ps=4,
+                 enc_hidden=384, enc_depth=4,
+                 stage_hidden=128, stage_V=16,
+                 dec_depth=3, n_cross=2, smooth_mid=8):
         super().__init__()
         self.matrix_v = V
         self.D = D
         self.patch_size = ps
         self.patch_dim = 3 * ps * ps
-        self.mat_dim = V * D
 
-        if n_heads is None:
-            n_heads = 2 if D <= 8 else min(4, D)
-        if smooth_mid is None:
-            smooth_mid = 16 if ps >= 16 else 8
-
-        # ── Encoder (identical to v1) ──
-        self.enc_in = nn.Linear(self.patch_dim, hidden)
-        self.enc_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(hidden),
-                nn.Linear(hidden, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, hidden),
-            ) for _ in range(depth)
-        ])
-        self.enc_out = nn.Linear(hidden, self.mat_dim)
-        nn.init.orthogonal_(self.enc_out.weight)
-
-        # ── Conduit Solver (always active) ──
+        # Shared conduit solver (no learnable params)
         self._conduit_solver = FLEighConduit()
         self.last_conduit_packet = None
 
-        # ── Spectral Cross-Attention (unchanged) ──
+        # ── Level 0: Patch encoder ──
+        self.patch_encoder = PatchEncoder(
+            self.patch_dim, V, D, enc_hidden, enc_depth)
+
+        # ── Levels 1-3: Hierarchical stages ──
+        self.stage1 = EncoderStage(TOKEN_DIM, stage_V, D, stage_hidden)
+        self.stage2 = EncoderStage(TOKEN_DIM, stage_V, D, stage_hidden)
+        self.stage3 = EncoderStage(TOKEN_DIM, stage_V, D, stage_hidden)
+
+        # ── Top-level cross-attention (over 4 final tokens) ──
         self.cross_attn = nn.ModuleList([
-            SpectralCrossAttention(D, n_heads=n_heads)
+            SpectralCrossAttention(D, n_heads=2)
             for _ in range(n_cross)
         ])
 
-        # ── Inverse Cascade Decoder ──
-        self.decoder = InverseCascadeDecoder(
-            V=V, D=D, hidden=hidden, patch_dim=self.patch_dim)
+        # ── Decoder levels 3→0 ──
+        self.dec_stage3 = DecoderStage(
+            TOKEN_DIM, TOKEN_DIM, stage_V, D, stage_hidden)
+        self.dec_stage2 = DecoderStage(
+            TOKEN_DIM, TOKEN_DIM, stage_V, D, stage_hidden)
+        self.dec_stage1 = DecoderStage(
+            TOKEN_DIM, TOKEN_DIM, stage_V, D, stage_hidden)
 
-        # ── Boundary Smoothing ──
+        # ── Level 0 decoder: tokens → pixels ──
+        self.patch_decoder = PatchDecoder(
+            TOKEN_DIM, V, D, enc_hidden, dec_depth, self.patch_dim)
+
+        # ── Boundary smoothing ──
         self.boundary_smooth = BoundarySmooth(channels=3, mid=smooth_mid)
 
-    def _svd(self, A: torch.Tensor):
-        solver = self._conduit_solver.to(A.device)
-        U, S, Vh, packet = gram_eigh_svd_conduit(A, solver)
-        self.last_conduit_packet = packet
-        return U, S, Vh, packet
-
-    def encode_patches(self, patches: torch.Tensor) -> dict:
-        B, N, _ = patches.shape
-        flat = patches.reshape(B * N, -1)
-
-        h = F.gelu(self.enc_in(flat))
-        for block in self.enc_blocks:
-            h = h + block(h)
-
-        M = self.enc_out(h).reshape(B * N, self.matrix_v, self.D)
-        M = F.normalize(M, dim=-1)
-
-        U, S, Vt, packet = self._svd(M)
-
-        U = U.reshape(B, N, self.matrix_v, self.D)
-        S = S.reshape(B, N, self.D)
-        Vt = Vt.reshape(B, N, self.D, self.D)
-        M = M.reshape(B, N, self.matrix_v, self.D)
-
-        S_coordinated = S
-        for layer in self.cross_attn:
-            S_coordinated = layer(S_coordinated)
-
-        return {
-            'U': U, 'S_orig': S, 'S': S_coordinated,
-            'Vt': Vt, 'M': M, 'conduit_packet': packet,
-        }
-
-    def decode_patches(self, U, S, Vt, packet):
-        B, N, V, D = U.shape
-        U_flat = U.reshape(B * N, V, D)
-        S_flat = S.reshape(B * N, D)
-        Vt_flat = Vt.reshape(B * N, D, D)
-
-        decoded = self.decoder(U_flat, S_flat, Vt_flat, packet)
-        return decoded.reshape(B, N, -1)
-
-    def forward(self, images: torch.Tensor) -> dict:
+    def forward(self, images):
         B, C, H, W = images.shape
         ps = self.patch_size
-        patches, gh, gw = extract_patches(images, ps)
+        gh0, gw0 = H // ps, W // ps  # 16, 16
 
-        svd = self.encode_patches(patches)
+        solver = self._conduit_solver.to(images.device)
+        patches, gh0, gw0 = extract_patches(images, ps)
 
-        decoded = self.decode_patches(
-            svd['U'], svd['S'], svd['Vt'], svd['conduit_packet'])
-        recon = stitch_patches(decoded, gh, gw, ps)
+        # ═══════════════════════════════════════════
+        # ENCODER — bottom up
+        # ═══════════════════════════════════════════
+
+        # Level 0: patches → spectral tokens
+        tok0, svd0 = self.patch_encoder(patches, solver)
+        # tok0: (B, 256, 16), svd0: full SVD+conduit at patch level
+        self.last_conduit_packet = svd0['packet']
+
+        # Level 1: group 2×2 → 64 cells
+        gh1, gw1 = gh0 // 2, gw0 // 2  # 8, 8
+        grouped1 = spatial_group_2x2(tok0, gh0, gw0)  # (B, 64, 4, 16)
+        tok1, svd1 = self.stage1(grouped1, solver)     # (B, 64, 16)
+
+        # Level 2: group 2×2 → 16 blocks
+        gh2, gw2 = gh1 // 2, gw1 // 2  # 4, 4
+        grouped2 = spatial_group_2x2(tok1, gh1, gw1)   # (B, 16, 4, 16)
+        tok2, svd2 = self.stage2(grouped2, solver)      # (B, 16, 16)
+
+        # Level 3: group 2×2 → 4 groups
+        gh3, gw3 = gh2 // 2, gw2 // 2  # 2, 2
+        grouped3 = spatial_group_2x2(tok2, gh2, gw2)    # (B, 4, 4, 16)
+        tok3, svd3 = self.stage3(grouped3, solver)       # (B, 4, 16)
+
+        # Top-level cross-attention on S values of the 4 final groups
+        S_top = svd3['S']  # (B, 4, D)
+        S_orig_top = S_top.clone()
+        for layer in self.cross_attn:
+            S_top = layer(S_top)
+
+        # ═══════════════════════════════════════════
+        # DECODER — top down with conduit skips
+        # ═══════════════════════════════════════════
+
+        # Level 3': 4 tokens → 16 block tokens
+        dec3 = self.dec_stage3(tok3, svd3)              # (B, 16, 16)
+
+        # Level 2': 16 tokens → 64 cell tokens
+        dec2 = self.dec_stage2(dec3, svd2)              # (B, 64, 16)
+
+        # Level 1': 64 tokens → 256 patch tokens
+        dec1 = self.dec_stage1(dec2, svd1)              # (B, 256, 16)
+
+        # Level 0': patch tokens + stored conduit → pixels
+        recon_patches = self.patch_decoder(dec1, svd0)  # (B, 256, 48)
+
+        # Stitch + smooth
+        recon = stitch_patches(recon_patches, gh0, gw0, ps)
         recon = self.boundary_smooth(recon)
 
-        return {'recon': recon, 'svd': svd}
-
-    @staticmethod
-    def from_v1(v1_model):
-        """Initialize v2 from trained v1. Encoder copied, decoder is new."""
-        v2 = PatchSVAEv2(
-            V=v1_model.matrix_v, D=v1_model.D, ps=v1_model.patch_size,
-            hidden=v1_model.enc_in.in_features,
-            depth=len(v1_model.enc_blocks),
-            n_cross=len(v1_model.cross_attn),
-        )
-        v2.enc_in.load_state_dict(v1_model.enc_in.state_dict())
-        for v2b, v1b in zip(v2.enc_blocks, v1_model.enc_blocks):
-            v2b.load_state_dict(v1b.state_dict())
-        v2.enc_out.load_state_dict(v1_model.enc_out.state_dict())
-        for v2c, v1c in zip(v2.cross_attn, v1_model.cross_attn):
-            v2c.load_state_dict(v1c.state_dict())
-        v2.boundary_smooth.load_state_dict(v1_model.boundary_smooth.state_dict())
-
-        n_v1 = sum(p.numel() for p in v1_model.parameters())
-        n_v2 = sum(p.numel() for p in v2.parameters())
-        print(f"  PatchSVAEv2 from v1: encoder copied, decoder NEW")
-        print(f"    v1: {n_v1:,}  v2: {n_v2:,}  delta: {n_v2-n_v1:+,}")
-        return v2
+        return {
+            'recon': recon,
+            'svd': {
+                # Level 0 (for compatibility / monitoring)
+                'S_orig': svd0['S'].reshape(B, gh0 * gw0, self.D),
+                'S': svd0['S'].reshape(B, gh0 * gw0, self.D),
+                'U': svd0['U'],
+                'Vt': svd0['Vt'],
+                'M': svd0['M'],
+                'conduit_packet': svd0['packet'],
+                # Hierarchy
+                'levels': {
+                    0: svd0, 1: svd1, 2: svd2, 3: svd3,
+                },
+                'S_top': S_top,
+                'S_top_orig': S_orig_top,
+            },
+        }
 
     @staticmethod
     def effective_rank(S):
