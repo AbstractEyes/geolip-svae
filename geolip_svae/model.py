@@ -286,6 +286,67 @@ class SpectralCrossAttention(nn.Module):
 
 # ── PatchSVAE ───────────────────────────────────────────────────
 
+# Ablation helpers — support F/G/H/L groups as parameterized toggles
+# inside the PatchSVAE class.
+
+ACTIVATIONS = {
+    'gelu': F.gelu,
+    'relu': F.relu,
+    'silu': F.silu,
+    'tanh': torch.tanh,
+    'identity': lambda x: x,
+}
+
+
+def _row_normalize(M: torch.Tensor, mode: str) -> torch.Tensor:
+    """Apply row normalization to M (shape [*, V, D]).
+
+    'sphere'     → F.normalize(dim=-1), rows on S^(D-1)  [default]
+    'layernorm'  → per-row zero-mean / unit-variance
+    'scale'      → per-row divide by max abs
+    'none'       → identity
+    """
+    if mode == 'sphere':
+        return F.normalize(M, dim=-1)
+    elif mode == 'layernorm':
+        mean = M.mean(dim=-1, keepdim=True)
+        std = M.std(dim=-1, keepdim=True).clamp(min=1e-8)
+        return (M - mean) / std
+    elif mode == 'scale':
+        scale = M.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        return M / scale
+    elif mode == 'none':
+        return M
+    else:
+        raise ValueError(f"Unknown row_norm mode: {mode}")
+
+
+def _init_weights(module: nn.Module, scheme: str) -> None:
+    """L-group init: override default nn.Linear init with one of the schemes."""
+    if scheme == 'kaiming_normal':
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    elif scheme == 'xavier_uniform':
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    elif scheme == 'normal_0_02':
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    elif scheme == 'orthogonal':
+        pass  # already the default for enc_out; let others fall through
+    else:
+        raise ValueError(f"Unknown init_scheme: {scheme}")
+
+
 class PatchSVAE(nn.Module):
     """Patch-based Spectral Variational Autoencoder.
 
@@ -313,7 +374,36 @@ class PatchSVAE(nn.Module):
     def __init__(self, V: int = 256, D: int = 16, ps: int = 16,
                  hidden: int = 768, depth: int = 4, n_cross: int = 2,
                  n_heads: int = None, smooth_mid: int = None,
-                 solver: str = 'default'):
+                 solver: str = 'default',
+                 # ── Ablation toggles (F/G/H/L groups) ─────────────────
+                 activation: str = 'gelu',
+                 row_norm: str = 'sphere',
+                 svd_mode: str = 'default',
+                 linear_readout: bool = False,
+                 match_params: bool = True,
+                 init_scheme: str = 'orthogonal'):
+        """
+        Ablation toggles:
+            activation:     'gelu' (default) | 'relu' | 'silu' | 'tanh' | 'identity'
+                            — activation on enc_in output (F group)
+            row_norm:       'sphere' (default) | 'layernorm' | 'scale' | 'none'
+                            — normalization applied to encoded M rows (G group)
+            svd_mode:       'default' (use `solver` argument) | 'fp32' | 'fp64' |
+                            'batch_shared' | 'none' (H group)
+                            When 'none' AND linear_readout=True: SVD is bypassed
+                            entirely and a learned linear readout replaces it.
+                            Column norms of readout output stand in as S;
+                            Vt is identity. This is the sphere-solver path.
+            linear_readout: False (default) | True — replace SVD with learned
+                            nn.Linear(V*D → V*D) readout (H group)
+            match_params:   True (default) | False — when linear_readout=True,
+                            True uses nn.Linear(V*D, V*D), False uses Identity
+                            (saves params but breaks geometric expressiveness)
+            init_scheme:    'orthogonal' (default, on enc_out) | 'kaiming_normal'
+                            | 'xavier_uniform' | 'normal_0_02' — initialization
+                            scheme for Linear layers (L group). Orthogonal is
+                            always re-applied to enc_out regardless.
+        """
         super().__init__()
         self.matrix_v = V
         self.D = D
@@ -325,6 +415,14 @@ class PatchSVAE(nn.Module):
         self.solver = solver
         self.last_conduit_packet = None
         self._conduit_solver = None  # lazy init
+
+        # Ablation mode storage
+        self.activation_name = activation
+        self.row_norm_mode = row_norm
+        self.svd_mode = svd_mode
+        self.linear_readout = linear_readout
+        self.match_params = match_params
+        self.init_scheme = init_scheme
 
         # Resolve regime-dependent defaults
         if n_heads is None:
@@ -344,6 +442,13 @@ class PatchSVAE(nn.Module):
         ])
         self.enc_out = nn.Linear(hidden, self.mat_dim)
         nn.init.orthogonal_(self.enc_out.weight)
+
+        # H group: optional learned readout replacing SVD
+        if linear_readout:
+            if match_params:
+                self.readout = nn.Linear(self.mat_dim, self.mat_dim)
+            else:
+                self.readout = nn.Identity()
 
         # Decoder
         self.dec_in = nn.Linear(self.mat_dim, hidden)
@@ -365,6 +470,13 @@ class PatchSVAE(nn.Module):
 
         # Boundary smoothing
         self.boundary_smooth = BoundarySmooth(channels=3, mid=smooth_mid)
+
+        # L group: optional init override
+        if init_scheme != 'orthogonal':
+            _init_weights(self, init_scheme)
+            # Re-apply orthogonal to enc_out — load-bearing per the
+            # architecture docs (validated in ablation Phase 1/2).
+            nn.init.orthogonal_(self.enc_out.weight)
 
     def _get_conduit_solver(self):
         """Lazy-init conduit solver on correct device."""
@@ -399,26 +511,77 @@ class PatchSVAE(nn.Module):
 
         Returns:
             dict with keys:
-                U:      (B, N, V, D)  left singular vectors
-                S_orig: (B, N, D)     raw singular values
+                U:      (B, N, V, D)  left singular vectors (or M_hat if linear_readout)
+                S_orig: (B, N, D)     raw singular values (or column norms if linear_readout)
                 S:      (B, N, D)     coordinated singular values (omega tokens)
-                Vt:     (B, N, D, D)  right singular vectors
-                M:      (B, N, V, D)  sphere-normalized encoding matrix
+                Vt:     (B, N, D, D)  right singular vectors (or identity if linear_readout)
+                M:      (B, N, V, D)  row-normalized encoding matrix
         """
         B, N, _ = patches.shape
         flat = patches.reshape(B * N, -1)
 
-        # Residual MLP encoder
-        h = F.gelu(self.enc_in(flat))
+        # F group: configurable activation on enc_in
+        act_fn = ACTIVATIONS[self.activation_name]
+        h = act_fn(self.enc_in(flat))
         for block in self.enc_blocks:
+            # Inner block activations (GELU inside Sequential) remain.
+            # F-group ablation only swaps the outer activation.
             h = h + block(h)
 
-        # Project to matrix manifold and sphere-normalize
+        # G group: configurable row normalization
         M = self.enc_out(h).reshape(B * N, self.matrix_v, self.D)
-        M = F.normalize(M, dim=-1)  # rows → S^{D-1}
+        M = _row_normalize(M, self.row_norm_mode)
 
-        # Exact SVD decomposition (routes through _svd)
-        U, S, Vt = self._svd(M)
+        # H group: SVD decomposition or linear-readout replacement
+        if self.linear_readout:
+            # Sphere-solver path: learned linear readout replaces SVD.
+            # This is the H2_linear_matched architecture used by the
+            # h2-64 battery array (when combined with svd_mode='none').
+            flat_M = M.reshape(B * N, -1)
+            M_hat = self.readout(flat_M).reshape(B * N, self.matrix_v, self.D)
+            U = M_hat
+            # Column norms stand in as singular values
+            S = M_hat.norm(dim=-2)
+            # Vt is identity — decode reduces to U * S.unsqueeze(1)
+            Vt = torch.eye(self.D, device=M.device, dtype=M.dtype
+                            ).unsqueeze(0).expand(B * N, -1, -1)
+        elif self.svd_mode == 'fp32':
+            # Low-precision SVD path (ablation variant)
+            G = torch.bmm(M.transpose(1, 2), M)
+            G.diagonal(dim1=-2, dim2=-1).add_(1e-6)
+            eigenvalues, Vmat = torch.linalg.eigh(G)
+            eigenvalues = eigenvalues.flip(-1)
+            Vmat = Vmat.flip(-1)
+            S = torch.sqrt(eigenvalues.clamp(min=1e-12))
+            U = torch.bmm(M, Vmat) / S.unsqueeze(1).clamp(min=1e-8)
+            Vt = Vmat.transpose(-2, -1).contiguous()
+        elif self.svd_mode == 'fp64':
+            # Raw fp64 SVD (used by ablation_trainer, not the geolip-core
+            # FLEigh path). Kept for ablation-reproducibility.
+            with torch.amp.autocast('cuda', enabled=False):
+                A_d = M.double()
+                G = torch.bmm(A_d.transpose(1, 2), A_d)
+                G.diagonal(dim1=-2, dim2=-1).add_(1e-12)
+                eigenvalues, Vmat = torch.linalg.eigh(G)
+                eigenvalues = eigenvalues.flip(-1)
+                Vmat = Vmat.flip(-1)
+                S_d = torch.sqrt(eigenvalues.clamp(min=1e-24))
+                U_d = torch.bmm(A_d, Vmat) / S_d.unsqueeze(1).clamp(min=1e-16)
+                Vt_d = Vmat.transpose(-2, -1).contiguous()
+            U = U_d.to(M.dtype)
+            S = S_d.to(M.dtype)
+            Vt = Vt_d.to(M.dtype)
+        elif self.svd_mode == 'batch_shared':
+            # Single SVD per batch — S/Vt replicated across patches
+            M_batched = M.reshape(B, N * self.matrix_v, self.D)
+            U_b, S_b, Vt_b = self._svd(M_batched)
+            S = S_b.unsqueeze(1).expand(-1, N, -1).reshape(B * N, self.D)
+            Vt = Vt_b.unsqueeze(1).expand(-1, N, -1, -1).reshape(
+                B * N, self.D, self.D)
+            U = torch.bmm(M, Vt.transpose(-2, -1)) / S.unsqueeze(1
+                                                                    ).clamp(min=1e-16)
+        else:  # 'default' — production FLEigh path
+            U, S, Vt = self._svd(M)
 
         # Reshape for cross-attention
         U = U.reshape(B, N, self.matrix_v, self.D)

@@ -17,7 +17,7 @@ spectral cross-attention and sphere-normalized encoding.
     image, ids, strings = tokenizer.text_to_image("Hello, world!")
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from geolip_svae.model import (
     PatchSVAE,
@@ -39,6 +39,11 @@ from geolip_svae.spectral_codebook import (
     SpectralTokenizer,
     build_codebook,
     generate_patch,
+)
+from geolip_svae.arrays import (
+    BatteryArrayConfig,
+    BatteryArrayModel,
+    build_array,
 )
 
 __all__ = [
@@ -64,4 +69,8 @@ __all__ = [
     "SpectralTokenizer",
     "build_codebook",
     "generate_patch",
+    # Battery arrays
+    "BatteryArrayConfig",
+    "BatteryArrayModel",
+    "build_array",
 ]

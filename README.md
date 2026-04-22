@@ -114,6 +114,7 @@ geolip_svae/
 ├── diagnostic.py        12-test universal diagnostic battery
 ├── spectral_codebook.py Noise-native tokenizer for Alexandria
 ├── noise_diagnostic.py  Freckles piecemeal resolution test (6 tests)
+├── arrays/              BatteryArrayConfig, BatteryArrayModel, build_array, specs/
 └── __init__.py          Package exports
 ```
 
@@ -121,6 +122,7 @@ geolip_svae/
 
 - [geolip-core](https://github.com/AbstractEyes/geolip-core) — FLEigh fast eigendecomposition (hard dependency)
 - torch >= 2.1.0
+- transformers >= 4.40.0 (battery arrays, AutoModel interface)
 - huggingface-hub >= 0.20.0
 
 ## Training
@@ -157,6 +159,38 @@ codebook = build_codebook(save_path='codebook.json')
 tokenizer = SpectralTokenizer(codebook)
 image, ids, strings = tokenizer.text_to_image("Hello, world!")
 ```
+
+## Battery Arrays
+
+Bundle multiple independently-trained PatchSVAE batteries as a single `AutoModel` that emits a per-bank MSE signature across all inputs. Useful for ensembling, OOD detection, and signature-based classifiers.
+
+```python
+from transformers import AutoModel
+
+# Load a prebuilt array (geolip-svae must be installed, no trust_remote_code needed)
+model = AutoModel.from_pretrained("AbstractPhil/geolip-svae-h2-64")
+
+signature = model(images)
+# images:    [B, 3, H, W]
+# signature: [B, n_batteries, n_epoch_phases] — MSE per bank
+```
+
+Build a new array from a completed training sweep:
+
+```python
+from geolip_svae.arrays import build_array
+
+build_array(spec_name="h2_64", upload=True)
+```
+
+Array specs live under `geolip_svae.arrays.specs/` — each spec describes its battery class, architecture kwargs, training-config layout, and checkpoint path scheme. To add a new array, drop in a new spec module.
+
+The packaged `PatchSVAE` supports ablation toggles used by array training:
+`activation`, `row_norm`, `svd_mode`, `linear_readout`, `match_params`, `init_scheme`. Defaults preserve standard behavior.
+
+## FOR CLAUDE
+
+claude.md
 
 ## License
 
