@@ -4,43 +4,28 @@ geolip_svae.arrays.model
 BatteryArrayModel — generic PreTrainedModel that dispatches to any
 sphere-solver battery class declared in its config.
 
-The array holds n_batteries × n_epoch_phases bank instances, all of the
-same battery class with the same architecture kwargs. Banks differ only
-in their loaded weights (which epoch of which training run).
-
 Sampling APIs (all take images, return sampled output):
 
-    forward(images)                — MSE signature [B, n_batt, n_phase]
-    compute_signature(images)      — same as forward, with phase filter
-    forward_full(images)           — recon + per-bank outputs (debug)
+    forward(images)                    — MSE signature [B, n_batt, n_phase]
+    compute_signature(images)          — same as forward, with phase filter
+    forward_full(images)               — recon + per-bank outputs (debug)
 
-    compute_axis_codebook(...)     — projective-axis codebook per bank
-    encode_axes(images, ...)       — axis activations per input
+    compute_axis_codebook(...)         — one bank's projective-axis codebook
+    compute_axis_codebooks(...)        — batched: many banks at once
+    encode_axes(images, ...)           — per-patch axis activations
+    quantize_axes(images, ...)         — discrete codes via argmax
 
-Empirical foundation for axis sampling
---------------------------------------
+Empirical foundation (000101 in scratchpad):
 Every trained sphere-solver tested (19 models across D ∈ {3, 4, 5})
 produces an M tensor whose rows, when antipodal pairs are collapsed,
-form a uniformly-distributed codebook on ℝP^(D-1). The "axis codebook"
-sampling exposes this structure as a discrete representation.
+form a uniformly-distributed codebook on ℝP^(D-1).
 
 Reference: AbstractPhil/geolip-svae-implicit-solver-experiments
-
-Example:
-    from transformers import AutoModel
-    model = AutoModel.from_pretrained("AbstractPhil/geolip-svae-h2-64")
-
-    # MSE-based sampling (existing)
-    sig = model(images)                          # [B, 64, 3]
-
-    # Axis-based sampling (new)
-    codebook = model.compute_axis_codebook(0, 'final', calib_images)
-    activations = model.encode_axes(images, 0, 'final', codebook)
 """
 
 import importlib
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -106,8 +91,7 @@ def collapse_to_axes(
     """Collapse antipodal pairs into single-axis representatives.
 
     Each pair (i, j) becomes one axis: (row_i - row_j) / 2 normalized.
-    Each axis is sign-canonicalized so antipodally-equivalent axes get
-    the same representation.
+    Each axis is sign-canonicalized.
 
     Returns:
         axes: [n_axes, D] where n_axes = len(pairs) + len(unpaired)
@@ -136,6 +120,47 @@ def _canonicalize_sign(v: torch.Tensor) -> torch.Tensor:
         if v[k].abs() > 1e-6:
             return -v if v[k] < 0 else v
     return v
+
+
+# ════════════════════════════════════════════════════════════════════
+# Aggregation helpers
+# ════════════════════════════════════════════════════════════════════
+
+SUPPORTED_AGG = ('mean', 'median', 'first', 'cat')
+
+
+def _aggregate_M(
+    M_stack: torch.Tensor,
+    method: str,
+    axis_label: str = '',
+) -> torch.Tensor:
+    """Aggregate M tensors stacked along dim 0.
+
+    Args:
+        M_stack: [N, V, D] tensor of M matrices
+        method: one of SUPPORTED_AGG
+        axis_label: descriptive name for error messages ('sample', 'patch')
+
+    Returns:
+        - 'mean'   → [V, D]
+        - 'median' → [V, D]
+        - 'first'  → [V, D] (just M_stack[0])
+        - 'cat'    → unchanged [N, V, D] — caller's job to handle multi-row
+                     codebook from concatenated samples/patches
+    """
+    if method not in SUPPORTED_AGG:
+        raise ValueError(
+            f"Unknown {axis_label} aggregation '{method}'. "
+            f"Supported: {SUPPORTED_AGG}"
+        )
+
+    if method == 'mean':
+        return M_stack.mean(dim=0)
+    if method == 'median':
+        return M_stack.median(dim=0).values
+    if method == 'first':
+        return M_stack[0]
+    return M_stack  # 'cat' — caller handles
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -190,7 +215,7 @@ class BatteryArrayModel(PreTrainedModel):
     def bank_by_flat_idx(self, bank_idx: int) -> nn.Module:
         return self.banks[bank_idx]
 
-    # ── MSE sampling (existing) ──────────────────────────────────────
+    # ── MSE sampling ─────────────────────────────────────────────────
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.compute_signature(images)
@@ -203,7 +228,8 @@ class BatteryArrayModel(PreTrainedModel):
     ) -> torch.Tensor:
         """Compute per-bank MSE signature.
 
-        Returns [B, n_batteries, n_epoch_phases] or [B, n_batteries] if phase given.
+        Returns [B, n_batteries, n_epoch_phases] or
+        [B, n_batteries] if phase given.
         """
         B = images.shape[0]
         n_batt = self.config.n_batteries
@@ -270,40 +296,19 @@ class BatteryArrayModel(PreTrainedModel):
     # ── Projective-axis sampling ─────────────────────────────────────
 
     @torch.no_grad()
-    def compute_axis_codebook(
+    def _bank_M_collected(
         self,
-        battery_idx: int,
-        phase: str,
+        bank: nn.Module,
         calibration_images: torch.Tensor,
-        patch_idx: int = 0,
-        threshold: float = -0.9,
+        patch_idx: Optional[int] = None,
         batch_size: int = 64,
     ) -> torch.Tensor:
-        """Sample the projective-axis codebook from a trained bank.
-
-        Runs calibration_images through the specified bank, averages
-        the M tensors, identifies antipodal row pairs, collapses to
-        axis representatives. Result is the bank's axis codebook on
-        ℝP^(D-1).
-
-        Args:
-            battery_idx: which battery
-            phase: which training phase ('epoch_1' / 'best' / 'final' typically)
-            calibration_images: [N, C, H, W] inputs for averaging.
-                Use 256-1024 samples for stable codebook.
-                Gaussian noise inputs work as a noise-distribution-independent
-                calibration probe.
-            patch_idx: which patch's M to read (default 0)
-            threshold: antipodal cosine threshold (default -0.9)
-            batch_size: forward-pass batch size for calibration
+        """Run calibration_images through bank, return stacked M tensors.
 
         Returns:
-            codebook: [n_axes, D] sphere-normed sign-canonicalized axes.
-                n_axes varies per bank (typically 24-27 at V=32 D=4).
+            If patch_idx is None: [N_images, n_patches, V, D] — full spatial
+            If patch_idx is int:  [N_images, V, D] — single patch (legacy)
         """
-        bank = self.bank(battery_idx, phase)
-        bank.eval()
-
         device = next(bank.parameters()).device
         calibration_images = calibration_images.to(device)
 
@@ -314,15 +319,158 @@ class BatteryArrayModel(PreTrainedModel):
             out = bank(chunk)
             if not isinstance(out, dict) or 'svd' not in out:
                 raise RuntimeError(
-                    f"Bank {battery_idx}/{phase} forward must return dict "
-                    f"with 'svd' key. compute_axis_codebook requires a "
-                    f"sphere-solver battery."
+                    "Bank forward must return dict with 'svd' key. "
+                    "Axis sampling requires a sphere-solver battery."
                 )
-            all_M.append(out['svd']['M'][:, patch_idx].cpu())
+            M = out['svd']['M']  # [B, n_patches, V, D]
+            if patch_idx is not None:
+                all_M.append(M[:, patch_idx].cpu())
+            else:
+                all_M.append(M.cpu())
+        return torch.cat(all_M, dim=0)
 
-        M_avg = torch.cat(all_M, dim=0).mean(dim=0)  # [V, D]
-        pairs, unpaired = identify_antipodal_pairs(M_avg, threshold=threshold)
-        return collapse_to_axes(M_avg, pairs, unpaired)
+    @torch.no_grad()
+    def compute_axis_codebook(
+        self,
+        battery_idx: int,
+        phase: str,
+        calibration_images: torch.Tensor,
+        sample_agg: str = 'mean',
+        patch_agg: str = 'mean',
+        patch_idx: Optional[int] = None,
+        threshold: float = -0.9,
+        batch_size: int = 64,
+    ) -> torch.Tensor:
+        """Sample the projective-axis codebook from one trained bank.
+
+        Args:
+            battery_idx: which battery
+            phase: which training phase ('epoch_1' / 'best' / 'final' typically)
+            calibration_images: [N, C, H, W] inputs for averaging
+            sample_agg: how to aggregate across calibration images.
+                'mean' (default), 'median', 'first', 'cat'.
+            patch_agg: how to aggregate across patches per image.
+                'mean' (default), 'median', 'first', 'cat'. Ignored if
+                patch_idx is set.
+            patch_idx: if set, use only this single patch index per image
+                (legacy behavior matching A0-A3 probes — the structural
+                projective verification path). Overrides patch_agg. Use this
+                to reproduce 000101's verified results exactly.
+            threshold: antipodal cosine threshold (default -0.9)
+            batch_size: forward-pass batch size
+
+        Returns:
+            codebook: [n_axes, D] sphere-normed sign-canonicalized axes.
+
+        Aggregation semantics:
+            mean/median/first reduce to a single [V, D] M_avg before the
+            collapse step. 'cat' at either level keeps the rows separate
+            so the collapse runs on a much larger M, producing a richer
+            (and larger) codebook.
+        """
+        bank = self.bank(battery_idx, phase)
+        bank.eval()
+
+        # Collect M (with optional single-patch shortcut for legacy)
+        M_collected = self._bank_M_collected(
+            bank, calibration_images,
+            patch_idx=patch_idx, batch_size=batch_size,
+        )
+
+        # Aggregate
+        if patch_idx is not None:
+            # Single-patch path — only sample agg applies
+            M_for_collapse = _aggregate_M(M_collected, sample_agg, 'sample')
+        else:
+            # Full per-patch tensor [N, P, V, D]
+            N, P, V, D = M_collected.shape
+
+            # Step 1: patch aggregation per image
+            if patch_agg == 'cat':
+                # Flatten patch dim into sample dim → [N*P, V, D]
+                M_after_patch = M_collected.reshape(N * P, V, D)
+            else:
+                # Aggregate per image's patches independently
+                per_image = []
+                for n in range(N):
+                    per_image.append(
+                        _aggregate_M(M_collected[n], patch_agg, 'patch')
+                    )
+                M_after_patch = torch.stack(per_image, dim=0)
+
+            # Step 2: sample aggregation
+            M_for_collapse = _aggregate_M(
+                M_after_patch, sample_agg, 'sample',
+            )
+
+        # If aggregation returned a stack (cat used), flatten the
+        # outer dim into V to give one big M tensor for collapse
+        if M_for_collapse.dim() == 3:
+            K, V, D = M_for_collapse.shape
+            M_for_collapse = M_for_collapse.reshape(K * V, D)
+
+        pairs, unpaired = identify_antipodal_pairs(
+            M_for_collapse, threshold=threshold,
+        )
+        return collapse_to_axes(M_for_collapse, pairs, unpaired)
+
+    @torch.no_grad()
+    def compute_axis_codebooks(
+        self,
+        targets: Sequence[Tuple[int, str]],
+        calibration_images: Union[
+            torch.Tensor, Dict[Tuple[int, str], torch.Tensor]
+        ],
+        sample_agg: str = 'mean',
+        patch_agg: str = 'mean',
+        patch_idx: Optional[int] = None,
+        threshold: float = -0.9,
+        batch_size: int = 64,
+    ) -> Dict[Tuple[int, str], torch.Tensor]:
+        """Batched codebook calibration across many (battery, phase) pairs.
+
+        Args:
+            targets: list of (battery_idx, phase) tuples to calibrate
+            calibration_images: either:
+                - a single tensor [N, C, H, W] used for all targets
+                  (typical: gaussian noise as a shared probe)
+                - a dict {(battery_idx, phase): tensor} for per-target
+                  calibration distributions
+            sample_agg, patch_agg, patch_idx, threshold, batch_size:
+                forwarded to compute_axis_codebook
+
+        Returns:
+            codebooks: dict {(battery_idx, phase): [n_axes, D] tensor}
+
+        Example:
+            # Single calibration set, many banks
+            targets = [(i, 'final') for i in range(16)]
+            codebooks = model.compute_axis_codebooks(
+                targets, gaussian_calib_imgs,
+            )
+
+            # Per-target calibration distributions
+            calib_per = {(i, 'final'): noise_imgs_for_type(i)
+                          for i in range(16)}
+            codebooks = model.compute_axis_codebooks(targets, calib_per)
+        """
+        is_per_target = isinstance(calibration_images, dict)
+
+        codebooks = {}
+        for tgt in targets:
+            calib = (calibration_images[tgt] if is_per_target
+                     else calibration_images)
+            codebooks[tgt] = self.compute_axis_codebook(
+                battery_idx=tgt[0],
+                phase=tgt[1],
+                calibration_images=calib,
+                sample_agg=sample_agg,
+                patch_agg=patch_agg,
+                patch_idx=patch_idx,
+                threshold=threshold,
+                batch_size=batch_size,
+            )
+        return codebooks
 
     @torch.no_grad()
     def encode_axes(
@@ -331,7 +479,7 @@ class BatteryArrayModel(PreTrainedModel):
         battery_idx: int,
         phase: str,
         codebook: torch.Tensor,
-        patch_idx: int = 0,
+        patch_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """Encode images against a bank's axis codebook.
 
@@ -341,14 +489,16 @@ class BatteryArrayModel(PreTrainedModel):
 
         Args:
             images: [B, C, H, W]
-            battery_idx: which battery to read M from
-            phase: which training phase
+            battery_idx, phase: which bank to read M from
             codebook: [n_axes, D] from compute_axis_codebook
-            patch_idx: which patch's M to read (default 0)
+            patch_idx: if set, use only that patch → returns [B, V, n_axes].
+                Otherwise return full per-patch activations
+                → [B, n_patches, V, n_axes].
 
         Returns:
-            activations: [B, V, n_axes] absolute cosines in [0, 1].
-                Higher = stronger axis activation for that input row.
+            activations: absolute cosines in [0, 1].
+                [B, V, n_axes] if patch_idx is set, else
+                [B, n_patches, V, n_axes].
         """
         bank = self.bank(battery_idx, phase)
         bank.eval()
@@ -358,13 +508,17 @@ class BatteryArrayModel(PreTrainedModel):
         codebook = codebook.to(device).to(images.dtype)
 
         out = bank(images)
-        M = out['svd']['M'][:, patch_idx]  # [B, V, D]
+        M_full = out['svd']['M']  # [B, n_patches, V, D]
 
-        norms = M.norm(dim=2, keepdim=True).clamp_min(1e-12)
-        unit = M / norms
-
-        # [B, V, D] @ [D, n_axes] → [B, V, n_axes]; abs for antipodal-equivalence
-        return torch.einsum('bvd,nd->bvn', unit, codebook).abs()
+        if patch_idx is not None:
+            M = M_full[:, patch_idx]  # [B, V, D]
+            norms = M.norm(dim=2, keepdim=True).clamp_min(1e-12)
+            unit = M / norms
+            return torch.einsum('bvd,nd->bvn', unit, codebook).abs()
+        else:
+            norms = M_full.norm(dim=3, keepdim=True).clamp_min(1e-12)
+            unit = M_full / norms
+            return torch.einsum('bpvd,nd->bpvn', unit, codebook).abs()
 
     @torch.no_grad()
     def quantize_axes(
@@ -373,13 +527,14 @@ class BatteryArrayModel(PreTrainedModel):
         battery_idx: int,
         phase: str,
         codebook: torch.Tensor,
-        patch_idx: int = 0,
+        patch_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """Hard quantization: each input row → strongest codebook axis index.
 
         Returns:
-            codes: [B, V] integer indices into codebook
+            codes: integer indices into codebook.
+                [B, V] if patch_idx is set, else [B, n_patches, V].
         """
         return self.encode_axes(
-            images, battery_idx, phase, codebook, patch_idx
+            images, battery_idx, phase, codebook, patch_idx,
         ).argmax(dim=-1)
