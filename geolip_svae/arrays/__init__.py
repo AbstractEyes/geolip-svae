@@ -21,11 +21,26 @@ Build a new array from an HF training repo:
         source_repo="AbstractPhil/geolip-svae-h2-64",
         spec_name="h2_64",
     )
+
+Read a trained bank's projective-axis codebook (empirically validated
+across 19 sphere-solver models, D ∈ {3, 4, 5}):
+    from geolip_svae.arrays import ProjectiveReader
+    reader = ProjectiveReader.from_bank(model.bank(0, 'final'), calib_inputs)
+    activations = reader.encode(new_M)   # [B, V, n_axes]
+    codes = reader.quantize(new_M)        # [B, V] discrete axis indices
 """
 
 from geolip_svae.arrays.config import BatteryArrayConfig
 from geolip_svae.arrays.model import BatteryArrayModel
 from geolip_svae.arrays.builder import build_array
+from geolip_svae.arrays.projective_reader import (
+    ProjectiveReader,
+    ProjectiveProbeMetrics,
+    identify_antipodal_pairs,
+    collapse_to_axes,
+    projective_pairwise_angles,
+    uniform_rp_baseline,
+)
 
 # Register with HF Auto* so the model loads without trust_remote_code
 # when geolip-svae is pip-installed.
@@ -39,7 +54,15 @@ except (ImportError, ValueError):
     pass
 
 __all__ = [
+    # Battery array (existing)
     "BatteryArrayConfig",
     "BatteryArrayModel",
     "build_array",
+    # Projective reader (new — see projective_reader.py)
+    "ProjectiveReader",
+    "ProjectiveProbeMetrics",
+    "identify_antipodal_pairs",
+    "collapse_to_axes",
+    "projective_pairwise_angles",
+    "uniform_rp_baseline",
 ]

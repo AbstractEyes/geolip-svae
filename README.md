@@ -190,7 +190,7 @@ The packaged `PatchSVAE` supports ablation toggles used by array training:
 
 ## FOR CLAUDE
 
-claude.md
+CLAUDE.md
 
 ## License
 
