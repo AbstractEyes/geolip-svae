@@ -51,10 +51,6 @@ __all__ = [
     "cv_of",
     "extract_patches",
     "stitch_patches",
-    # v2 model (hierarchical spectral cascade, v1 interface)
-    "PatchSVAEv2",
-    "HierarchyStage",
-    "GroupAttention",
     # Inference
     "load_model",
     "encode",
