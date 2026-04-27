@@ -38,129 +38,18 @@ from geolip_svae.arrays.config import BatteryArrayConfig
 # ════════════════════════════════════════════════════════════════════
 # Module-level helpers for projective-axis collapse
 # ════════════════════════════════════════════════════════════════════
+# These helpers were originally defined here. Their canonical home is
+# now ``geolip_svae.inference.codebook`` (scratchpad 000107). They are
+# re-exported from this module for backward compatibility with code
+# that already imports them from ``geolip_svae.arrays.model``.
 
-def identify_antipodal_pairs(
-    M: torch.Tensor,
-    threshold: float = -0.9,
-) -> Tuple[List[Tuple[int, int]], List[int]]:
-    """Find rows of M that form antipodal pairs (mutual-strongest matching).
-
-    Args:
-        M: [V, D] sphere-norm row vectors
-        threshold: cosine threshold for "antipodal", default -0.9
-
-    Returns:
-        pairs: list of (i, j) tuples with i < j
-        unpaired: row indices with no antipodal partner
-    """
-    M = M.detach().cpu()
-    norms = M.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    unit = M / norms
-    cosines = unit @ unit.T
-    cosines.fill_diagonal_(1.0)
-
-    V = M.shape[0]
-    claimed = [False] * V
-    pairs: List[Tuple[int, int]] = []
-
-    candidates = []
-    for i in range(V):
-        best_j = int(cosines[i].argmin())
-        best_cos = float(cosines[i, best_j])
-        if best_cos < threshold:
-            candidates.append((best_cos, i, best_j))
-    candidates.sort()
-
-    for _cos, i, j in candidates:
-        if claimed[i] or claimed[j]:
-            continue
-        if int(cosines[j].argmin()) == i or float(cosines[j, i]) < threshold:
-            pairs.append((min(i, j), max(i, j)))
-            claimed[i] = True
-            claimed[j] = True
-
-    unpaired = [i for i in range(V) if not claimed[i]]
-    return pairs, unpaired
-
-
-def collapse_to_axes(
-    M: torch.Tensor,
-    pairs: List[Tuple[int, int]],
-    unpaired: List[int],
-) -> torch.Tensor:
-    """Collapse antipodal pairs into single-axis representatives.
-
-    Each pair (i, j) becomes one axis: (row_i - row_j) / 2 normalized.
-    Each axis is sign-canonicalized.
-
-    Returns:
-        axes: [n_axes, D] where n_axes = len(pairs) + len(unpaired)
-    """
-    M = M.detach().cpu()
-    norms = M.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    unit = M / norms
-
-    representatives = []
-    for i, j in pairs:
-        merged = unit[i] - unit[j]
-        merged = merged / merged.norm().clamp_min(1e-12)
-        representatives.append(_canonicalize_sign(merged))
-
-    for i in unpaired:
-        representatives.append(_canonicalize_sign(unit[i].clone()))
-
-    if not representatives:
-        return torch.empty(0, M.shape[1], dtype=M.dtype)
-    return torch.stack(representatives, dim=0)
-
-
-def _canonicalize_sign(v: torch.Tensor) -> torch.Tensor:
-    """Flip v so its first nonzero coordinate is positive."""
-    for k in range(v.shape[0]):
-        if v[k].abs() > 1e-6:
-            return -v if v[k] < 0 else v
-    return v
-
-
-# ════════════════════════════════════════════════════════════════════
-# Aggregation helpers
-# ════════════════════════════════════════════════════════════════════
-
-SUPPORTED_AGG = ('mean', 'median', 'first', 'cat')
-
-
-def _aggregate_M(
-    M_stack: torch.Tensor,
-    method: str,
-    axis_label: str = '',
-) -> torch.Tensor:
-    """Aggregate M tensors stacked along dim 0.
-
-    Args:
-        M_stack: [N, V, D] tensor of M matrices
-        method: one of SUPPORTED_AGG
-        axis_label: descriptive name for error messages ('sample', 'patch')
-
-    Returns:
-        - 'mean'   → [V, D]
-        - 'median' → [V, D]
-        - 'first'  → [V, D] (just M_stack[0])
-        - 'cat'    → unchanged [N, V, D] — caller's job to handle multi-row
-                     codebook from concatenated samples/patches
-    """
-    if method not in SUPPORTED_AGG:
-        raise ValueError(
-            f"Unknown {axis_label} aggregation '{method}'. "
-            f"Supported: {SUPPORTED_AGG}"
-        )
-
-    if method == 'mean':
-        return M_stack.mean(dim=0)
-    if method == 'median':
-        return M_stack.median(dim=0).values
-    if method == 'first':
-        return M_stack[0]
-    return M_stack  # 'cat' — caller handles
+from geolip_svae.inference.codebook import (
+    identify_antipodal_pairs,
+    collapse_to_axes,
+    _canonicalize_sign,
+    _aggregate_M,
+    SUPPORTED_AGG,
+)
 
 
 # ════════════════════════════════════════════════════════════════════

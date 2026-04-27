@@ -29,13 +29,8 @@ from geolip_svae.model import (
     extract_patches,
     stitch_patches,
 )
-from geolip_svae.model_v2 import (
-    PatchSVAEv2,
-    HierarchyStage,
-    GroupAttention,
-)
 from geolip_svae.inference import load_model, encode, decode, reconstruct
-from geolip_svae.spectral_codebook import (
+from geolip_svae.experimental.experimental_codebook import (
     SpectralTokenizer,
     build_codebook,
     generate_patch,
