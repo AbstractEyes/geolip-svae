@@ -376,6 +376,24 @@ add it to `_extract_model_state`.
   rather than upstream-linked. The `PatchSVAE_F_Ablation` class there
   is the predecessor to the extended `PatchSVAE` in the package; they
   should produce identical state_dicts for H-group configs.
+- **Reconstruction MSE is essentially constant across input resolution
+  and tile size** at a given precision — within ~1% across a 36-config
+  sweep on h2-64 (sizes 128/256/512, tile_sizes 32/64/128/256/512). This
+  is correct. The model solves the same problem on the unit sphere
+  regardless of how many points it's given; reconstruction quality is
+  architecture-defined, not regime-defined. **Inverted, this is a
+  debugging signal**: if you ever see resolution-dependent MSE shifts at
+  fixed precision, something upstream is broken — boundary smoothing
+  failing, tile stitching corrupted, input distribution drifted from
+  what the model was trained on, or the SVD autocast-disable bypassed.
+  The flatness is the canary.
+- **bf16 reconstruction MSE is roughly 7× the fp32 floor** and stable
+  across all regimes at that elevated value. This is the mantissa
+  precision floor, not a bug. The M tensor lives on the unit sphere;
+  7-bit mantissa quantizes angular differences too coarsely and the
+  error compounds through SVD → decoder. fp16 (10-bit mantissa) sits
+  ~5% above fp32 and is fine for most uses; bf16 is for when memory
+  pressure matters more than reconstruction floor.
 
 ## When you're uncertain
 

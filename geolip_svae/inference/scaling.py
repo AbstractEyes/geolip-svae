@@ -4,15 +4,21 @@ geolip_svae.inference.scaling
 Resolution-aware encoding and reconstruction.
 
 Three modes:
-    'direct' — feed images straight through model(images). Fast, but
-               relies on the architecture tolerating non-native patch
-               counts in its spatial-aggregation layers.
+    'direct' — feed images straight through model(images). Fast at small
+               inputs, but cross-attention memory grows O(N^2) in total
+               patch count, so direct burns VRAM at large inputs.
     'tile'   — pad to tile_size multiple, iterate over tiles, run model
                per tile, stitch outputs (and crop padding for recon).
-               Always works at the cost of losing cross-tile context.
-    'auto'   — try 'direct' first, fall back to 'tile' on failure. The
-               diagnostic mode for "does this architecture handle larger
-               inputs natively?"
+               Lower peak VRAM; throughput often higher above the
+               direct-fits-in-one-tile threshold.
+    'auto'   — dispatch based on input size: direct when min(H, W) fits
+               in tile_size (one tile, no overhead), tile otherwise.
+               Falls back from direct to tile on exception.
+
+Default tile_size is 128 — empirically the hardware sweet spot on A100
+(1024 patches per 128x128 tile at ps=4 balances cross-attention cost
+with kernel launch overhead). On other hardware the optimum may shift;
+override tile_size at call site if you have a measurement that differs.
 
 Design principles (Abstract Powered Research framework v0):
     - No core limiters. patch_size, tile_size, batch_size all overridable.
@@ -26,6 +32,27 @@ from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn.functional as F
+
+
+# Hardware-determined tile size. The unit-sphere geometry that underlies
+# this model is regime-independent — reconstruction MSE is flat across
+# input sizes — so the optimal tile_size is set by the GPU's
+# attention-cost vs kernel-launch-overhead crossover, not by anything
+# about the model. 128 was confirmed across a 36-config throughput sweep
+# on A100 (sizes 128/256/512 × tile_sizes 32/64/128/256/512 × fp32/fp16/bf16).
+DEFAULT_TILE_SIZE = 128
+
+
+def _resolve_auto_mode(images: torch.Tensor, tile_size: int) -> str:
+    """For mode='auto', dispatch to 'direct' or 'tile' based on input size.
+
+    Direct wins when the input fits in one tile (no pad/reshape/stitch
+    overhead). Tile wins above that — direct's O(N^2) attention cost
+    grows faster than the per-tile work, so peak VRAM and per-image
+    latency both favor tile mode at larger sizes.
+    """
+    _, _, H, W = images.shape
+    return 'direct' if min(H, W) <= tile_size else 'tile'
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -116,7 +143,8 @@ def encode_at_scale(
     Args:
         model: any model whose forward returns ``dict`` with ``'svd'`` key
         images: (B, C, H, W)
-        tile_size: native resolution for tile mode (default 64)
+        tile_size: tile resolution for tile mode (default 128, the A100
+                   hardware sweet spot — see module docstring)
         mode: 'direct', 'tile', or 'auto'
         batch_size: forward-pass chunk size for tile mode
         patch_size: override the model's patch_size (default = model's own)
@@ -131,14 +159,17 @@ def encode_at_scale(
     """
     model.eval()
     if tile_size is None:
-        tile_size = 64
+        tile_size = DEFAULT_TILE_SIZE
     if mode not in ('direct', 'tile', 'auto'):
         raise ValueError(f"mode must be 'direct'/'tile'/'auto', got {mode!r}")
 
     ps = _resolve_patch_size(model, patch_size)
 
+    # Resolve auto → direct or tile based on input size.
+    chosen = _resolve_auto_mode(images, tile_size) if mode == 'auto' else mode
+
     # ── direct ──
-    if mode in ('direct', 'auto'):
+    if chosen == 'direct':
         try:
             out = model(images)
             svd = dict(out['svd'])
@@ -148,11 +179,13 @@ def encode_at_scale(
             svd['mode_used'] = 'direct'
             return svd
         except Exception as e:
-            if mode == 'direct':
+            if mode != 'auto':
                 raise
+            # Auto fallback: direct OOMed or otherwise failed; tile is
+            # the safer path. Surface the failure rather than silent.
             print(
-                f"[encode_at_scale] direct mode failed "
-                f"({type(e).__name__}: {str(e)[:120]}), "
+                f"[encode_at_scale] auto chose direct but it failed "
+                f"({type(e).__name__}: {str(e)[:120]}); "
                 f"falling back to tile mode"
             )
 
@@ -265,7 +298,8 @@ def reconstruct_at_scale(
     Args:
         model: any model whose forward returns ``dict`` with ``'recon'``
         images: (B, C, H, W)
-        tile_size: native resolution for tile mode (default 64)
+        tile_size: tile resolution for tile mode (default 128, the A100
+                   hardware sweet spot — see module docstring)
         mode: 'direct', 'tile', or 'auto'
         batch_size: chunk size for tile mode
         patch_size: override the model's patch_size
@@ -280,14 +314,17 @@ def reconstruct_at_scale(
     """
     model.eval()
     if tile_size is None:
-        tile_size = 64
+        tile_size = DEFAULT_TILE_SIZE
     if mode not in ('direct', 'tile', 'auto'):
         raise ValueError(f"mode must be 'direct'/'tile'/'auto', got {mode!r}")
 
     _resolve_patch_size(model, patch_size)  # validate early
 
+    # Resolve auto → direct or tile based on input size.
+    chosen = _resolve_auto_mode(images, tile_size) if mode == 'auto' else mode
+
     # ── direct ──
-    if mode in ('direct', 'auto'):
+    if chosen == 'direct':
         try:
             out = model(images)
             recon = out['recon']
@@ -299,11 +336,13 @@ def reconstruct_at_scale(
                 'mse_per_image': mse.cpu(),
             }
         except Exception as e:
-            if mode == 'direct':
+            if mode != 'auto':
                 raise
+            # Auto fallback: direct failed (typically OOM at large input);
+            # tile is the safer path. Surface the failure rather than silent.
             print(
-                f"[reconstruct_at_scale] direct mode failed "
-                f"({type(e).__name__}: {str(e)[:120]}), "
+                f"[reconstruct_at_scale] auto chose direct but it failed "
+                f"({type(e).__name__}: {str(e)[:120]}); "
                 f"falling back to tile mode"
             )
 
