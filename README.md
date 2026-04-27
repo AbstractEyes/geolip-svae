@@ -11,14 +11,37 @@ pip install git+https://github.com/AbstractEyes/geolip-svae.git
 ```
 
 ```python
-from geolip_svae import PatchSVAE, load_model, reconstruct
+from geolip_svae import load_model
+from geolip_svae.inference import (
+    InferenceEngine, make_calibration, Codebook,
+)
 
 # Load a pretrained model
-model, cfg = load_model(hf_version='v12_imagenet128')  # Fresnel
-out = model(images)  # out['recon'], out['svd']['S'], out['svd']['U'], out['svd']['Vt']
-
-# Or Freckles (2.5M params, D=4, 4×4 patches)
 model, cfg = load_model(hf_version='v40_freckles_noise')
+
+# Run inference through the engine — handles arbitrary resolution
+engine = InferenceEngine(model)
+recon = engine.reconstruct(images_64x64)['recon']
+recon_large = engine.reconstruct(images_512x512, mode='auto')['recon']
+
+# Extract the projective-axis codebook
+calib = make_calibration('sixteen_noise', n=64, size=64)
+codebook = engine.extract_codebook(
+    calib, attach=True,
+    model_id='v40_freckles_noise', calibration_name='sixteen_noise',
+)
+print(codebook)
+# Codebook(D=4, n_axes=35, pairs=13, unpaired=22, dev=-0.0426, clean=True)
+
+# Project test inputs onto the codebook axes
+out = engine.encode_axes(test_images)
+activations = out['activations']  # [B, n_patches, V, n_axes]
+
+# Persist the codebook for reuse (safetensors + JSON sidecar)
+codebook.save('codebooks/freckles_v40__sixteen_noise')
+
+# ...and load it later, possibly into a different engine
+cb_loaded = Codebook.load('codebooks/freckles_v40__sixteen_noise')
 ```
 
 ## Architecture
@@ -97,26 +120,85 @@ All 16 types: 1.00× match, omega distance = 0.000000
 4×4 patches are truly atomic — resolution-independent spectral descriptors
 ```
 
-**Grandmaster single-shot denoising** (noisy→clean, one pass):
-```
-σ=0.2: near-Fresnel quality
-σ=0.5: full structure preserved
-σ=1.0: recovers from visual destruction
+## Projective-Axis Codebooks
+
+Every trained sphere-solver tested produces an M tensor whose rows, when
+antipodal pairs are merged via mutual-strongest matching, form a
+near-uniformly-distributed codebook on **ℝP^(D-1)**. The collapse method
+is a deterministic tensor operation, not a learned property:
+
+```python
+from geolip_svae.inference import (
+    InferenceEngine, extract_codebook, make_calibration,
+)
+
+# Verify the projective property on any sphere-solver
+calib = make_calibration('sixteen_noise', n=64, size=64)
+cb = extract_codebook(model, calib, model_id='v40_freckles_noise',
+                       calibration_name='sixteen_noise')
+
+print(cb.metadata.deviation)         # signed distance from uniform RP^(D-1)
+print(cb.is_projective_clean())      # |deviation| < 0.05
 ```
 
-## Package Structure
+`Codebook` is a first-class artifact: extract once, save as a
+safetensors + JSON sidecar pair, reuse across inference runs.
+`InferenceEngine.encode_axes()` projects M onto the codebook axes;
+`InferenceEngine.quantize_axes()` returns nearest-axis indices.
+
+### Verification (Phase U / U5 — 6 cells, all projective-clean)
+
+| Model | D | V | n_axes | pairs | deviation | clean |
+|---|---|---|---|---|---|---|
+| h2-64 battery_0 (gaussian) | 4 | 32 | 27 | 5 | +0.012 | ✓ |
+| h2-64 battery_0 (sixteen_noise) | 4 | 32 | 27 | 5 | +0.012 | ✓ |
+| Freckles v40 (gaussian) | 4 | 48 | 35 | 13 | −0.043 | ✓ |
+| Freckles v40 (sixteen_noise) | 4 | 48 | 34 | 14 | −0.040 | ✓ |
+| Johanna v18 (gaussian) | 16 | 256 | 231 | 25 | +0.040 | ✓ |
+| Johanna v18 (sixteen_noise) | 16 | 256 | 229 | 27 | +0.040 | ✓ |
+
+Calibration mismatch (gaussian vs sixteen_noise) shifts the codebook
+metadata by less than 0.003 deviation in every case. The codebook is
+the model's, not the input's. Direct extraction works at all tested D
+values — no distillation training required.
+
+Reproduce:
+```bash
+python -m geolip_svae.tests.u5_codebook_capacity --n-calib 64
+```
+
+For the full discovery story see scratchpad entries 000099–000107
+and the ft1/ft2 articles at the end of this README.
 
 ```
 geolip_svae/
-├── model.py             PatchSVAE, SpectralCrossAttention, BoundarySmooth, gram_eigh_svd
-├── inference.py         load_model, encode, decode, reconstruct, VERSIONS
-├── train.py             Unified trainer (7 presets)
-├── diagnostic.py        12-test universal diagnostic battery
-├── spectral_codebook.py Noise-native tokenizer for Alexandria
-├── noise_diagnostic.py  Freckles piecemeal resolution test (6 tests)
-├── arrays/              BatteryArrayConfig, BatteryArrayModel, build_array, specs/
-└── __init__.py          Package exports
+├── model.py              PatchSVAE, SpectralCrossAttention, BoundarySmooth, gram_eigh_svd
+├── inference/            Production inference framework (v0.7.0+)
+│   ├── loading.py        load_model, VERSIONS, list_versions
+│   ├── scaling.py        encode_at_scale / reconstruct_at_scale (direct/tile/auto)
+│   ├── calibration.py    Calibration data generators (registry pattern)
+│   ├── codebook.py       Codebook artifact, extract_codebook, antipodal-collapse helpers
+│   ├── engine.py         InferenceEngine — orchestrator with codebook lifecycle
+│   └── legacy.py         Back-compat shims (encode/decode/reconstruct/compute_axis_codebook)
+├── arrays/               BatteryArrayConfig, BatteryArrayModel, build_array, specs/
+├── experimental/         Preserved earlier variants — not part of the canonical path
+│   ├── spectral_cell.py
+│   ├── spectral_battery.py
+│   └── experimental_codebook.py   (formerly spectral_codebook.py)
+├── tests/                Phase U lens-scope test framework
+│   ├── framework.py      LensScopeTestCase base + 3 measurement axes
+│   ├── u0_smoke_test.py  Framework integrity gate (15 tests, ~5s)
+│   └── u5_codebook_capacity.py   Cross-band codebook capacity test
+├── train.py              Unified trainer (7 presets)
+├── diagnostic.py         12-test universal diagnostic battery
+├── noise_diagnostic.py   Freckles piecemeal resolution test (6 tests)
+└── __init__.py           Package exports + back-compat surface
 ```
+
+The `inference/` package is the recommended public surface. Pre-v0.7.0 code that
+imports `encode`, `decode`, `reconstruct`, `batched_forward`, or
+`compute_axis_codebook` directly from `geolip_svae.inference` continues to work
+via shims in `inference/legacy.py`.
 
 ## Dependencies
 
@@ -124,6 +206,7 @@ geolip_svae/
 - torch >= 2.1.0
 - transformers >= 4.40.0 (battery arrays, AutoModel interface)
 - huggingface-hub >= 0.20.0
+- safetensors >= 0.4.0 (codebook persistence)
 
 ## Training
 
@@ -148,17 +231,27 @@ python -m geolip_svae.diagnostic --hf v12_imagenet128
 python -m geolip_svae.noise_diagnostic --model v40_freckles_noise
 ```
 
-## Spectral Codebook
+## Spectral Codebook (experimental)
 
-Noise-native tokenizer mapping text characters to spectral noise signatures:
+A pre-rebuild noise-native tokenizer mapping text characters to spectral
+noise signatures. Lives in the `experimental/` subpackage and is
+distinct from the projective-axis `Codebook` artifact described above —
+the spectral codebook does NOT perform antipodal-pair collapse and
+reports different geometric statistics. Preserved for the Alexandria
+text-as-noise pathway.
 
 ```python
 from geolip_svae import SpectralTokenizer, build_codebook
+# (lazily re-exported from geolip_svae.experimental.experimental_codebook)
 
 codebook = build_codebook(save_path='codebook.json')
 tokenizer = SpectralTokenizer(codebook)
 image, ids, strings = tokenizer.text_to_image("Hello, world!")
 ```
+
+For projective-axis codebooks (the canonical path for sphere-solver
+inference), see [Projective-Axis Codebooks](#projective-axis-codebooks)
+above.
 
 ## Battery Arrays
 
