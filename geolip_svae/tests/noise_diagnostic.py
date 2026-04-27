@@ -12,8 +12,8 @@ which image it came from, then:
 This diagnostic runs all permutations across noise types and resolutions.
 
 Usage:
-    python -m geolip_svae.noise_diagnostic --model v40_freckles_noise
-    python -m geolip_svae.noise_diagnostic --checkpoint /path/to/best.pt
+    python -m geolip_svae.tests.noise_diagnostic --model v40_freckles_noise
+    python -m geolip_svae.tests.noise_diagnostic --checkpoint /path/to/best.pt
 """
 
 import os

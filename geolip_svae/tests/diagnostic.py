@@ -4,12 +4,12 @@ Universal SVAE Diagnostic Battery
 One script. Any checkpoint. Every dataset.
 
 Usage (CLI):
-    python -m geolip_svae.diagnostic --hf v13_imagenet256
-    python -m geolip_svae.diagnostic --hf-file v18_johanna_curriculum/checkpoints/epoch_0300.pt
-    python -m geolip_svae.diagnostic --checkpoint /path/to/best.pt
+    python -m geolip_svae.tests.diagnostic --hf v13_imagenet256
+    python -m geolip_svae.tests.diagnostic --hf-file v18_johanna_curriculum/checkpoints/epoch_0300.pt
+    python -m geolip_svae.tests.diagnostic --checkpoint /path/to/best.pt
 
 Usage (Python):
-    from geolip_svae.diagnostic import run
+    from geolip_svae.tests.diagnostic import run
     results = run(hf_version='v13_imagenet256')
 
 Tests:

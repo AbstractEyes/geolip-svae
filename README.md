@@ -185,13 +185,14 @@ geolip_svae/
 │   ├── spectral_cell.py
 │   ├── spectral_battery.py
 │   └── experimental_codebook.py   (formerly spectral_codebook.py)
-├── tests/                Phase U lens-scope test framework
+├── tests/                Diagnostic + Phase U lens-scope tests
 │   ├── framework.py      LensScopeTestCase base + 3 measurement axes
 │   ├── u0_smoke_test.py  Framework integrity gate (15 tests, ~5s)
-│   └── u5_codebook_capacity.py   Cross-band codebook capacity test
+│   ├── u5_codebook_capacity.py   Cross-band codebook capacity test
+│   ├── diagnostic.py     12-test universal diagnostic battery (D=16 models)
+│   ├── noise_diagnostic.py       Freckles piecemeal resolution test (6 tests)
+│   └── noise_stress_test.py      Freckles extreme-resolution + OOD stress test
 ├── train.py              Unified trainer (7 presets)
-├── diagnostic.py         12-test universal diagnostic battery
-├── noise_diagnostic.py   Freckles piecemeal resolution test (6 tests)
 └── __init__.py           Package exports + back-compat surface
 ```
 
@@ -225,10 +226,13 @@ python -m geolip_svae.train --list-presets
 
 ```bash
 # Universal diagnostic (D=16 models)
-python -m geolip_svae.diagnostic --hf v12_imagenet128
+python -m geolip_svae.tests.diagnostic --hf v12_imagenet128
 
 # Freckles piecemeal test
-python -m geolip_svae.noise_diagnostic --model v40_freckles_noise
+python -m geolip_svae.tests.noise_diagnostic --model v40_freckles_noise
+
+# Freckles extreme-resolution + OOD stress test
+python -m geolip_svae.tests.noise_stress_test --model v40_freckles_noise
 ```
 
 ## Spectral Codebook (experimental)

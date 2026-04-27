@@ -56,6 +56,100 @@ is the **sphere-solver** variant — used by the h2-64 battery array. It
 replaces SVD with a learned linear readout; downstream code treats the
 readout output as U, column norms as S, identity as Vt.
 
+## The `inference/` package (the canonical inference path)
+
+Production inference goes through `geolip_svae.inference.InferenceEngine`,
+not through `model.forward()` directly and not through the legacy flat
+encode/decode/reconstruct/compute_axis_codebook functions. The flat API
+still works via shims in `inference/legacy.py`, but new code uses the
+engine.
+
+The architectural rule for the inference layer is **no core limiters**.
+`patch_size`, `tile_size`, calibration distribution, codebook source,
+aggregation method — all overridable at engine construction or per-call.
+If you find yourself hard-coding an assumption (e.g. "patch_size is
+always 4"), that's a regression. The engine accepts overrides because
+users may want to inference Fresnel with non-native patch sizes for
+diagnostic reasons; the model will fail loudly if it doesn't tolerate
+the override, which is the desired behavior.
+
+`PatchSVAEv2` was removed entirely (scratchpad 000107). Loading a v2
+checkpoint raises `UnsupportedCheckpointError` with a clear "re-train
+as v1" message. Don't try to revive it.
+
+Module ownership inside `inference/`:
+
+```
+loading.py     — load_model + VERSIONS registry + checkpoint resolution
+scaling.py     — encode_at_scale / reconstruct_at_scale (direct/tile/auto)
+calibration.py — calibration data generators with registry pattern
+codebook.py    — Codebook artifact + extract_codebook + collapse helpers
+engine.py      — InferenceEngine orchestrator
+legacy.py      — back-compat shims (encode/decode/reconstruct/...)
+```
+
+When extending inference, put new code in the module that owns its
+responsibility — not in `engine.py` just because the engine is the
+top-level surface.
+
+## Projective-axis codebooks
+
+The empirical finding (scratchpad 000101, ft2 article): every trained
+sphere-solver tested at D=3, 4, 16 produces an M tensor whose rows,
+when antipodal pairs are merged via mutual-strongest matching, form a
+near-uniformly-distributed codebook on ℝP^(D-1). Verified across
+h2-64, Freckles, Johanna, plus the earlier single-bank A0–A3 probes.
+The collapse method is a deterministic tensor operation, not a
+learned property.
+
+The `Codebook` artifact is how you use this:
+
+```python
+from geolip_svae.inference import (
+    InferenceEngine, Codebook, extract_codebook, make_calibration,
+)
+
+calib = make_calibration('sixteen_noise', n=64, size=64)
+cb = extract_codebook(
+    model, calib,
+    model_id='v40_freckles_noise', calibration_name='sixteen_noise',
+)
+cb.save('codebooks/freckles_v40__sixteen_noise')   # safetensors + JSON
+cb = Codebook.load('codebooks/freckles_v40__sixteen_noise')
+
+engine = InferenceEngine(model)
+engine.attach_codebook(cb)
+out = engine.encode_axes(images)   # projects M onto cb.axes
+```
+
+Things to know before writing codebook code:
+
+- The four collapse helpers (`identify_antipodal_pairs`,
+  `collapse_to_axes`, `_canonicalize_sign`, `_aggregate_M`) live in
+  `inference/codebook.py`. They were relocated from `arrays/model.py`,
+  which now re-imports them for back-compat. Don't add new collapse
+  logic in `arrays/model.py` — go to `codebook.py`.
+
+- `extract_codebook(...)` returns a full `Codebook` artifact with
+  metadata. The legacy `compute_axis_codebook(...)` shim returns just
+  the axes tensor — fine for old code, but new code uses
+  `extract_codebook` so the metadata flows through.
+
+- Compatibility check is on by default. `engine.attach_codebook(cb)`
+  raises `CodebookIncompatibleError` if `cb.D != model.D`. Cross-model
+  experiments (apply Codebook X to model Y) require
+  `InferenceEngine(model, require_codebook_compatibility=False)` at
+  construction. This is opt-in for a reason — silently mis-projecting
+  M onto the wrong axes is a hard bug to debug.
+
+- Patch-aggregation default is `'mean'` (per-patch averaging across
+  all patches per image). The legacy `patch_idx=0` path was a silent
+  bug for downstream classification — it carried unchallenged from
+  training-time CV measurement into A0–A3 (where it didn't matter)
+  into production code (where it cost ~88% of the spatial signal).
+  Kept as opt-in for reproducing A0–A3 verifications, NOT for
+  production use. See scratchpad 000104.
+
 ## Architecture-identity invariants (for battery arrays)
 
 When a PatchSVAE is instantiated to load weights from a specific trained
@@ -132,6 +226,15 @@ name, and instantiates `n_banks` of them with `config.battery_kwargs`.
 This means adding a new array type does **not** require editing
 `BatteryArrayModel`. Just write a new spec.
 
+`BatteryArrayModel` also has projective-codebook methods:
+`compute_axis_codebook(battery_idx, phase, ...)`,
+`compute_axis_codebooks(targets, ...)` (batched across many banks),
+`encode_axes(images, ...)`, `quantize_axes(images, ...)`. These delegate
+to the helpers in `inference/codebook.py` (relocated from this module
+during the inference rebuild). The `arrays/model.py` re-imports
+preserve back-compat for any code still importing
+`identify_antipodal_pairs` etc. from here.
+
 ### Adding a new array spec
 
 1. Copy `specs/h2_64.py` to `specs/your_new_array.py`.
@@ -177,6 +280,31 @@ model = BatteryArrayModel(config)
 print(f"Per-bank: {sum(p.numel() for p in model.banks[0].parameters()):,}")
 # Compare against one real checkpoint from the source repo
 ```
+
+## `experimental/` subpackage
+
+Three modules: `spectral_cell`, `spectral_battery`, `experimental_codebook`
+(the last is the renamed `spectral_codebook`). They're preserved earlier
+sphere-solver variants and codebook tooling that pre-date the
+projective-axis discovery. They are NOT the canonical inference path.
+
+Be aware:
+
+- `experimental_codebook` is **not** the projective `Codebook` artifact.
+  It pre-dates the antipodal-collapse method and reports different
+  geometric statistics. Don't conflate the two. Use `Codebook` from
+  `inference/codebook.py` for new work.
+
+- Anything in `experimental/` may change without warning. The package's
+  stability promise is on `inference/` and the canonical surfaces, not
+  here.
+
+- These modules import at package-load time via `experimental/__init__.py`.
+  Module-level `print()` statements there fire on every
+  `import geolip_svae`. `spectral_battery.py` had a "Has conduit" /
+  "Has no conduit, defaulting to invalid code" pair at the top that
+  escaped this way; both were silenced. If you add new code here,
+  no module-level prints — use logging or just track state in a flag.
 
 ## Common problems and where to look
 
