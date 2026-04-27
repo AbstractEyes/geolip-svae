@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 """
@@ -103,10 +102,8 @@ class BaseConfig:
 
 try:
     from geolip_core.linalg.conduit import FLEighConduit, ConduitPacket  # type: ignore
-    print("Has conduit")
     _HAS_GEO_CONDUIT = True
 except Exception:  # pragma: no cover - fallback for standalone usage
-    print("Has no conduit, defaulting to invalid code")
     _HAS_GEO_CONDUIT = False
 
     @dataclass

@@ -89,7 +89,7 @@ def _load_h2_64_battery_0(device: str = 'cuda'):
     """
     from geolip_svae.arrays import BatteryArrayModel
     arr = BatteryArrayModel.from_pretrained(
-        'AbstractPhil/geolip-svae-h2-64-batteries',
+        'AbstractPhil/geolip-svae-h2-64',
     )
     arr.to(device).eval()
     bank = arr.bank(battery_idx=0, phase='final')
@@ -297,10 +297,18 @@ def render_markdown(
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         if 'error' in r:
+            err = r['error']
+            # Truncate + sanitize for markdown table cell:
+            #   - newlines break row layout
+            #   - pipes break column layout
+            #   - HF errors include a multi-line "If this is a private..." note
+            err_short = err.replace('\n', ' ').replace('|', '/')
+            if len(err_short) > 80:
+                err_short = err_short[:77] + '...'
             lines.append(
                 f"| {r['display_name']} | {r['calibration']} | "
                 f"— | — | — | — | — | — | — | — | "
-                f"❌ ERROR: {r['error']} |"
+                f"❌ {err_short} |"
             )
             continue
         clean_mark = '✓' if r['is_projective_clean'] else '✗'
