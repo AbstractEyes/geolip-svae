@@ -73,9 +73,9 @@ users may want to inference Fresnel with non-native patch sizes for
 diagnostic reasons; the model will fail loudly if it doesn't tolerate
 the override, which is the desired behavior.
 
-`PatchSVAEv2` was removed entirely (scratchpad 000107). Loading a v2
-checkpoint raises `UnsupportedCheckpointError` with a clear "re-train
-as v1" message. Don't try to revive it.
+`PatchSVAEv2` was removed entirely during the inference framework
+rebuild. Loading a v2 checkpoint raises `UnsupportedCheckpointError`
+with a clear "re-train as v1" message. Don't try to revive it.
 
 Module ownership inside `inference/`:
 
@@ -94,13 +94,12 @@ top-level surface.
 
 ## Projective-axis codebooks
 
-The empirical finding (scratchpad 000101, ft2 article): every trained
-sphere-solver tested at D=3, 4, 16 produces an M tensor whose rows,
-when antipodal pairs are merged via mutual-strongest matching, form a
-near-uniformly-distributed codebook on ℝP^(D-1). Verified across
-h2-64, Freckles, Johanna, plus the earlier single-bank A0–A3 probes.
-The collapse method is a deterministic tensor operation, not a
-learned property.
+The empirical finding: every trained sphere-solver tested at D=3, 4, 16
+produces an M tensor whose rows, when antipodal pairs are merged via
+mutual-strongest matching, form a near-uniformly-distributed codebook
+on ℝP^(D-1). Verified across h2-64, Freckles, Johanna, plus 17+ earlier
+single-bank experiments. The collapse method is a deterministic tensor
+operation, not a learned property.
 
 The `Codebook` artifact is how you use this:
 
@@ -145,10 +144,11 @@ Things to know before writing codebook code:
 - Patch-aggregation default is `'mean'` (per-patch averaging across
   all patches per image). The legacy `patch_idx=0` path was a silent
   bug for downstream classification — it carried unchallenged from
-  training-time CV measurement into A0–A3 (where it didn't matter)
-  into production code (where it cost ~88% of the spatial signal).
-  Kept as opt-in for reproducing A0–A3 verifications, NOT for
-  production use. See scratchpad 000104.
+  training-time CV measurement into the early structural verification
+  probes (where it didn't matter) into production code (where it cost
+  ~88% of the spatial signal in downstream classifiers). Kept as
+  opt-in for reproducing those original verifications, NOT for
+  production use.
 
 ## Architecture-identity invariants (for battery arrays)
 
