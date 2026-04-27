@@ -17,7 +17,7 @@ spectral cross-attention and sphere-normalized encoding.
     image, ids, strings = tokenizer.text_to_image("Hello, world!")
 """
 
-__version__ = "0.6.0"
+__version__ = "0.9.0"
 
 from geolip_svae.model import (
     PatchSVAE,
