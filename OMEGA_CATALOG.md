@@ -37,6 +37,274 @@ A "potential" is any trained instance OR sweep candidate that has run through th
 
 ---
 
+## The load-bearing stack (non-negotiable for any recipe)
+
+Architectural primitives that make the omega regime exist. If any row is absent, the configuration is **not** an omega recipe — these are not tunable hyperparameters, they are the substrate.
+
+| primitive | code | breaks if removed |
+| --- | --- | --- |
+| Sphere-norm M rows | `M = F.normalize(M, dim=-1)` before SVD/readout | scale-explosion snap (G2/G4 confirm dev +0.16-0.36 across all bands) |
+| fp64 SVD path | `_svd_fp64` autocast-disabled, fp64 Gram + sqrt + U-recovery, floors 1e-24/1e-16 | discharge spikes, max_grad >1000 (paste 019) |
+| Orthogonal init on encoder readout | `nn.init.orthogonal_(enc_out.weight)`, re-applied after L-group overrides | L2/L3/L4 init variants regress |
+| Bounded-α cross-attn | `S_out = S · (1 + α · tanh(...))`, α ≤ max_α via sigmoid | unbounded-α (I4) poisons spectrum |
+| BoundarySmooth zero-init conv | identity-at-init smoothing post-stitch | boundary inconsistency under tile stitching |
+| Pure Adam (NEVER AdamW) | `torch.optim.Adam` | weight decay fights geometric structure |
+| No BatchNorm, no Dropout | — | spectral structure destabilizes |
+| No global average pool | flatten or spatial statistics | accuracy 70% → 29% in geometric encoders |
+| Patch-based forward | all components per-patch except cross-attn | breaks resolution invariance by design |
+
+
+---
+
+## The recipes
+
+Each recipe is a **named configuration** with verified or predicted omega signature. Empirical instances are linked to the tier inventory below.
+
+### Recipe A-class — Johanna / Fresnel (workhorse)
+
+```
+matrix_v=256, D=16, patch_size=16, hidden=768, depth=4, n_cross_layers=2
+~17M params, full SVD path (svd_mode='svd_fp64')
+optimizer=Adam, lr=3e-4
+```
+
+- Omega clean at scale; teachable downstream as a single instance.
+- Cost: ~30GB VRAM, ~4hr/epoch. **Not stackable.**
+- Verified: Tier 1 `v50_fresnel_64`. Pending: Tier 9 Johanna D=16 codebook probe.
+- Use when: workhorse encoder; downstream needs single-instance legibility.
+
+### Recipe S-class — Freckles (the crown)
+
+```
+matrix_v=48, D=4, patch_size=4, hidden=384, depth=4, n_cross_layers=2
+~2.55M params, full SVD path, all defenses stacked
+optimizer=Adam, lr=3e-4
+```
+
+- Perfect noise reconstruction (val MSE 5e-6 reporting floor on 16-noise mixture).
+- Resolution-invariant by construction — weights at N=256 work at N=4096 (architectural, not empirical).
+- **Fails to teach as single instance.** Requires the full Freckles array for legibility.
+- Verified: Tier 1 `v40` (64×64), `v41` (256×256).
+- Use when: noise/texture substrate; downstream consumes the array.
+
+### Recipe H2-class — sphere-solver (h2-64 single bank)
+
+```
+matrix_v=32, D=4, patch_size=4, hidden=64, depth=1, n_cross_layers=1
+linear_readout=True, svd_mode='none', match_params=True, smooth_mid=16
+~57,215 params per bank, optimizer=Adam, lr=3e-3
+```
+
+- The canonical sphere-solver. SVD replaced by learned linear readout; column norms = S, identity = Vt.
+- Projective-clean at D=4: 24-27 axes/bank, dev +0.010 ±0.013 across 16 single-noise banks (A2 probe).
+- Stackable into 192-bank arrays; teaches via per-bank MSE signature.
+- Verified: Tier 1a (full 192-bank h2-64 array). Q-rank08 is the exact same architecture.
+- Use when: small-scale, multi-bank, codebook-engaged regime.
+
+**Identity invariants for loading h2-64 weights** (silent partial-load otherwise):
+
+- `smooth_mid=16` (NOT the ps-dependent default 8 at ps<16 — 440 params missing if wrong).
+- `linear_readout=True`, `svd_mode='none'`, `match_params=True`.
+- `n_heads` divides D — at D=4 with `n_heads=4`, head_dim=1.
+
+### Recipe H2a — minimum H2-class (Q-rank02)
+
+```
+matrix_v=32, D=4, patch_size=4, hidden=64, depth=0, n_cross_layers=0
+linear_readout=True, svd_mode='none', match_params=True
+~40,227 params, optimizer=Adam, lr=3e-3
+```
+
+- Minimum sphere-solver: depth+n_cross stripped to zero.
+- Q-MSE 0.00205 at 1000 batches — best Adam in Q-sweep.
+- Use when: floor-finding the sphere-solver capacity envelope at D=4.
+
+### Recipe P-class — minimum projective-clean (Q-rank09)
+
+```
+matrix_v=32, D=3, patch_size=4, hidden=64, depth=0, n_cross_layers=0
+linear_readout=True, svd_mode='none', match_params=True
+~28,899 params, optimizer=Adam, lr=3e-3
+```
+
+- Smallest projective-clean omega-class instance in the catalog.
+- LOW-band CV (~0.03), projective-clean on RP², 22 axes (10 pairs + 12 unpaired).
+- Use when: minimum parameter budget; D=3 RP² regime is acceptable.
+
+### Recipe F-class — experimental nursery
+
+```
+matrix_v ∈ {32, 48, 64}, D ∈ {2, 4, 8, 16}, patch_size ∈ {8, 16}
+hidden ∈ {32, 64, 128}, depth ∈ {1, 2}, n_cross_layers ∈ {1, 2}
+2K – 645K params per config, 1 epoch × 1M samples (triage regime)
+optimizer=Adam, lr=3e-4, soft-hand=CV-EMA prox boost (gradient-free)
+```
+
+- Designed to fail often. Collapse is a data point, not a bug.
+- Triage signal (1ep × 1M) ≡ 30ep × 200K for keep/kill discrimination at 1/5 wallclock.
+- Soft-hand: `loss = (1 + boost · prox) · recon_loss`; prox is Gaussian on `current_cv` vs CV-EMA. **No penalty term.**
+- Use when: searching for new viable templates; running large sweeps cheaply.
+
+### Recipe T — D=5 sweet spot (Phase T)
+
+```
+matrix_v=16, D=5, hidden=64, depth=1, n_cross_layers=1
+linear_readout=True, svd_mode='none', match_params=True
+optimizer=Adam, lr=3e-3, 1000 batches
+```
+
+- 62% projective-clean across 16 noise types — only V whose mean dev lands in band at D=5.
+- V=32 fails the cross-noise universality test at D=5 (Tier 6 supersedes A3's V=32 reading).
+- Use when: extending recipes to D=5 with realistic projective-clean expectation.
+
+### Recipe R — polytope-packing (predicted, not yet probed)
+
+```
+(V, D) ∈ {(16, 4) 16-cell, (8, 4) 8-cell, (20, 3) dodecahedron}
+hidden=64, depth=0, n_cross_layers=0
+linear_readout=True, svd_mode='none', match_params=True
+optimizer=Adam, lr=3e-3, 1000 batches
+```
+
+- Hypothesis: V matched to a known regular polytope vertex count for S^(D-1) → static rows, no antipodal pair rotation. Geometric frustration disappears.
+- Trained, weights in `phaseR_reports/` on HF; **codebooks not yet extracted**.
+- Use when: testing the natural-axis-count framework. Open item from 000101.
+
+### Recipe J5 (LOW-band, unverified)
+
+```
+matrix_v=128, D=16, patch_size=16, hidden=128, depth=1, n_cross_layers=1
+~1.46M params estimated, optimizer=Adam
+```
+
+- Strongest unverified noise-substrate candidate. LOW-band MSE 0.9595 with dev exactly 0.000 against uniform RP¹⁵ baseline — best of any non-H-group entry at LOW band.
+- Worth a U5-style projective probe before committing to long-horizon training.
+
+---
+
+## The substrate layer (input encoding rules)
+
+Architecture and encoding are **separate hypotheses**. Passthrough on one encoding does not invalidate the architecture (lesson from 000113: SP-bit passthrough on h2-class → byte-trigram engaged on the same arch).
+
+### Per-patch capacity arithmetic
+
+A `(C, ps, ps)` patch on the unit sphere supports:
+
+- **4×4 RGB ≈ 1M discriminable positions on S³** at 1° resolution.
+- The encoding's information cardinality must approach this for the codebook to do compression work.
+- Hard zeros are wasted capacity — every float in every patch should carry signal.
+
+### Engagement vs passthrough
+
+The full diagnostic table is the "Diagnostic signature" section above. Shorthand:
+
+- **Engaged**: α rises monotonically; row_cv leaves natural class band; ratio S0/SD drifts; erank dips below D; recovery curve climbs from low.
+- **Passthrough**: α stationary at init; row_cv in band; ratio ≈ 1.0; erank flat at D; recovery near-100% from ep 1.
+
+### Substrate pass/fail history
+
+| substrate | architecture probed | result | reason |
+| --- | --- | --- | --- |
+| 16-type `OmegaNoiseDataset` | A, S, F, h2 | Engaged | Original substrate; full per-patch density |
+| ImageNet random crops (sublens) | A (Fresnel-64 v50) | Engaged | Natural image structure; full RGB density |
+| Byte-trigram `(R,G,B)` (000113) | h2 | **Engaged** | 256³ cardinality per cell, every float carries signal |
+| Sentencepiece bit content (000112) | h2 | **Passthrough** | 1/3-filled patch with 32 hard-zero paddings — model bored |
+| Binary-tree i.i.d. Bernoulli (000111) | h2 | **Passthrough** | Sign-only signal; trivial under linear_readout=True |
+
+### Substrate design rules
+
+1. Every float in every patch should carry signal. Hard zeros = wasted capacity.
+2. Information cardinality per cell should approach 256³ for RGB (or the equivalent for non-RGB channel counts).
+3. Spatial coherence within the patch matters — noise/image/byte-trigram all have it; bit-encodings of token IDs do not.
+4. Test before training: compute the patch-space cardinality of your encoding. If it's orders of magnitude below per-patch capacity, expect passthrough.
+
+---
+
+## The triage protocol (verifying a candidate is potentially an omega)
+
+Run in order. Stop at first failure. Most candidates die at step 3 or 4.
+
+### Step 1. Architecture check (free, no training)
+
+- Inspect kwargs against the load-bearing stack. Missing items disqualify before any compute is spent.
+- Run the "debug move" from `CLAUDE.md`: instantiate, print `state_dict` keys + shapes, compare against a reference checkpoint. Mismatched `smooth_mid`, `n_heads`, `linear_readout`, `svd_mode`, `match_params` cause silent partial-loads under `strict=False`.
+
+### Step 2. Substrate check (free, no training)
+
+- Compute per-patch information cardinality of the input encoding.
+- If cardinality << per-patch capacity, expect passthrough — fix the encoding before training.
+
+### Step 3. 1-epoch triage (~minutes per config on a single GPU)
+
+- 1 epoch × 1M samples, gaussian-only training (`noise_types=[0]`).
+- Score on 16-noise per-noise generalization (256 samples per noise).
+- **Pass**: spectrum bounded (no scale-explosion snap); MSE within 2-3× class baseline.
+- **Fail**: NaN / divergence / snap event / MSE order-of-magnitude worse than class.
+
+### Step 4. 1000-batch convergence sweep (~hour per config on a single GPU)
+
+- Full optimizer trajectory at lr=3e-3 (Adam) or lr=1.0 (LBFGS post-fix).
+- **Pass**: MSE leadership in its band; CV stays in natural band; α trajectory shows engagement signature.
+- **Optimizer regime** (000100): Adam dominates ≥500 batches; LBFGS niche is short-budget probing (≤100 batches).
+
+### Step 5. Codebook extraction (the omega ratification)
+
+```python
+from geolip_svae.inference import (
+    InferenceEngine, extract_codebook, make_calibration,
+)
+
+calib = make_calibration('sixteen_noise', n=64, size=64)
+cb = extract_codebook(
+    model, calib,
+    model_id='...', calibration_name='sixteen_noise',
+)
+assert cb.is_projective_clean()         # |dev from uniform RP^(D-1)| < 0.05
+assert abs(cb.deviation()) < 0.05
+```
+
+- **Pass**: projective-clean, axis utilization > 0.95, ≤3 secondary antipodal pairs.
+- The candidate is now ratified as omega-class.
+
+### Step 6. Vacuum-seal test (cell deployability)
+
+- Freeze candidate parameters (`requires_grad=False`).
+- Train an adapter classifier around it on a downstream task.
+- **Pass**: CV / erank / S0 stay locked under host gradient stress; classifier learns.
+- **Fail**: geometry collapses → not deployable as a cell. (CE on cell internals "ripped the internals to shreds" — paste 023.)
+
+### Step 7. Bandwidth probe (downstream legibility)
+
+- Linear head on omega outputs, downstream task.
+- **Pass**: classifier achieves task-meaningful performance.
+- **Fail**: omega outputs lack representational bandwidth at this scale (S-class symptom).
+
+A candidate that passes 1–7 is a deployable omega cell ready for collective integration.
+
+---
+
+## Decision tree: which recipe?
+
+| Goal | Recipe | Why |
+| --- | --- | --- |
+| Stable workhorse encoder, single-instance teachable | A-class (Johanna/Fresnel) | Omega clean at scale; teaches downstream |
+| Best noise reconstruction, multi-bank deployment | S-class (Freckles) | Perfect recon; needs full array for legibility |
+| Small-scale, multi-bank ensemble, text/vision substrate | H2-class (h2-64) | 57K params/bank, projective-clean, stackable |
+| Minimum sphere-solver footprint at D=4 | H2a (Q-rank02) | 40K params, depth=0, n_cross=0, MSE 0.00205 |
+| Minimum projective-clean footprint at D=3 | P-class (Q-rank09) | 28.9K params, RP², MSE 0.028 |
+| Search for new templates cheaply | F-class triage | 1ep × 1M, designed to fail often |
+| D=5 representative | T (V=16) | Only V whose mean dev lands in band at D=5 |
+| Test natural-axis-count hypothesis | R polytope-packing | Predicts static-row H2-LIKE; codebooks unprobed |
+| LOW-band scale-up (unverified) | J5 | dev exactly 0.000 vs uniform RP¹⁵ baseline |
+
+---
+
+# Empirical catalog (trained and in-progress instances)
+
+The sections below are the empirical record backing the recipes above. Each tier represents a class of trained or in-progress instances with measured signatures.
+
+---
+
 ## TIER 1 — Trained, verified omega-class on HuggingFace
 
 | HF path | arch class | params | D | V | optimizer | natural CV | n_axes | dev | training content | verified by |
