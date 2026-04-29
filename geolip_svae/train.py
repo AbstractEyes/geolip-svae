@@ -10,6 +10,7 @@ Single entry point for all model variants. Replaces the previous train.py.
     Fresnel-64 (D=4 imgs): python -m geolip_svae.train --preset fresnel_64
     H2-64      (sphere):   python -m geolip_svae.train --preset h2_64_single
     BinTree    (substrate):python -m geolip_svae.train --preset bintree_proto
+    SP-bits    (substrate):python -m geolip_svae.train --preset sentencepiece_proto
 
     Streaming continuation:  python -m geolip_svae.train_streaming \
                                  --hf-version v50_fresnel_64
@@ -48,6 +49,8 @@ Listed presets:
     h2_64_single       H2-class single battery, gaussian only — for reproducing
                        individual h2-64 banks
     bintree_proto      Binary-tree substrate prototype on h2-64 architecture
+    sentencepiece_proto T5-base SentencePiece-bit substrate (first real-data
+                       prototype on h2-64 architecture; one token per patch)
 
 For long-running continuation of any trained model on streaming random crops
 (the "sublens perspective" mode that produced v50_fresnel_64's 140M+ images),
@@ -228,6 +231,32 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         ds_size=200_000, val_size=2_000,
         # Tree config
         tree_depth=4,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
+    # ── SentencePiece-bit substrate prototype ──
+    # First REAL-DATA prototype on the substrate path. Same h2-class architecture
+    # as bintree_proto. Each patch holds the 16-bit binary representation of one
+    # t5-base SentencePiece token ID (vocab 32128, fits in 15 bits, 16-bit
+    # encoding leaves a 1-bit buffer above vocab range). Per-image = 16 patches
+    # = 16 contiguous tokens from a wikitext-2 corpus excerpt. Reconstruction
+    # objective. cv_weight=0 — let the substrate self-solve to whatever
+    # geometry the SentencePiece bit distribution selects, not the noise band.
+    'sentencepiece_proto': dict(
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        dataset='sentencepiece_bits', img_size=16, batch_size=256,
+        lr=1e-3, epochs=20, target_cv=0.215,
+        hf_version='sentencepiece_proto_v1', save_every=5,
+        ds_size=200_000, val_size=2_000,
+        # SentencePiece config
+        sp_tokenizer='google-t5/t5-base',  # HF model id with spiece.model
+        sp_corpus='wikitext-2-raw-v1',     # HF datasets id
+        sp_n_bits=16,                      # bits per token (vocab 32128 < 2^15=32768)
+        # Soft-hand idle for self-solving on unknown attractor
+        cv_weight=0.0,
         # Diagnostics cadence
         report_every=200,
     ),
@@ -630,6 +659,221 @@ def bit_recovery_metrics(orig_trees: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# SENTENCEPIECE-BIT DATASET — first real-data substrate prototype
+# ═══════════════════════════════════════════════════════════════════
+
+class SentencePieceBitDataset(torch.utils.data.Dataset):
+    """T5-base SentencePiece token bits packed into (3, H, W) images.
+
+    Each 4x4 RGB patch (48 floats) holds:
+      - First n_bits floats: ±1 bit values of one token's ID (LSB-first)
+      - Remaining floats: zero padding
+
+    Image layout: (img_size // 4)^2 patches per image, each holding ONE
+    token. Tokens within an image come from a contiguous corpus excerpt,
+    so the substrate sees natural token-sequence locality.
+
+    Vocab: t5-base = 32128 < 2^15 = 32768. Default n_bits=16 leaves a
+    1-bit buffer above vocab range (clean byte alignment for downstream
+    decoders).
+    """
+
+    PATCH_FLOATS = 48
+
+    def __init__(self, size=200_000, img_size=16,
+                 tokenizer_id='google-t5/t5-base',
+                 corpus_id='wikitext-2-raw-v1',
+                 n_bits=16, split='train', seed=42,
+                 max_corpus_chars=20_000_000):
+        self.size = size
+        self.img_size = img_size
+        self.n_bits = n_bits
+        if n_bits > self.PATCH_FLOATS:
+            raise ValueError(
+                f"n_bits={n_bits} exceeds patch capacity {self.PATCH_FLOATS}")
+        self.n_pad = self.PATCH_FLOATS - n_bits
+        if img_size % 4 != 0:
+            raise ValueError(f"img_size must be divisible by 4, got {img_size}")
+        self.gh = self.gw = img_size // 4
+        self.n_patches = self.gh * self.gw  # tokens per image
+        self._base_seed = seed
+        self._call_count = 0
+        self._rng = np.random.default_rng(seed)
+
+        # Promote bare aliases to canonical org-prefixed paths. The bare names
+        # ('t5-base', 't5-small') now redirect to 'google-t5/...' on HF and
+        # the redirect is unauthenticated-restricted in some access tiers.
+        if tokenizer_id in ('t5-small', 't5-base', 't5-large', 't5-3b', 't5-11b'):
+            tokenizer_id = f'google-t5/{tokenizer_id}'
+
+        # ── Load tokenizer ──
+        # Two modes: tokenizer_id can be either:
+        #   (a) an HF repo id like 'google-t5/t5-base' → downloads spiece.model
+        #   (b) a local path ending in .model or .spm → loads directly
+        # We use the `sentencepiece` package directly (no transformers dep
+        # required just for tokenization).
+        import sentencepiece as spm
+        if os.path.isfile(tokenizer_id) and tokenizer_id.endswith(('.model', '.spm')):
+            spm_path = tokenizer_id
+            print(f"  [SentencePieceBitDataset] Loading local tokenizer "
+                  f"{tokenizer_id}...")
+        else:
+            from huggingface_hub import hf_hub_download
+            print(f"  [SentencePieceBitDataset] Loading tokenizer "
+                  f"{tokenizer_id}...")
+            spm_path = hf_hub_download(repo_id=tokenizer_id,
+                                        filename='spiece.model')
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.Load(spm_path)
+        self.vocab_size = self.sp.GetPieceSize()
+        max_token_id = self.vocab_size - 1
+        if max_token_id >= (1 << n_bits):
+            raise ValueError(
+                f"vocab_size={self.vocab_size} requires more than n_bits={n_bits}; "
+                f"max token id {max_token_id} >= 2^{n_bits} = {1 << n_bits}")
+        print(f"  [SentencePieceBitDataset] vocab={self.vocab_size}, "
+              f"max_id={max_token_id}, encoded as {n_bits} bits")
+
+        # ── Load and tokenize corpus (cached after first call) ──
+        # Two modes: corpus_id can be either:
+        #   (a) an HF datasets identifier like 'wikitext-2-raw-v1' or
+        #       'wikitext/wikitext-103-v1' → loaded via load_dataset
+        #   (b) a local path to a .txt file → loaded directly
+        from datasets import load_dataset
+        if os.path.isfile(corpus_id) and corpus_id.endswith(('.txt', '.text')):
+            print(f"  [SentencePieceBitDataset] Loading local corpus "
+                  f"{corpus_id}...")
+            with open(corpus_id, 'r', encoding='utf-8') as f:
+                full_text = f.read()
+        else:
+            print(f"  [SentencePieceBitDataset] Loading corpus "
+                  f"{corpus_id}...")
+            if corpus_id.startswith('wikitext'):
+                ds = load_dataset('wikitext', corpus_id, split=split)
+            else:
+                ds = load_dataset(corpus_id, split=split)
+            text_parts, total = [], 0
+            for record in ds:
+                txt = record.get('text', '')
+                if not txt or not txt.strip():
+                    continue
+                text_parts.append(txt)
+                total += len(txt)
+                if total >= max_corpus_chars:
+                    break
+            full_text = '\n'.join(text_parts)
+        # Cap text by char count if loaded from local
+        if len(full_text) > max_corpus_chars:
+            full_text = full_text[:max_corpus_chars]
+        print(f"  [SentencePieceBitDataset] Tokenizing {len(full_text):,} chars...")
+        self.token_ids = np.asarray(
+            self.sp.EncodeAsIds(full_text), dtype=np.int32)
+        if len(self.token_ids) < self.n_patches + 1:
+            raise RuntimeError(
+                f"Corpus too small: only {len(self.token_ids)} tokens, "
+                f"need at least {self.n_patches + 1}")
+        print(f"  [SentencePieceBitDataset] {len(self.token_ids):,} tokens. "
+              f"n_patches/img = {self.n_patches}")
+
+    def __len__(self):
+        return self.size
+
+    @staticmethod
+    def ids_to_bits(ids: np.ndarray, n_bits: int) -> np.ndarray:
+        """[N] int → [N, n_bits] ±1 floats, LSB-first."""
+        bit_indices = np.arange(n_bits, dtype=np.int32)
+        # Broadcast: (N, 1) >> (n_bits,) → (N, n_bits)
+        bits = ((ids[:, None] >> bit_indices[None, :]) & 1).astype(np.float32)
+        return bits * 2.0 - 1.0  # 0/1 → -1/+1
+
+    @staticmethod
+    def bits_to_ids(bits: np.ndarray) -> np.ndarray:
+        """[..., n_bits] sign-thresholded floats → [...] int ids, LSB-first."""
+        n_bits = bits.shape[-1]
+        bin_bits = (bits > 0).astype(np.int64)
+        powers = (1 << np.arange(n_bits, dtype=np.int64))
+        return (bin_bits * powers).sum(axis=-1)
+
+    def __getitem__(self, idx):
+        self._call_count += 1
+        if self._call_count % 1000 == 0:
+            self._rng = np.random.default_rng(int.from_bytes(os.urandom(4), 'big'))
+
+        # Random contiguous window of n_patches tokens
+        max_start = len(self.token_ids) - self.n_patches
+        start = int(self._rng.integers(0, max_start + 1))
+        ids = self.token_ids[start:start + self.n_patches]
+
+        # Encode each id to n_bits ±1 values
+        bits = self.ids_to_bits(ids, self.n_bits)  # [n_patches, n_bits]
+
+        # Pad to 48 floats per patch
+        padded = np.zeros((self.n_patches, self.PATCH_FLOATS), dtype=np.float32)
+        padded[:, :self.n_bits] = bits
+
+        # Reshape to (n_patches, 3, 4, 4) channels-first
+        patches = padded.reshape(self.n_patches, 3, 4, 4)
+
+        # Stitch into image (3, H, W)
+        img = patches.reshape(self.gh, self.gw, 3, 4, 4)
+        img = img.transpose(2, 0, 3, 1, 4)
+        img = img.reshape(3, self.img_size, self.img_size)
+
+        return torch.from_numpy(img), 0
+
+
+def decode_image_to_tokens(images: torch.Tensor, n_bits: int) -> torch.Tensor:
+    """Inverse of the SentencePiece-bit spatial layout.
+
+    Returns: [B, n_patches, n_bits] tensor of values close to ±1.
+    """
+    B, C, H, W = images.shape
+    assert C == 3 and H % 4 == 0 and W % 4 == 0
+    gh = gw = H // 4
+    p = images.reshape(B, 3, gh, 4, gw, 4)
+    p = p.permute(0, 2, 4, 1, 3, 5)  # [B, gh, gw, 3, 4, 4]
+    p = p.reshape(B, gh * gw, 48)
+    return p[..., :n_bits]  # [B, n_patches, n_bits]
+
+
+def token_bit_recovery_metrics(orig_bits: torch.Tensor,
+                                recon_bits: torch.Tensor) -> Dict[str, Any]:
+    """Per-bit and per-token recovery metrics for SentencePiece-bit content.
+
+    Args:
+        orig_bits:  [B, n_patches, n_bits] in {-1, +1}
+        recon_bits: [B, n_patches, n_bits] continuous floats
+
+    Returns dict with:
+        per_bit_acc:           overall fraction of correctly-recovered bits
+        token_exact_rate:      fraction of tokens with all bits correct
+        per_bit_position_acc:  list of n_bits accuracies (which bit positions
+                               are most/least reliable — LSB to MSB)
+        per_seq_position_acc:  list of n_patches accuracies (does the model
+                               handle position-1-in-sequence as well as
+                               position-N-in-sequence)
+    """
+    orig_signs = (orig_bits > 0).float()
+    recon_signs = (recon_bits > 0).float()
+    correct = (orig_signs == recon_signs).float()  # [B, n_patches, n_bits]
+
+    per_bit_acc = correct.mean().item()
+    # All bits correct in a token = exact match
+    token_exact_rate = correct.all(dim=-1).float().mean().item()
+    # Accuracy averaged over [B, n_patches] for each bit position
+    per_bit_position_acc = correct.mean(dim=(0, 1)).tolist()
+    # Accuracy averaged over [B, n_bits] for each sequence position
+    per_seq_position_acc = correct.mean(dim=(0, 2)).tolist()
+
+    return {
+        'per_bit_acc': per_bit_acc,
+        'token_exact_rate': token_exact_rate,
+        'per_bit_position_acc': per_bit_position_acc,
+        'per_seq_position_acc': per_seq_position_acc,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # PER-TYPE EVALUATION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -767,7 +1011,7 @@ def train(cfg: Dict[str, Any]):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     # ── Data ──
-    is_noise = is_text = is_image = is_tree = False
+    is_noise = is_text = is_image = is_tree = is_sentencepiece = False
 
     if dataset in ('tiny_imagenet', 'imagenet_128', 'imagenet_256'):
         train_loader, test_loader, _, _ = get_image_loaders(
@@ -839,6 +1083,32 @@ def train(cfg: Dict[str, Any]):
             num_workers=4, pin_memory=True)
         is_tree = True
 
+    elif dataset == 'sentencepiece_bits':
+        ds_size = cfg.get('ds_size', 200_000)
+        val_size = cfg.get('val_size', 2_000)
+        sp_tokenizer = cfg.get('sp_tokenizer', 't5-base')
+        sp_corpus = cfg.get('sp_corpus', 'wikitext-2-raw-v1')
+        sp_n_bits = cfg.get('sp_n_bits', 16)
+        # Single shared tokenization pass — train and val draw from the same
+        # corpus but with different RNG seeds, sampling different windows.
+        # num_workers=0 because the tokenized corpus + sp model are too large
+        # to copy into worker processes cheaply, and __getitem__ is fast.
+        train_ds = SentencePieceBitDataset(
+            size=ds_size, img_size=img_size,
+            tokenizer_id=sp_tokenizer, corpus_id=sp_corpus,
+            n_bits=sp_n_bits, seed=42)
+        val_ds = SentencePieceBitDataset(
+            size=val_size, img_size=img_size,
+            tokenizer_id=sp_tokenizer, corpus_id=sp_corpus,
+            n_bits=sp_n_bits, seed=999)
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=True, drop_last=True)
+        test_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=True)
+        is_sentencepiece = True
+
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -866,6 +1136,11 @@ def train(cfg: Dict[str, Any]):
     if is_tree:
         print(f"  Tree depth: {tree_depth}, "
               f"n_nodes: {train_ds.n_nodes}, n_pad: {train_ds.n_pad}")
+    if is_sentencepiece:
+        print(f"  SP tokenizer: {cfg.get('sp_tokenizer', 'google-t5/t5-base')}, "
+              f"corpus: {cfg.get('sp_corpus', 'wikitext-2-raw-v1')}, "
+              f"n_bits: {cfg.get('sp_n_bits', 16)}, "
+              f"vocab: {train_ds.vocab_size}, tokens/img: {train_ds.n_patches}")
     print("=" * 100)
 
     # ── Helpers ──
@@ -1087,12 +1362,36 @@ def train(cfg: Dict[str, Any]):
             writer.add_scalar('tree/exact_rate',
                               tree_metrics['tree_exact_rate'], epoch)
 
+        # Bit/token recovery for SentencePiece bits
+        sp_str = ""
+        sp_metrics = None
+        if is_sentencepiece:
+            sp_n_bits_eval = cfg.get('sp_n_bits', 16)
+            with torch.no_grad():
+                sample_imgs, _ = next(iter(test_loader))
+                sample_imgs = sample_imgs[:64].to(device)
+                sample_out = model(sample_imgs)
+                orig_bits = decode_image_to_tokens(sample_imgs, sp_n_bits_eval)
+                recon_bits = decode_image_to_tokens(sample_out['recon'],
+                                                    sp_n_bits_eval)
+                sp_metrics = token_bit_recovery_metrics(orig_bits, recon_bits)
+            sp_str = (f"bits={sp_metrics['per_bit_acc']*100:.1f}% "
+                      f"toks={sp_metrics['token_exact_rate']*100:.1f}%")
+            writer.add_scalar('sp/per_bit_acc',
+                              sp_metrics['per_bit_acc'], epoch)
+            writer.add_scalar('sp/token_exact_rate',
+                              sp_metrics['token_exact_rate'], epoch)
+            for bit_idx, acc in enumerate(sp_metrics['per_bit_position_acc']):
+                writer.add_scalar(f'sp/bit_pos_{bit_idx}_acc', acc, epoch)
+            for seq_idx, acc in enumerate(sp_metrics['per_seq_position_acc']):
+                writer.add_scalar(f'sp/seq_pos_{seq_idx}_acc', acc, epoch)
+
         print(f" {epoch:3d} | {total_loss/n_seen:.4f} {total_recon/n_seen:.4f} "
               f"{epoch_time:.0f}s | test={test_mse:.6f} | "
               f"S0={S_mean[0]:.3f} SD={S_mean[-1]:.3f} r={ratio:.2f} er={erank:.2f}"
               f" | cv={last_cv:.3f} band={'Y' if cv_in_band else 'N'} "
               f"Sd={s_delta:.5f} a={a_mean:.3f} g={epoch_max_grad:.1f} "
-              f"{byte_str} {tree_str} {type_str}")
+              f"{byte_str} {tree_str} {sp_str} {type_str}")
 
         # Per-epoch TB
         writer.add_scalar('epoch/test_mse', test_mse, epoch)
@@ -1119,6 +1418,7 @@ def train(cfg: Dict[str, Any]):
             'epoch_max_grad': epoch_max_grad,
             'epoch_time_s': epoch_time,
             'tree_metrics': tree_metrics,
+            'sp_metrics': sp_metrics,
         })
 
         # ── Curriculum: scheduled tier unlocks ──
