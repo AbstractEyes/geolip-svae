@@ -271,6 +271,33 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # Diagnostics cadence
         report_every=200,
     ),
+
+    # Byte-trigrams as RGB pixel-equivalents at 256×256.
+    # Each spatial cell of each 4×4 patch holds one (R,G,B) byte trigram from
+    # the corpus stream. 4096 patches × 16 cells × 3 bytes = 196,608 bytes per
+    # image (~192 KB of text, roughly a long Wikipedia article or chapter).
+    # No padding; every float carries signal. 16.7M-cardinality input per cell
+    # → ~1M-cardinality codebook capacity per patch on S^3 = real compression
+    # work for the codebook to do (unlike sentencepiece_proto, which gave the
+    # model a 1/3-filled patch with sign-only signal).
+    'byte_trigram_proto': dict(
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        dataset='byte_trigram', img_size=256, batch_size=8,
+        # H2-class natural band — informational. If the codebook actually
+        # engages at this scale (cross-attn α leaves 0.023, erank drops below
+        # 4.0, ratio leaves 1.0), CV will leave the band as well.
+        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        cv_band_lo=0.80, cv_band_hi=1.05,
+        hf_version='byte_trigram_proto_v1', save_every=2,
+        ds_size=20_000, val_size=200,
+        # ByteTrigram config
+        bt_corpus='wikitext-103-raw-v1',
+        bt_max_corpus_bytes=500_000_000,
+        # Diagnostics cadence
+        report_every=100,
+    ),
 }
 
 
@@ -885,6 +912,199 @@ def token_bit_recovery_metrics(orig_bits: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# BYTE-TRIGRAM DATASET (every cell is a pixel-equivalent RGB byte triple)
+# ═══════════════════════════════════════════════════════════════════
+
+class ByteTrigramDataset(torch.utils.data.Dataset):
+    """UTF-8 byte trigrams as RGB pixels.
+
+    Each spatial cell (row, col) of each patch_size×patch_size patch holds
+    one byte trigram from the corpus stream as (R, G, B):
+
+        cell[r, c]: (R, G, B) = bytes[3i], bytes[3i+1], bytes[3i+2]
+
+    where i is the cell's linear index in the image (row-major across
+    patches, row-major within each patch). Bytes are normalized
+    [0, 255] → [-1, 1] via (b - 127.5) / 127.5.
+
+    Capacity (per spatial cell): 256³ = 16,777,216 distinguishable trigrams.
+    Capacity (per 4×4 patch): 16 cells × 3 bytes = 48 bytes = 384 bits.
+    Capacity (per 256×256 image at ps=4): 4096 patches × 16 cells × 3 bytes
+        = 196,608 bytes ≈ 192 KB of text per training sample.
+
+    No padding — every float carries signal. The codebook has actual
+    compression work to do (16.7M-cardinality input distribution per cell
+    vs ~1M-cardinality codebook capacity per patch on S^3 at 1° resolution).
+
+    Args:
+        size: dataset length (number of training samples to yield)
+        img_size: image dimension (must be divisible by patch_size)
+        patch_size: patch dimension (default 4 → ~16.7M cells/cardinality)
+        corpus_id: HF dataset name (default 'wikitext-103-raw-v1') OR a
+            local .txt path. Loaded as a single byte stream.
+        split: dataset split for HF datasets (default 'train')
+        seed: RNG seed for window sampling
+        max_corpus_bytes: cap on corpus bytes loaded into memory. Default
+            500MB which fits wikitext-103 raw text comfortably.
+    """
+
+    def __init__(self, size=200_000, img_size=256, patch_size=4,
+                 corpus_id='wikitext-103-raw-v1', split='train',
+                 seed=42, max_corpus_bytes=500_000_000):
+        self.size = size
+        self.img_size = img_size
+        self.patch_size = patch_size
+        if img_size % patch_size != 0:
+            raise ValueError(
+                f"img_size={img_size} must be divisible by "
+                f"patch_size={patch_size}")
+        self.gh = self.gw = img_size // patch_size
+        self.cells_per_patch = patch_size * patch_size  # 16 at ps=4
+        self.n_patches = self.gh * self.gw               # 4096 at 256/4
+        self.bytes_per_image = self.n_patches * self.cells_per_patch * 3
+        self._base_seed = seed
+        self._call_count = 0
+        self._rng = np.random.default_rng(seed)
+
+        # ── Load corpus as raw UTF-8 byte stream ──
+        if os.path.isfile(corpus_id) and corpus_id.endswith(('.txt', '.text')):
+            print(f"  [ByteTrigramDataset] Loading local corpus "
+                  f"{corpus_id}...")
+            with open(corpus_id, 'rb') as f:
+                full_bytes = f.read(max_corpus_bytes)
+        else:
+            print(f"  [ByteTrigramDataset] Loading corpus {corpus_id}...")
+            from datasets import load_dataset
+            if corpus_id.startswith('wikitext'):
+                ds = load_dataset('wikitext', corpus_id, split=split)
+            else:
+                ds = load_dataset(corpus_id, split=split)
+            chunks = []
+            total = 0
+            for record in ds:
+                txt = record.get('text', '')
+                if not txt or not txt.strip():
+                    continue
+                b = txt.encode('utf-8')
+                chunks.append(b)
+                total += len(b)
+                if total >= max_corpus_bytes:
+                    break
+            full_bytes = b'\n'.join(chunks)
+
+        self.corpus = np.frombuffer(full_bytes, dtype=np.uint8)
+        if len(self.corpus) < self.bytes_per_image + 16:
+            raise ValueError(
+                f"Corpus too small: {len(self.corpus):,} bytes < "
+                f"required {self.bytes_per_image:,} per image. "
+                f"Increase max_corpus_bytes or use a larger corpus.")
+        print(f"  [ByteTrigramDataset] Corpus: {len(self.corpus):,} bytes, "
+              f"{self.bytes_per_image:,} bytes/image, "
+              f"{len(self.corpus) // self.bytes_per_image:,} non-overlapping "
+              f"images available")
+
+    def __len__(self):
+        return self.size
+
+    @staticmethod
+    def bytes_to_image(byte_chunk: np.ndarray, img_size: int,
+                       patch_size: int = 4) -> np.ndarray:
+        """[bytes_per_image] uint8 → [3, img_size, img_size] float32 in [-1, 1].
+
+        Layout: cell linear index i goes to image position
+            patch_row = (i // cells_per_patch) // gw
+            patch_col = (i // cells_per_patch) %  gw
+            cell_row  = (i %  cells_per_patch) // patch_size
+            cell_col  = (i %  cells_per_patch) %  patch_size
+        with (R, G, B) = byte_chunk[3i:3i+3].
+        """
+        gh = gw = img_size // patch_size
+        cells_per_patch = patch_size * patch_size
+        n_patches = gh * gw
+        # Reshape: [n_patches, cells_per_patch, 3]
+        rgb = byte_chunk.reshape(n_patches, cells_per_patch, 3).astype(np.float32)
+        rgb = (rgb - 127.5) / 127.5  # → [-1, 1]
+        # Reshape to [n_patches, ps, ps, 3] (cells in row-major within patch)
+        per_patch = rgb.reshape(n_patches, patch_size, patch_size, 3)
+        # Reshape to [gh, gw, ps, ps, 3] (patches in row-major across grid)
+        grid = per_patch.reshape(gh, gw, patch_size, patch_size, 3)
+        # Stitch: for each (image_row, image_col), find (patch_row, patch_col)
+        # and (cell_row, cell_col), then get (R, G, B). Permute to channels-first.
+        # grid axes: (gh, gw, cell_r, cell_c, channel)
+        # We want image axes: (channel, gh*ps, gw*ps)
+        img = grid.transpose(4, 0, 2, 1, 3)  # (channel, gh, ps, gw, ps)
+        img = img.reshape(3, img_size, img_size)
+        return img
+
+    @staticmethod
+    def image_to_bytes(images: torch.Tensor, patch_size: int = 4
+                        ) -> torch.Tensor:
+        """[B, 3, H, W] float → [B, n_cells_total, 3] in {0..255}.
+
+        Inverse of bytes_to_image. Maps continuous [-1, 1] back to
+        rounded uint8 byte values.
+        """
+        B, C, H, W = images.shape
+        assert C == 3 and H == W and H % patch_size == 0, \
+            f"Need square 3-ch image div by ps; got {tuple(images.shape)}, ps={patch_size}"
+        gh = gw = H // patch_size
+        ps = patch_size
+        # (B, 3, gh, ps, gw, ps) → (B, gh, gw, ps, ps, 3) row-major cells
+        x = images.reshape(B, 3, gh, ps, gw, ps)
+        x = x.permute(0, 2, 4, 3, 5, 1)  # (B, gh, gw, ps_r, ps_c, channel)
+        x = x.reshape(B, gh * gw * ps * ps, 3)  # [B, n_cells, 3]
+        # Recover bytes: float in [-1, 1] → byte in [0, 255]
+        bytes_f = x * 127.5 + 127.5
+        return bytes_f.clamp(0, 255).round().to(torch.uint8)
+
+    def __getitem__(self, idx):
+        self._call_count += 1
+        if self._call_count % 1000 == 0:
+            self._rng = np.random.default_rng(int.from_bytes(os.urandom(4), 'big'))
+
+        # Sample a random window of bytes_per_image consecutive bytes
+        max_start = len(self.corpus) - self.bytes_per_image
+        start = int(self._rng.integers(0, max_start + 1))
+        chunk = self.corpus[start:start + self.bytes_per_image]
+        img = self.bytes_to_image(chunk, self.img_size, self.patch_size)
+        return torch.from_numpy(img), 0
+
+
+def byte_recovery_metrics(orig_bytes: torch.Tensor,
+                           recon_bytes: torch.Tensor) -> Dict[str, Any]:
+    """Per-byte and per-trigram recovery metrics.
+
+    Args:
+        orig_bytes:  [B, n_cells, 3] uint8 (output of image_to_bytes on input)
+        recon_bytes: [B, n_cells, 3] uint8 (output of image_to_bytes on recon)
+
+    Returns:
+        per_byte_acc:        fraction of bytes recovered exactly
+        per_byte_l1:         mean |orig - recon| in byte units (0..255)
+        trigram_exact_rate:  fraction of trigrams with all 3 bytes exact
+        per_channel_acc:     [3] R/G/B exact-recovery rates separately
+    """
+    orig = orig_bytes.to(torch.int32)
+    recon = recon_bytes.to(torch.int32)
+    diff = (orig - recon).abs()
+    correct = (diff == 0).float()  # [B, n_cells, 3]
+
+    per_byte_acc = correct.mean().item()
+    per_byte_l1 = diff.float().mean().item()
+    # Trigram exact: all 3 bytes per cell match
+    trigram_exact = (correct.sum(dim=-1) == 3).float()  # [B, n_cells]
+    trigram_exact_rate = trigram_exact.mean().item()
+    per_channel_acc = correct.mean(dim=(0, 1)).tolist()  # [3]
+
+    return {
+        'per_byte_acc': per_byte_acc,
+        'per_byte_l1': per_byte_l1,
+        'trigram_exact_rate': trigram_exact_rate,
+        'per_channel_acc': per_channel_acc,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # PER-TYPE EVALUATION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1031,7 +1251,7 @@ def train(cfg: Dict[str, Any]):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     # ── Data ──
-    is_noise = is_text = is_image = is_tree = is_sentencepiece = False
+    is_noise = is_text = is_image = is_tree = is_sentencepiece = is_byte_trigram = False
 
     if dataset in ('tiny_imagenet', 'imagenet_128', 'imagenet_256'):
         train_loader, test_loader, _, _ = get_image_loaders(
@@ -1128,6 +1348,27 @@ def train(cfg: Dict[str, Any]):
             val_ds, batch_size=batch_size, shuffle=False,
             num_workers=0, pin_memory=True)
         is_sentencepiece = True
+
+    elif dataset == 'byte_trigram':
+        ds_size = cfg.get('ds_size', 20_000)
+        val_size = cfg.get('val_size', 200)
+        bt_corpus = cfg.get('bt_corpus', 'wikitext-103-raw-v1')
+        bt_max_corpus_bytes = cfg.get('bt_max_corpus_bytes', 500_000_000)
+        train_ds = ByteTrigramDataset(
+            size=ds_size, img_size=img_size, patch_size=patch_size,
+            corpus_id=bt_corpus, seed=42,
+            max_corpus_bytes=bt_max_corpus_bytes)
+        val_ds = ByteTrigramDataset(
+            size=val_size, img_size=img_size, patch_size=patch_size,
+            corpus_id=bt_corpus, seed=999,
+            max_corpus_bytes=bt_max_corpus_bytes)
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=True, drop_last=True)
+        test_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=True)
+        is_byte_trigram = True
 
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
@@ -1413,12 +1654,40 @@ def train(cfg: Dict[str, Any]):
             for seq_idx, acc in enumerate(sp_metrics['per_seq_position_acc']):
                 writer.add_scalar(f'sp/seq_pos_{seq_idx}_acc', acc, epoch)
 
+        # Byte/trigram recovery for byte-trigram dataset
+        bt_str = ""
+        bt_metrics = None
+        if is_byte_trigram:
+            with torch.no_grad():
+                # Sample size capped to fit memory at 256x256; n_cells per
+                # image is large (4096 patches × 16 cells × 3 bytes at 256×256)
+                sample_imgs, _ = next(iter(test_loader))
+                sample_imgs = sample_imgs[:8].to(device)
+                sample_out = model(sample_imgs)
+                orig_bytes = ByteTrigramDataset.image_to_bytes(
+                    sample_imgs.cpu(), patch_size)
+                recon_bytes = ByteTrigramDataset.image_to_bytes(
+                    sample_out['recon'].cpu(), patch_size)
+                bt_metrics = byte_recovery_metrics(orig_bytes, recon_bytes)
+            bt_str = (f"bytes={bt_metrics['per_byte_acc']*100:.1f}% "
+                      f"trig={bt_metrics['trigram_exact_rate']*100:.1f}% "
+                      f"L1={bt_metrics['per_byte_l1']:.2f}")
+            writer.add_scalar('bt/per_byte_acc',
+                              bt_metrics['per_byte_acc'], epoch)
+            writer.add_scalar('bt/per_byte_l1',
+                              bt_metrics['per_byte_l1'], epoch)
+            writer.add_scalar('bt/trigram_exact_rate',
+                              bt_metrics['trigram_exact_rate'], epoch)
+            for ch_idx, ch_name in enumerate(['R', 'G', 'B']):
+                writer.add_scalar(f'bt/channel_{ch_name}_acc',
+                                  bt_metrics['per_channel_acc'][ch_idx], epoch)
+
         print(f" {epoch:3d} | {total_loss/n_seen:.4f} {total_recon/n_seen:.4f} "
               f"{epoch_time:.0f}s | test={test_mse:.6f} | "
               f"S0={S_mean[0]:.3f} SD={S_mean[-1]:.3f} r={ratio:.2f} er={erank:.2f}"
               f" | cv={last_cv:.3f} band={'Y' if cv_in_band else 'N'} "
               f"Sd={s_delta:.5f} a={a_mean:.3f} g={epoch_max_grad:.1f} "
-              f"{byte_str} {tree_str} {sp_str} {type_str}")
+              f"{byte_str} {tree_str} {sp_str} {bt_str} {type_str}")
 
         # Per-epoch TB
         writer.add_scalar('epoch/test_mse', test_mse, epoch)
@@ -1446,6 +1715,7 @@ def train(cfg: Dict[str, Any]):
             'epoch_time_s': epoch_time,
             'tree_metrics': tree_metrics,
             'sp_metrics': sp_metrics,
+            'bt_metrics': bt_metrics,
         })
 
         # ── Curriculum: scheduled tier unlocks ──
