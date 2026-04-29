@@ -210,7 +210,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         linear_readout=True, svd_mode='none', match_params=True,
         # Training — gaussian only by default (foundation)
         dataset='omega_noise', img_size=64, batch_size=128,
-        lr=1e-3, epochs=20, target_cv=0.215,  # midpoint of CV band
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.80, cv_band_hi=1.05,
         allowed_types=[0],
         hf_version='h2_64_repro_single', save_every=5,
         ds_size=200_000, val_size=2_000,
@@ -224,9 +230,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
-        # Training on i.i.d. depth-4 binary trees (BFS-encoded, ±1 floats)
+        # Training on i.i.d. depth-4 binary trees (BFS-encoded, ±1 floats).
+        # Bintree-iid measured CV trajectory: 0.80-1.01 across 20 ep.
+        # H2-class natural attractor for ±1 bit content is CV~1.0.
         dataset='binary_tree', img_size=16, batch_size=256,
-        lr=1e-3, epochs=20, target_cv=0.215,
+        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        # H2-class band; bintree-iid landed CV 0.80-1.01
+        cv_band_lo=0.80, cv_band_hi=1.05,
         hf_version='bintree_proto_v1', save_every=5,
         ds_size=200_000, val_size=2_000,
         # Tree config
@@ -248,15 +258,16 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
         dataset='sentencepiece_bits', img_size=16, batch_size=256,
-        lr=1e-3, epochs=20, target_cv=0.215,
+        # H2-class CV band; SP-bit content may shift this slightly but
+        # cv_weight=0 means the value is informational only.
+        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        cv_band_lo=0.80, cv_band_hi=1.05,
         hf_version='sentencepiece_proto_v1', save_every=5,
         ds_size=200_000, val_size=2_000,
         # SentencePiece config
         sp_tokenizer='google-t5/t5-base',  # HF model id with spiece.model
         sp_corpus='wikitext-2-raw-v1',     # HF datasets id
         sp_n_bits=16,                      # bits per token (vocab 32128 < 2^15=32768)
-        # Soft-hand idle for self-solving on unknown attractor
-        cv_weight=0.0,
         # Diagnostics cadence
         report_every=200,
     ),
@@ -929,6 +940,15 @@ def train(cfg: Dict[str, Any]):
     boost         = cfg.get('boost', 0.5)
     sigma         = cfg.get('sigma', 0.15)
 
+    # ── CV band thresholds (for the cv_in_band boolean diagnostic) ──
+    # Defaults to the V=256/D=16 noise-substrate band (0.13-0.30) per the
+    # CM CV deep embedding analysis framework. Override for h2-class (V=32/
+    # D=4) which lives in a different basin — natural band is roughly
+    # 0.85-1.05 per measured runs (h2 single-Gaussian: 0.88-0.92, bintree:
+    # 0.80-1.01). Set both to None to disable the band check.
+    cv_band_lo    = cfg.get('cv_band_lo', 0.13)
+    cv_band_hi    = cfg.get('cv_band_hi', 0.30)
+
     # ── Data filters / curriculum ──
     pretrained    = cfg.get('pretrained', None)
     curriculum    = cfg.get('curriculum', None)
@@ -1126,7 +1146,7 @@ def train(cfg: Dict[str, Any]):
           f"{total_params:,} params")
     print(f"  Dataset: {dataset}, batch={batch_size}, lr={lr}, epochs={epochs}")
     print(f"  Target CV: {target_cv}, soft hand: boost={1+boost:.1f}x, "
-          f"penalty={cv_weight}")
+          f"penalty={cv_weight}, band=[{cv_band_lo:.2f}, {cv_band_hi:.2f}]")
     if allowed_types is not None:
         print(f"  Allowed types: {allowed_types}")
     if curriculum:
@@ -1156,10 +1176,17 @@ def train(cfg: Dict[str, Any]):
             'config': {
                 'V': V, 'D': D, 'patch_size': patch_size,
                 'hidden': hidden, 'depth': depth, 'n_cross_layers': n_cross,
+                'n_heads': n_heads, 'smooth_mid': smooth_mid,
                 'linear_readout': linear_readout, 'svd_mode': svd_mode,
                 'match_params': match_params,
                 'target_cv': target_cv, 'dataset': dataset,
                 'img_size': img_size, 'lr': lr,
+                # Pass through SP-specific kwargs so a checkpoint can be
+                # rehydrated for evaluation without the original preset.
+                'sp_tokenizer': cfg.get('sp_tokenizer'),
+                'sp_corpus': cfg.get('sp_corpus'),
+                'sp_n_bits': cfg.get('sp_n_bits'),
+                'tree_depth': cfg.get('tree_depth'),
             },
         }
         if extra:
@@ -1256,7 +1283,7 @@ def train(cfg: Dict[str, Any]):
                     ).mean().item()
                     s_delta = (S_batch - S_orig).abs().mean().item()
                     a_mean, a_std = per_layer_alphas()
-                    cv_in_band = 0.13 <= last_cv <= 0.30
+                    cv_in_band = cv_band_lo <= last_cv <= cv_band_hi
 
                 # TB scalars
                 writer.add_scalar('train/loss', total_loss / n_seen, global_batch)
@@ -1314,7 +1341,7 @@ def train(cfg: Dict[str, Any]):
             erank = model.effective_rank(out['svd']['S'].reshape(-1, D)).mean().item()
             s_delta = (S_mean - S_orig).abs().mean().item()
             a_mean, a_std = per_layer_alphas()
-            cv_in_band = 0.13 <= last_cv <= 0.30
+            cv_in_band = cv_band_lo <= last_cv <= cv_band_hi
 
         # Per-type MSE for noise variants
         type_str = ""
