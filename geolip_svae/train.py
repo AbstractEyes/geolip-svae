@@ -1519,7 +1519,48 @@ def train(cfg: Dict[str, Any]):
 # CLI
 # ═══════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def _is_jupyter_kernel() -> bool:
+    """Detect if we're running inside an IPython/Jupyter kernel.
+
+    Jupyter passes `-f /path/to/kernel.json` to the launcher's argv, which
+    breaks naive argparse. When detected, we strip these kernel args before
+    parsing so a `from geolip_svae.train import *; train(PRESETS['x'])`
+    workflow works alongside the CLI.
+    """
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and 'IPKernelApp' in ip.config
+    except Exception:
+        return False
+
+
+def _filter_jupyter_args(argv):
+    """Strip the `-f /path/to/kernel.json` pair if present."""
+    out = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '-f':
+            skip_next = True
+            continue
+        if arg.startswith('-f='):
+            continue
+        out.append(arg)
+    return out
+
+
+def main(argv=None):
+    """Entry point. argv defaults to sys.argv[1:] but can be passed for
+    programmatic use. Tolerates Jupyter kernel args via parse_known_args."""
+    import sys as _sys
+    if argv is None:
+        argv = _sys.argv[1:]
+    if _is_jupyter_kernel():
+        argv = _filter_jupyter_args(argv)
+
     parser = argparse.ArgumentParser(description='SVAE Unified Trainer (v2)')
     parser.add_argument('--preset', type=str, choices=list(PRESETS.keys()),
                         help='Named preset configuration')
@@ -1529,7 +1570,11 @@ if __name__ == "__main__":
                         help='Override epochs from preset')
     parser.add_argument('--no-upload', action='store_true',
                         help='Disable HF upload')
-    args = parser.parse_args()
+    # Tolerate unknown args (e.g. Jupyter's stray flags). We don't error on them.
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        # Quiet warning — not an error since we expect Jupyter pollution
+        print(f"  [main] Ignoring unknown args: {unknown}")
 
     if args.list_presets:
         for name, cfg in PRESETS.items():
@@ -1545,14 +1590,14 @@ if __name__ == "__main__":
             pre = cfg.get('pretrained', 'scratch')
             print(f"  {name:<22s} {ds:<20s} {sz}×{sz}  {ep:>3d} ep"
                   f"  V={cfg['V']:<3d} D={cfg['D']:<3d}{arch}  from={pre}")
-        exit()
+        return
 
     if not args.preset:
         parser.print_help()
         print("\nPresets:")
         for name in PRESETS:
             print(f"  {name}")
-        exit()
+        return
 
     cfg = dict(PRESETS[args.preset])
     if args.epochs is not None:
@@ -1562,3 +1607,7 @@ if __name__ == "__main__":
 
     torch.set_float32_matmul_precision('high')
     train(cfg)
+
+
+if __name__ == "__main__":
+    main()
