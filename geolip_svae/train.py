@@ -319,15 +319,16 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
         dataset='byte_trigram', img_size=128, batch_size=256,
-        lr=1e-3, epochs=100, target_cv=0.9, cv_weight=0.0,
-        cv_band_lo=0.80, cv_band_hi=1.05,
-        hf_version='byte_trigram_proto_128_v1', save_every=10,
-        ds_size=1_000_000, val_size=2_000,
+        lr=1e-5, epochs=20, target_cv=1.0, cv_weight=0.0,
+        cv_band_lo=0.95, cv_band_hi=1.3,
+        hf_version='byte_trigram_proto_128_v1', save_every=1,
+        ds_size=1_000_000, val_size=10_000,
         # ByteTrigram config — same corpus as the 256×256 run
         # No max_corpus_bytes; load the full ~500MB wikitext-103.
         bt_corpus='wikitext-103-raw-v1',
         # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
         # report_every=500 gives ~8 reports per epoch including end.
+        pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
         report_every=500,
     ),
 }
@@ -1408,8 +1409,8 @@ def train(cfg: Dict[str, Any]):
         is_sentencepiece = True
 
     elif dataset == 'byte_trigram':
-        ds_size = cfg.get('ds_size', 20_000)
-        val_size = cfg.get('val_size', 200)
+        ds_size = cfg.get('ds_size', 100_000)
+        val_size = cfg.get('val_size', 1_000)
         bt_corpus = cfg.get('bt_corpus', 'wikitext-103-raw-v1')
         bt_max_corpus_bytes = cfg.get('bt_max_corpus_bytes', None)  # None = use full corpus
         train_ds = ByteTrigramDataset(
@@ -1428,10 +1429,10 @@ def train(cfg: Dict[str, Any]):
         # = ~256ms single-threaded) can match or exceed GPU compute time.
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=4, pin_memory=True, drop_last=True)
+            num_workers=8, pin_memory=True, drop_last=True)
         test_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=batch_size, shuffle=False,
-            num_workers=4, pin_memory=True)
+            num_workers=2, pin_memory=True)
         is_byte_trigram = True
 
     else:
