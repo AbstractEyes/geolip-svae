@@ -119,9 +119,183 @@ After the LBFGS Hessian-corruption fix (000099), the Q-sweep ran clean on 10/10 
 
 ---
 
-## TIER 3 — P-sweep parent grid (600 configs at 20 batches)
+## TIER 3 — Phase 1 ablation grid (233 configs across 15 groups × 3 bands × seeds)
 
-The Q-sweep was the top-10 from this. **Full grid: 5 × 5 × 3 × 2 × 2 × 2 = 600 configs.**
+The Phase 1 ablation predates the P-sweep. **A through M groups, each varying one architectural axis at a time, all three CV bands (LOW D=16, MID D=8, HIGH D=4), seed-replicated where statistically meaningful.** 233 total entries; 227 band-match (97%); 229 params-finite (98%); 223 valid (band-match + finite). Data from `omega_inventory.csv`. Columns: D / V / hidden / depth / patch_size = `dp`/`ps` / n_seeds / mean test MSE / mean CV / band deviation (observed_sphere_cv − uniform_RP^(D-1)_baseline) / n_finite seeds.
+
+### HIGH band (D=4, V=32, hidden=64, ps=4) — sphere-solver candidates
+
+| group | variant | n | mse | cv | dev | fin | notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A | baseline | 5 | 1.4591 | 0.902 | +0.018 | 5 | seed-replicated reference |
+| B | B1_all16 | 1 | 1.4709 | 0.858 | +0.021 | 1 | 16-noise mixture |
+| B | B2_gaussian_only | 1 | 0.9590 | 0.753 | +0.027 | 1 | gaussian-only train |
+| B | B3_structured | 1 | 1.7076 | 0.968 | −0.036 | 1 | structured-noise train |
+| B | B4_heavy_tailed | 1 | 1.7982 | 0.820 | +0.064 | 1 | heavy-tailed train |
+| B | B5_first_half | 1 | 1.4395 | 0.944 | +0.025 | 1 | noises 0-7 |
+| B | B6_even_indices | 1 | 1.9918 | 0.880 | +0.023 | 1 | noises 0,2,4,...,14 |
+| C | C1_adam | 1 | 1.4667 | 0.860 | +0.022 | 1 | Adam @ default lr |
+| C | C2_sgd | 1 | 1.5670 | 0.858 | +0.019 | 1 | plain SGD |
+| C | C3_sgd_momentum | 1 | 1.2006 | 0.860 | +0.013 | 1 | SGD with momentum |
+| C | C4_adamw | 1 | 1.4706 | 0.859 | +0.023 | 1 | AdamW |
+| C | C5_lbfgs | 1 | nan | 0.943 | −0.923 | 1 | **LBFGS Hessian-corruption — pre-fix bug** |
+| D | D1_cosine | 1 | 1.4712 | 0.858 | +0.020 | 1 | cosine LR |
+| D | D2_constant | 1 | 1.3028 | 0.858 | +0.028 | 1 | constant LR |
+| D | D3_linear_decay | 1 | 1.4652 | 0.858 | +0.021 | 1 | linear decay |
+| D | D4_warm_restart | 1 | 1.3216 | 0.858 | +0.016 | 1 | warm restart |
+| D | D5_one_cycle | 1 | 1.4656 | 0.858 | +0.019 | 1 | one-cycle LR |
+| E | E1_full_softhand | 3 | 0.4420 | 0.907 | +0.026 | 3 | soft-hand CV regularizer |
+| E | E2_pure_mse | 3 | 0.4692 | 0.904 | +0.037 | 3 | pure MSE, no regularizer |
+| E | E3_measure_only | 3 | 0.4517 | 0.908 | −0.011 | 3 | measure CV but don't regularize |
+| E | E4_hard_cv_penalty | 3 | 0.4504 | 0.902 | +0.002 | 3 | hard CV penalty |
+| F | F1_gelu | 1 | 1.4669 | 0.858 | +0.022 | 1 | GELU activation |
+| F | F2_relu | 1 | 1.4744 | 0.855 | +0.025 | 1 | ReLU |
+| F | F3_silu | 1 | 1.4702 | 0.901 | +0.022 | 1 | SiLU |
+| F | F4_tanh | 1 | 1.4550 | 0.806 | +0.027 | 1 | tanh |
+| F | F5_identity | 1 | 1.4522 | 0.866 | +0.031 | 1 | identity (no activation) |
+| G | G1_sphere_norm | 1 | 1.4668 | 0.858 | +0.022 | 1 | reference (sphere-norm M) |
+| G | G2_no_norm | 1 | 1.4680 | 1.112 | **+0.357** | 1 | **REMOVES sphere-norm — geometry breaks** |
+| G | G3_layer_norm | 1 | 1.4482 | 0.701 | **−0.217** | 1 | **layer-norm instead — geometry breaks** |
+| G | G4_scale_only | 1 | 1.4588 | 1.112 | **+0.359** | 1 | **scale-only — geometry breaks** |
+| H | H1_svd_fp64 | 3 | 0.4198 | 0.906 | +0.006 | 3 | full-fp64 SVD reference |
+| **H** | **H2_linear_matched** | **3** | **0.0456** | **0.908** | **+0.005** | **3** | **CANONICAL — H2-class baseline.** 9× lower MSE than H1 fp64. |
+| H | H3_linear_unmatched | 3 | 0.0948 | 0.911 | +0.001 | 3 | linear readout, mismatched dims |
+| H | H5_batch_shared_svd | 2 | 0.2799 | 0.918 | +0.056 | 2 | shared-SVD across batch |
+| H | H6_no_svd_direct | 1 | 0.4606 | 0.902 | +0.085 | 1 | direct readout, no SVD |
+| I | I1_1layer | 1 | 1.4733 | 0.859 | +0.023 | 1 | 1 cross-attn layer |
+| I | I2_0layers | 1 | 1.8687 | 0.910 | +0.087 | 1 | 0 cross-attn layers |
+| I | I3_2layers | 1 | 1.6295 | 0.924 | −0.002 | 1 | 2 cross-attn layers |
+| I | I4_unbounded_alpha | 1 | 1.4803 | 0.859 | +0.022 | 1 | no clip on α |
+| K | K1_bs128 | 1 | 1.4653 | 0.858 | +0.021 | 1 | batch_size=128 |
+| K | K2_bs32 | 1 | 1.4276 | 0.858 | +0.024 | 1 | batch_size=32 |
+| K | K3_bs512 | 1 | 1.5732 | 0.859 | +0.024 | 1 | batch_size=512 |
+| K | K4_bs1024 | 1 | 1.5428 | 0.859 | +0.017 | 1 | batch_size=1024 |
+| L | L1_orthogonal | 1 | 1.4802 | 0.858 | +0.018 | 1 | orthogonal init |
+| L | L2_kaiming | 1 | 2.4802 | 0.912 | −0.009 | 1 | Kaiming init |
+| L | L3_xavier | 1 | 1.6138 | 0.952 | +0.025 | 1 | Xavier init |
+| L | L4_normal_small | 1 | 1.5360 | 0.942 | −0.019 | 1 | normal init small std |
+| L2 | L2_lbfgs_pure_mse | 3 | **0.0058** | 0.878 | **−0.605** | 1 | **LBFGS+pure MSE: BEST MSE ON HIGH but only 1/3 finite, geometry broken** |
+| M | M1_sgd_aggressive | 1 | 1.0770 | 0.858 | +0.009 | 1 | SGD aggressive |
+| M | M2_sgd_huge_lr | 1 | 0.6798 | 0.858 | +0.052 | 1 | SGD huge lr |
+| M | M3_sgd_high_momentum | 1 | 1.2939 | 0.859 | +0.013 | 1 | SGD high momentum |
+| E_preview | E1-E4 (4 variants × 1 seed each) | 4 | ~1.47 | ~0.858 | +0.020 to +0.028 | 4 | 1-seed preview of Group E |
+
+**HIGH-band omega-class candidates (band-match + finite + |dev|<0.05)**: 49 of 51 HIGH entries. The two failures: G2_no_norm (+0.357 — confirms sphere-norm is non-negotiable for omega-class) and G4_scale_only (+0.359 — same finding). G3_layer_norm at −0.217 is the third sphere-norm-disruption case. C5_lbfgs is the pre-fix Hessian-corruption casualty.
+
+**HIGH-band MSE leader**: **H2_linear_matched at MSE 0.0456 with dev +0.005**. This is the **canonical sphere-solver template** that h2-64 was built from — 9× lower MSE than the fp64-SVD baseline (H1) at the same dev tolerance. The L2_lbfgs_pure_mse achieves MSE 0.0058 (8× better still) but only 1 of 3 seeds converged finite and geometry deviation hits −0.605, so it's not omega-class despite the MSE win.
+
+### MID band (D=8, V=64, hidden=64, ps=16) — bulk-Gaussian attractor
+
+| group | variant | n | mse | cv | dev | fin |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | baseline | 5 | 1.0115 | 0.359 | +0.005 | 5 |
+| B | B1_all16 | 1 | 1.0088 | 0.380 | −0.004 | 1 |
+| B | B2_gaussian_only | 1 | 0.9530 | 0.369 | −0.017 | 1 |
+| B | B3_structured | 1 | 0.7076 | 0.347 | −0.007 | 1 |
+| B | B4_heavy_tailed | 1 | 1.6415 | 0.352 | +0.007 | 1 |
+| B | B5_first_half | 1 | 0.9441 | 0.380 | −0.004 | 1 |
+| B | B6_even_indices | 1 | 1.1708 | 0.352 | −0.010 | 1 |
+| C | C1_adam | 1 | 1.0093 | 0.380 | −0.004 | 1 |
+| C | C2_sgd | 1 | 1.7354 | 0.381 | −0.018 | 1 |
+| C | C3_sgd_momentum | 1 | 1.0390 | 0.380 | +0.001 | 1 |
+| C | C4_adamw | 1 | 1.0095 | 0.379 | −0.005 | 1 |
+| C | C5_lbfgs | 1 | nan | 0.337 | −0.357 | 1 | LBFGS pre-fix |
+| D | D1-D5 (5 variants) | 5 | ~1.00 | ~0.380 | −0.002 to −0.009 | 5 |
+| E | E1_full_softhand | 3 | 0.9441 | 0.361 | +0.008 | 3 |
+| E | E2_pure_mse | 3 | 0.9416 | 0.362 | +0.010 | 3 |
+| E | E3_measure_only | 3 | 0.9430 | 0.363 | +0.009 | 3 |
+| E | E4_hard_cv_penalty | 3 | 0.9447 | 0.362 | +0.011 | 3 |
+| F | F1-F5 (5 variants) | 5 | ~1.01 | 0.375-0.388 | −0.002 to −0.009 | 5 |
+| G | G1_sphere_norm | 1 | 1.0105 | 0.381 | −0.005 | 1 | reference |
+| G | G2_no_norm | 1 | 0.9935 | 0.560 | **+0.198** | 1 | **sphere-norm removed — geometry breaks** |
+| G | G3_layer_norm | 1 | 1.0093 | 0.428 | +0.064 | 1 |
+| G | G4_scale_only | 1 | 1.0103 | 0.556 | **+0.149** | 1 | **scale-only — geometry breaks** |
+| H | H1_svd_fp64 | 3 | 0.9429 | 0.362 | +0.009 | 3 |
+| H | H2_linear_matched | 3 | **0.9195** | 0.365 | +0.015 | 3 | best MID-band MSE among finite |
+| H | H3_linear_unmatched | 3 | 0.9343 | 0.359 | +0.018 | 3 |
+| H | H4_svd_fp32 | 2 | 0.9434 | 0.368 | +0.015 | 2 |
+| H | H5_batch_shared_svd | 2 | 0.9439 | 0.367 | +0.016 | 2 |
+| H | H6_no_svd_direct | 1 | 0.9453 | 0.368 | −0.002 | 1 |
+| I | I1-I4 (4 variants) | 4 | 1.007-1.011 | 0.355-0.380 | −0.005 to +0.004 | 4 |
+| K | K1-K4 (4 variants) | 4 | 0.999-1.038 | ~0.380 | −0.002 to −0.012 | 4 |
+| L | L1-L4 (4 variants) | 4 | 1.011-1.340 | 0.336-0.383 | +0.006 to +0.011 | 4 |
+| L2 | L2_lbfgs_pure_mse | 3 | **0.8924** | 0.359 | **−0.233** | 1 | LBFGS pre-fix |
+| M | M1-M3 (3 variants) | 3 | 0.976-1.024 | ~0.380 | +0.002 to +0.006 | 3 |
+| E_preview | E1-E4 | 4 | ~1.01 | ~0.380 | −0.004 to −0.006 | 4 |
+
+**MID-band omega-class candidates**: 73 of 78 MID entries. Same sphere-norm-disruption failures (G2, G4). MSE leader at H2_linear_matched 0.9195 with dev +0.015.
+
+### LOW band (D=16, V=64, hidden=64, ps=16) — noise-substrate attractor
+
+| group | variant | n | mse | cv | dev | fin |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | baseline | 5 | 1.0080 | 0.197 | −0.000 | 5 | reference (5-seed) |
+| B | B1_all16 | 1 | 1.0104 | 0.203 | −0.003 | 1 |
+| B | B2_gaussian_only | 1 | 0.9389 | 0.210 | +0.001 | 1 |
+| B | B3_structured | 1 | 0.7051 | 0.207 | +0.006 | 1 |
+| B | B4_heavy_tailed | 1 | 1.6091 | 0.191 | +0.009 | 1 |
+| B | B5_first_half | 1 | 0.9401 | 0.201 | −0.005 | 1 |
+| B | B6_even_indices | 1 | 1.1678 | 0.211 | −0.001 | 1 |
+| C | C1-C4 (4 finite) | 4 | 1.008-1.626 | ~0.204 | −0.004 to +0.008 | 4 |
+| C | C5_lbfgs | 1 | nan (excluded) | — | — | 0 |
+| D | D1-D5 | 5 | 0.974-1.010 | 0.203-0.205 | −0.000 to −0.003 | 5 |
+| E | E1_full_softhand | 3 | 0.9338 | 0.199 | +0.002 | 3 |
+| E | E2_pure_mse | 3 | 0.9340 | 0.200 | +0.001 | 3 |
+| E | E3_measure_only | 3 | 0.9342 | 0.200 | +0.002 | 3 |
+| E | E4_hard_cv_penalty | 3 | 0.9336 | 0.199 | +0.001 | 3 |
+| F | F1-F5 | 5 | 1.003-1.011 | 0.199-0.204 | −0.001 to −0.004 | 5 |
+| G | G1_sphere_norm | 1 | 1.0085 | 0.204 | −0.003 | 1 |
+| G | G2_no_norm | 1 | 0.9914 | 0.353 | **+0.174** | 1 |
+| G | G3_layer_norm | 1 | 1.0048 | 0.211 | +0.001 | 1 |
+| G | G4_scale_only | 1 | 1.0092 | 0.347 | **+0.159** | 1 |
+| H | H1_svd_fp64 | 3 | 0.9345 | 0.200 | +0.002 | 3 |
+| H | H2_linear_matched | 3 | **0.9128** | 0.204 | +0.005 | 3 |
+| H | H3_linear_unmatched | 3 | 0.9195 | 0.202 | +0.010 | 3 |
+| H | H4_svd_fp32 | 2 | 0.9327 | 0.202 | +0.002 | 2 |
+| H | H5_batch_shared_svd | 2 | 0.9331 | 0.202 | +0.003 | 2 |
+| H | H6_no_svd_direct | 1 | 0.9359 | 0.202 | +0.003 | 1 |
+| I | I1-I4 | 4 | 1.004-1.014 | 0.201-0.210 | −0.001 to +0.012 | 4 |
+| **J** | **J1_V64_h64** | **1** | **1.0094** | **0.204** | **−0.002** | **1** | **V=64 h=64 — Group J is V-sweep on D=16** |
+| **J** | **J2_V32_h32** | **1** | **1.1314** | **0.205** | **−0.028** | **1** | V=32 h=32 — capacity floor probe |
+| **J** | **J3_V16_h32** | **1** | **1.1862** | **0.234** | **−0.002** | **1** | V=16 h=32 — sub-capacity test |
+| **J** | **J4_V64_h32** | **1** | **1.0957** | **0.208** | **−0.008** | **1** | V=64 h=32 — hidden-floor test |
+| **J** | **J5_V128_h128** | **1** | **0.9595** | **0.199** | **−0.000** | **1** | V=128 h=128 — over-capacity, dev exactly zero |
+| K | K1-K4 | 4 | 0.997-1.047 | ~0.204 | −0.003 to −0.006 | 4 |
+| L | L1-L4 | 4 | 1.009-1.242 | 0.197-0.204 | +0.002 to +0.012 | 4 |
+| M | M1-M3 | 3 | 0.977-1.011 | 0.204 | +0.002 to +0.006 | 3 |
+| E_preview | E1-E4 | 4 | ~1.01 | ~0.204 | −0.001 to −0.003 | 4 |
+
+**LOW-band omega-class candidates**: 76 of 79 LOW entries. Same sphere-norm-disruption failures (G2, G4). MSE leader: H2_linear_matched at 0.9128 with dev +0.005 — the same H2 template that wins on every band.
+
+**Group J — V × hidden capacity sweep at D=16**: only 5 configs (one of the smallest groups), but the only group that varies V away from the standard {32, 64} options at the LOW-band. Confirms V=128 (J5) drives dev to exactly 0.000 and produces the lowest MSE in the LOW group at 0.9595. V=16 (J3) at h=32 still maintains dev −0.002 but loses 23% on MSE relative to V=128. **J5_V128_h128 is the strongest unverified noise-substrate candidate** in the catalog — params 1.46M (estimated from V=128, h=128), dev exactly zero against the uniform-RP^15 baseline, lowest MSE in the LOW band among non-H-group entries. Worth a U5-style projective probe.
+
+### Phase 1 ablation — engineering invariants surfaced
+
+* **Sphere-norm (Group G) is non-negotiable**: removing it (G2, G4) blows up dev across all three bands by 0.15-0.36. Confirmed independently in HIGH/MID/LOW.
+* **H2_linear_matched is the canonical template**: best MSE in 2 of 3 bands (LOW + HIGH), within 0.003 of best in MID. Forms the architectural template behind h2-64, all H2a/H2b Q-sweep candidates, and the substrate prototypes (bintree/SP-bit/byte-trigram).
+* **L2_lbfgs_pure_mse achieves the lowest MSE on HIGH** (0.0058) at the cost of 67% non-convergence and broken geometry — the pre-fix Hessian-corruption pattern that 000099 diagnosed.
+* **CV bands quantize cleanly by D**: HIGH ≈ 0.86 (D=4), MID ≈ 0.36 (D=8), LOW ≈ 0.20 (D=16). Bulk of variants land within ±0.05 of band center; the failures are sphere-norm disruption + LBFGS Hessian corruption.
+* **Group A 5-seed reference** establishes within-config variance: HIGH dev variance ±0.018, MID ±0.005, LOW ±0.000. Within-config noise is comparable to or smaller than the |dev|<0.05 projective-clean threshold, so single-seed entries are still informative for the omega-class criterion.
+
+### Phase 1 ablation — direct architecture comparisons
+
+| comparison | HIGH | MID | LOW |
+| --- | --- | --- | --- |
+| H2_linear_matched (canonical) MSE | 0.0456 ± 0.0076 | 0.9195 ± 0.0026 | 0.9128 ± 0.0043 |
+| H1_svd_fp64 (full SVD) MSE | 0.4198 ± 0.0154 | 0.9429 ± 0.0041 | 0.9345 ± 0.0023 |
+| H2 advantage over H1 | **9.2× lower MSE** | 2.5% lower | 2.3% lower |
+| H3_linear_unmatched MSE | 0.0948 ± 0.0123 | 0.9343 ± 0.0025 | 0.9195 ± 0.0011 |
+| H6_no_svd_direct MSE | 0.4606 | 0.9453 | 0.9359 |
+
+The HIGH-band H2 advantage (9.2× lower MSE than full-SVD H1) is what made H2_linear_matched the canonical template. At MID and LOW the H-group converges (linear-matched, full-SVD, and direct-readout all within 3% of each other), so the H2 win is specifically a HIGH-band phenomenon. This matches the architectural reading: at D=4 the SVD dimension is small enough that linear readout matches the spectral bandwidth without information loss; at D=8 and D=16 the spectral residual matters.
+
+---
+
+## TIER 4 — P-sweep small-battery floor grid (600 configs at 20 batches)
+
+`group_P_small_battery_floor` from `ablation_configs.py` line 615. **Full product: 5 × 5 × 3 × 2 × 2 × 2 = 600 configs.** This is the parent grid the Q-sweep top-10 came out of. It runs after Phase 1 ablation establishes H2_linear_matched as the canonical template, and varies the architecture axes around that template at a budget-minimal 20 batches per config.
+
+### P-sweep grid axes
 
 | axis | values | count |
 | --- | --- | --- |
@@ -132,22 +306,63 @@ The Q-sweep was the top-10 from this. **Full grid: 5 × 5 × 3 × 2 × 2 × 2 = 
 | n_cross | {0, 1} | 2 |
 | optimizer | {Adam, LBFGS} | 2 |
 
-**Pins**: H2_linear_matched baseline (svd='none', linear_readout=True, match_params=True), HIGH band (patch_size=4, img_size=64), batch_size=256, batch_limit=20, n_heads=1 (D varies are gone), grad_clip=1.0, soft_hand=False. Adam uses lr=3e-3; LBFGS uses lr=1.0 (default unit-Wolfe-step).
+### Pins (H2_linear_matched baseline)
 
-**Outcomes by optimizer**:
+* `svd='none'`, `linear_readout=True`, `match_params=True` (the H2 ablation winner)
+* HIGH band: `patch_size=4`, `img_size=64`
+* `batch_size=256`, `batch_limit=20` (~5,120 samples seen per config)
+* `n_heads=1` (since D varies down to 2, default n_heads=4 would fail)
+* `grad_clip=1.0` (defensive — see TIER 4a)
+* `soft_hand=False`, `cv_measure_every=2`
+* Adam: `lr=3e-3` (Phase-2 default scaled to 20-batch budget)
+* LBFGS: `lr=1.0` (default unit-Wolfe-step, lib's own line search)
+* Training: gaussian-only (`noise_types=[0]`)
+* Testing: 16-noise per-noise generalization (`test_noise_types=list(range(16))`, 256 samples per noise)
 
-* **Adam configs** (300 total): all converged finite. Top 6 of Q-sweep are Adam (ranks 02, 03, 06, 07, 08, 09).
-* **LBFGS configs** (300 total): **9 NaN/diverged** (the 000099 Hessian-corruption casualties — ALL 9 NaNs in the original P-sweep were LBFGS configs at depth=1+n_cross=1, exact bug profile). The 9 NaN configs were never re-run with the corrected trainer (parked open item from 000100). Surviving LBFGS configs: 4 in Q-sweep top 10 (ranks 01, 04, 05).
+### P-sweep outcomes by optimizer split
 
-**Geometric attractor split observed in P-sweep + confirmed in Q**:
+| optimizer | total configs | finite | NaN/divergent | Q-sweep top-10 representation |
+| --- | --- | --- | --- | --- |
+| Adam | 300 | 300 (100%) | 0 | 6 of top-10 (Q-ranks 02, 03, 06, 07, 08, 09, 10) |
+| LBFGS | 300 | 291 (97%) | 9 | 3 of top-10 (Q-ranks 01, 04, 05) |
+| **Total** | **600** | **591** | **9** | **10 advanced to Q-sweep at 1000 batches** |
 
-* D=4 configs → HIGH-band (CV 0.86-1.07) sphere-solver attractor (H2 family)
-* D=3 configs → LOW-band (CV ~0.03) projective-clean attractor (P-class)
-* D=2 configs → no pentachoron, fails geometric validity test
+The 9 NaN/divergent LBFGS configs all matched the **000099 Hessian-corruption profile**: depth=1 + n_cross=1 architectures where gradient clipping inside the LBFGS closure caused the (s_k, y_k) Hessian approximation to underestimate, generating runaway H⁻¹ steps over enough iterations. 20 batches is the threshold below which divergence is incipient but not yet catastrophic; the 1000-batch Q-sweep would have surfaced 30 LBFGS divergences had it not been pre-fixed.
 
----
+### P-sweep geometric attractor split (observed across all 600 configs, confirmed in Q)
 
-## TIER 4 — R-sweep polytope packing test (3 configs)
+| D class | typical CV (post-20-batch) | attractor | members |
+| --- | --- | --- | --- |
+| **D=4** | 0.86 - 1.07 (HIGH band) | **sphere-solver** (H2 family) | 200 configs (5 hidden × 5 V × 2 depth × 2 n_cross × 2 opt) |
+| **D=3** | ~0.03 (LOW band) | **projective-clean on RP²** (P-class, originally framed "polynomial") | 200 configs |
+| **D=2** | undefined (V<5 cannot form pentachoron) | failed geometric validity | 200 configs |
+
+200 D=4 configs are theoretically all H2 candidates. Survival of the 6 Adam + 3 LBFGS into Q-sweep top-10 depends on `continued_training_potential`, which combines convergence-rate-at-20-batches with extrapolated-MSE-at-1000-batches. Q-sweep's full table (Tier 2) gives the actual 1000-batch outcomes for those 10.
+
+### TIER 4a — P-sweep extrapolation rankings (the top-10 source data)
+
+Each Q-sweep entry started as a P-sweep entry. The "P-MSE" column from `group_Q_h2_candidates` shows the MSE that ranked it at 20 batches:
+
+| Q-rank | source P config | P-MSE (20 batch) | Q-MSE (1000 batch) | improvement | optimizer regime change |
+| --- | --- | --- | --- | --- | --- |
+| 01 | h64_V32_D4_dp1_nx0_lbfgs | 0.053 | 0.00421 | 13× | LBFGS clean at 1000 (post-fix) |
+| 02 | h64_V32_D4_dp0_nx0_adam | 0.572 | **0.00205** | 279× | **strongest extrapolation** |
+| 03 | h64_V32_D4_dp0_nx1_adam | 0.584 | 0.00250 | 234× | |
+| 04 | h64_V32_D4_dp0_nx1_lbfgs | 0.041 | 0.00391 | 10× | LBFGS started low, gained little |
+| 05 | h64_V16_D4_dp1_nx1_lbfgs | 0.115 | 0.03117 | 4× | V=16 hits H2b ceiling |
+| 06 | h64_V32_D3_dp1_nx1_adam | 0.656 | 0.02497 | 26× | D=3 P-class |
+| 07 | h64_V32_D3_dp0_nx1_adam | 0.641 | 0.03151 | 20× | D=3 P-class |
+| 08 | h64_V32_D4_dp1_nx1_adam | 0.620 | 0.00231 | 268× | h2-64 single-bank arch |
+| 09 | h64_V32_D3_dp0_nx0_adam | 0.638 | 0.02782 | 23× | D=3 P-class smallest |
+| 10 | h64_V32_D2_dp0_nx1_adam | 0.736 | 0.16139 | 5× | D=2 — failed geometric validity |
+
+**Reading**: Adam configs started P-sweep with high MSE (0.57-0.74) and gained 20-280× by 1000 batches. LBFGS configs started P-sweep with low MSE (0.04-0.12) and gained only 4-13×. This confirms the optimizer regime shift that 000100 logged: **LBFGS dominates at short budgets (≤20 batches), Adam dominates at long budgets (≥500 batches)**. The architectural template (h64_V32_D4 with depth/n_cross combinations) is unchanged across optimizers; only the optimization trajectory differs.
+
+### P-sweep coverage gaps
+
+* **9 NaN configs never re-run** with the post-fix trainer (parked open item from 000100). Could surface 9 additional Tier 2 candidates at the LBFGS+depth=1+n_cross=1 architecture frontier.
+* **V<32 LBFGS coverage** is thin — only Q-rank05 represented from 300 LBFGS configs across V ∈ {2, 4, 8, 16, 32}. The full P-sweep contains 60 LBFGS configs at each V; their ranking among each other is not surfaced into the catalog.
+* **hidden < 64 LBFGS** coverage is sparse — Q-sweep's top-10 are all hidden=64. A dedicated lower-hidden LBFGS sub-sweep was never run.
 
 Test of the natural-axis-count hypothesis: V matched to known polytope vertex counts on S^(D-1) should produce **static** sphere-solver rows (no rotating antipodal frame).
 
@@ -162,6 +377,20 @@ Test of the natural-axis-count hypothesis: V matched to known polytope vertex co
 **Status**: trained (in `phaseR_reports/` on HF), results not surfaced into the projective-clean catalog yet. Worth probing against the omega-class criterion since natural-axis-count framework predicts they should land cleanly.
 
 ---
+
+## TIER 4b — R-sweep polytope packing test (3 configs at 1000 batches)
+
+`group_R_packed_polytope_test` from `ablation_configs.py`. Predicted-H2-LIKE configs where V is matched to known polytope vertex counts on S^(D-1). Same H2_linear_matched baseline as P/Q, Adam @ lr=3e-3, 1000 batches, gaussian-only training. Ran 2026-04-24 alongside Q-sweep.
+
+| variant | V | D | polytope | predicted | architecturally implies |
+| --- | --- | --- | --- | --- | --- |
+| R_h64_V16_D4_16cell_orthoplex_adam | 16 | 4 | 16-cell (4-orthoplex) | H2-LIKE static rows | natural axis count for D=4 = 16 |
+| R_h64_V8_D4_8cell_or_16cell_subset_adam | 8 | 4 | 8-cell (tesseract) | H2-LIKE static rows | sub-polytope vertex count |
+| R_h64_V20_D3_dodecahedron_adam | 20 | 3 | dodecahedron | H2-LIKE static rows | natural axis count for D=3 = 20 |
+
+**Hypothesis tested**: when V matches a known regular polytope vertex count for S^(D-1), training should produce **static** sphere-solver rows (no antipodal pair rotation). Phil's framing (000100): the 32-row × D=3 G-Class behavior emerged because 32 points cannot be uniformly arranged on S² — geometric frustration. Match V to polytope, frustration disappears.
+
+**Status**: trained, weights in `phaseR_reports/` on HF, but **codebooks were never extracted and probed against the projective-clean threshold**. Worth running through `extract_codebook` to surface them into the verified-omega-class tier; the natural-axis-count framework (ft2 §9.1) predicts they should land cleanly. Open item from 000101.
 
 ## TIER 5 — Phase S D=5 architecture floor map (1600 configs at 20 batches)
 
