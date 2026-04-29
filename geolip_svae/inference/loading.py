@@ -137,7 +137,9 @@ def load_model(
             f"re-train it as a v1 PatchSVAE configuration."
         )
 
-    model = PatchSVAE(
+    # Build PatchSVAE — handle h2-class architecture kwargs that may be
+    # absent in older checkpoints (those default to standard architecture).
+    pv_kwargs = dict(
         V=cfg['V'],
         D=cfg['D'],
         ps=cfg['patch_size'],
@@ -147,6 +149,12 @@ def load_model(
         n_heads=cfg.get('n_heads', None),
         smooth_mid=cfg.get('smooth_mid', None),
     )
+    # H2-class checkpoints include these; older Fresnel/Freckles/Johanna
+    # checkpoints don't. Only pass if present so PatchSVAE defaults apply.
+    for k in ('linear_readout', 'svd_mode', 'match_params'):
+        if k in cfg and cfg[k] is not None:
+            pv_kwargs[k] = cfg[k]
+    model = PatchSVAE(**pv_kwargs)
     model.load_state_dict(ckpt['model_state_dict'], strict=True)
     model = model.to(device).eval()
 
