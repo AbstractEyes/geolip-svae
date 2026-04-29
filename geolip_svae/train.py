@@ -224,6 +224,117 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         report_every=200,
     ),
 
+    # ── H2-class dodecahedron (sphere-solver, the architecture used by h2-64 batteries) ──
+    'h2_h64_v64_d16_ps16_single_full_noise_image64x64': dict(
+        # H2_linear_matched architecture
+        V=64,
+        D=16,
+        patch_size=16,
+        hidden=64,
+        depth=1,
+        n_cross=1,
+        n_heads=8,
+        smooth_mid=16,
+        # Training — gaussian only by default (foundation)
+        dataset='omega_noise', img_size=64, batch_size=128,
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=100, target_cv=0.2, cv_weight=0.001,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.10, cv_band_hi=0.35,
+        #allowed_types=[0],
+        hf_version='h2_h64_v64_d16_ps16_single_full_noise', save_every=5,
+        ds_size=1_280_000, val_size=2_000,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
+    # ── H2-class dodecahedron (sphere-solver, the architecture used by h2-64 batteries) ──
+    'h2_64_dodecahedron_v1': dict(
+        # H2_linear_matched architecture
+        V=20,
+        D=3,
+        patch_size=4,
+        hidden=64,
+        depth=1,
+        n_cross=1,
+        n_heads=3,
+        smooth_mid=20,
+        linear_readout=True, svd_mode='none', match_params=True,
+        # Training — gaussian only by default (foundation)
+        dataset='omega_noise', img_size=64, batch_size=128,
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=50, target_cv=0.9, cv_weight=0.01,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.85, cv_band_hi=1.25,
+        allowed_types=[0],
+        hf_version='h2_64_repro_single', save_every=5,
+        ds_size=200_000, val_size=2_000,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
+
+    # ── H2-class dodecahedron (sphere-solver, the architecture used by h2-64 batteries) ──
+    'h2_64_dodecahedron_v2': dict(
+        # H2_linear_matched architecture
+        V=20,
+        D=3,
+        patch_size=4,
+        hidden=192,
+        depth=4,
+        n_cross=4,
+        n_heads=3,
+        smooth_mid=3,
+        # Training — gaussian only by default (foundation)
+        dataset='omega_noise', img_size=64, batch_size=128,
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=50, target_cv=0.9, cv_weight=0.01,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.85, cv_band_hi=1.25,
+        #allowed_types=[0],
+        hf_version='h2_64_dodecahedron_v2_gauss_svd', save_every=5,
+        ds_size=200_000, val_size=2_000,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
+        # ── H2-class tesseract (tesseract-solver, the architecture used by h2-64 batteries) ──
+    'h2_64_tesseract_v1': dict(
+        # H2_linear_matched architecture
+        V=8,
+        D=4,
+        patch_size=4,
+        hidden=64,
+        depth=1,
+        n_cross=1,
+        n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        # Training — gaussian only by default (foundation)
+        dataset='omega_noise', img_size=64, batch_size=128,
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=50, target_cv=0.9, cv_weight=0.01,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.85, cv_band_hi=1.25,
+        allowed_types=[0],
+        hf_version='h2_64_repro_single', save_every=5,
+        ds_size=200_000, val_size=2_000,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
     # ── BinaryTree substrate prototype ──
     'bintree_proto': dict(
         # H2-64 architecture exactly
@@ -314,21 +425,21 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     # At 100 epochs that's 100M sample-views, ~28-40 hours wall-clock on A100.
     # If shorter wall-clock is needed, drop epochs to 20-30 (still hits or
     # exceeds the noise precedent's 10M total views in 10-30 hours).
-    'byte_trigram_proto_128': dict(
-        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+    'byte_trigram_proto_64': dict(
+        V=32, D=4, patch_size=2, hidden=64, depth=1, n_cross=1, n_heads=4,
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
-        dataset='byte_trigram', img_size=128, batch_size=256,
-        lr=1e-5, epochs=20, target_cv=1.0, cv_weight=0.0,
-        cv_band_lo=0.95, cv_band_hi=1.3,
-        hf_version='byte_trigram_proto_128_v1', save_every=1,
+        dataset='byte_trigram', img_size=64, batch_size=1024,
+        lr=1e-3, epochs=50, target_cv=1.0, cv_weight=0.01,
+        cv_band_lo=0.80, cv_band_hi=1.3,
+        hf_version='byte_trigram_proto_64_patch_2_v1', save_every=5,
         ds_size=1_000_000, val_size=10_000,
         # ByteTrigram config — same corpus as the 256×256 run
         # No max_corpus_bytes; load the full ~500MB wikitext-103.
         bt_corpus='wikitext-103-raw-v1',
         # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
         # report_every=500 gives ~8 reports per epoch including end.
-        pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
+        #pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
         report_every=500,
     ),
 }
@@ -1972,4 +2083,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    main(["--preset", "h2_h64_v64_d16_ps16_single_full_noise_image64x64"])
