@@ -126,7 +126,7 @@ def load_model(
 
     path = _resolve_checkpoint(hf_version, checkpoint_path, hf_file, repo_id)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    cfg = ckpt['config']
+    cfg = dict(ckpt['config'])  # mutable copy
 
     model_type = cfg.get('model_type', 'v1')
     if model_type == 'v2':
@@ -136,6 +136,34 @@ def load_model(
             f"checkpoint cannot be loaded. If you need this checkpoint, "
             f"re-train it as a v1 PatchSVAE configuration."
         )
+
+    # Backfill missing architecture kwargs from final_report.json. The
+    # pre-2026-04-29 trainer's per-checkpoint config dict omitted
+    # n_heads / smooth_mid / linear_readout / svd_mode / match_params,
+    # but final_report.json (in the same hf_version folder) preserved
+    # them. We attempt the backfill silently when these are missing AND
+    # we know the hf_version to source the report from.
+    backfillable = ('n_heads', 'smooth_mid', 'linear_readout',
+                    'svd_mode', 'match_params')
+    missing_keys = [k for k in backfillable if k not in cfg]
+    if missing_keys and hf_version:
+        try:
+            from huggingface_hub import hf_hub_download
+            report_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=f'{hf_version}/final_report.json',
+                repo_type='model',
+            )
+            import json as _json
+            with open(report_path) as _f:
+                report_cfg = _json.load(_f).get('config', {})
+            for k in missing_keys:
+                if k in report_cfg and report_cfg[k] is not None:
+                    cfg[k] = report_cfg[k]
+        except Exception:
+            # Backfill is best-effort; if final_report.json isn't there or
+            # can't be read, fall through to PatchSVAE defaults.
+            pass
 
     # Build PatchSVAE — handle h2-class architecture kwargs that may be
     # absent in older checkpoints (those default to standard architecture).
