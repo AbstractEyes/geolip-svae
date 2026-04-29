@@ -292,11 +292,43 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         cv_band_lo=0.80, cv_band_hi=1.05,
         hf_version='byte_trigram_proto_v1', save_every=2,
         ds_size=20_000, val_size=200,
-        # ByteTrigram config
+        # ByteTrigram config — no corpus cap by default
         bt_corpus='wikitext-103-raw-v1',
-        bt_max_corpus_bytes=500_000_000,
         # Diagnostics cadence
         report_every=100,
+    ),
+
+    # Byte-trigram at 128×128 with batch=256 for 100 epochs. The 256×256/batch=8
+    # run (byte_trigram_proto_v1) plateaued at α=0.043 by ep 13, suggesting
+    # under-saturation — the model found a stable point at only 22% of the α
+    # cap (0.2). Hypothesis: larger batch (32× more gradient signal per step)
+    # + more epochs + matched data volume will let α push higher and shift the
+    # equilibrium. 128×128 cuts patches from 4096 to 1024 (4× cheaper per
+    # image) but batch=256 means 8× more text per gradient step than the
+    # prior run (12 MB vs 1.5 MB).
+    #
+    # ds_size=1M matches the noise-substrate training precedent (Johanna,
+    # Fresnel, h2-64 batteries: 1M samples/epoch). Anything less is
+    # under-data'd against that baseline, where 10M total sample-views
+    # was sufficient to characterize the projective-clean codebook.
+    # At 100 epochs that's 100M sample-views, ~28-40 hours wall-clock on A100.
+    # If shorter wall-clock is needed, drop epochs to 20-30 (still hits or
+    # exceeds the noise precedent's 10M total views in 10-30 hours).
+    'byte_trigram_proto_128': dict(
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        dataset='byte_trigram', img_size=128, batch_size=256,
+        lr=1e-3, epochs=100, target_cv=0.9, cv_weight=0.0,
+        cv_band_lo=0.80, cv_band_hi=1.05,
+        hf_version='byte_trigram_proto_128_v1', save_every=10,
+        ds_size=1_000_000, val_size=2_000,
+        # ByteTrigram config — same corpus as the 256×256 run
+        # No max_corpus_bytes; load the full ~500MB wikitext-103.
+        bt_corpus='wikitext-103-raw-v1',
+        # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
+        # report_every=500 gives ~8 reports per epoch including end.
+        report_every=500,
     ),
 }
 
@@ -950,7 +982,23 @@ class ByteTrigramDataset(torch.utils.data.Dataset):
 
     def __init__(self, size=200_000, img_size=256, patch_size=4,
                  corpus_id='wikitext-103-raw-v1', split='train',
-                 seed=42, max_corpus_bytes=500_000_000):
+                 seed=42, max_corpus_bytes=None):
+        """
+        Args:
+            size: dataset length (number of training samples to yield)
+            img_size: image dimension (must be divisible by patch_size)
+            patch_size: patch dimension (default 4)
+            corpus_id: HF dataset name OR local .txt path. Loaded as one byte
+                stream.
+            split: HF dataset split (default 'train')
+            seed: RNG seed for window sampling
+            max_corpus_bytes: optional cap on corpus bytes loaded.
+                Default None = load entire corpus (no truncation). Set this
+                only if you specifically want to subsample a larger corpus
+                (e.g., a small slice of C4 for a quick test). Loaded corpus
+                lives in RAM as a uint8 array — 1 byte per byte. Warns above
+                10 GB so you know what you're committing.
+        """
         self.size = size
         self.img_size = img_size
         self.patch_size = patch_size
@@ -971,7 +1019,10 @@ class ByteTrigramDataset(torch.utils.data.Dataset):
             print(f"  [ByteTrigramDataset] Loading local corpus "
                   f"{corpus_id}...")
             with open(corpus_id, 'rb') as f:
-                full_bytes = f.read(max_corpus_bytes)
+                if max_corpus_bytes is not None:
+                    full_bytes = f.read(max_corpus_bytes)
+                else:
+                    full_bytes = f.read()
         else:
             print(f"  [ByteTrigramDataset] Loading corpus {corpus_id}...")
             from datasets import load_dataset
@@ -988,20 +1039,27 @@ class ByteTrigramDataset(torch.utils.data.Dataset):
                 b = txt.encode('utf-8')
                 chunks.append(b)
                 total += len(b)
-                if total >= max_corpus_bytes:
+                if max_corpus_bytes is not None and total >= max_corpus_bytes:
                     break
             full_bytes = b'\n'.join(chunks)
+
+        if len(full_bytes) > 10_000_000_000:
+            gb = len(full_bytes) / 1e9
+            print(f"  [ByteTrigramDataset] WARNING: corpus is {gb:.1f} GB. "
+                  f"This loads entirely into system RAM as a uint8 array. "
+                  f"Set max_corpus_bytes=N to subsample if RAM-constrained.")
 
         self.corpus = np.frombuffer(full_bytes, dtype=np.uint8)
         if len(self.corpus) < self.bytes_per_image + 16:
             raise ValueError(
                 f"Corpus too small: {len(self.corpus):,} bytes < "
-                f"required {self.bytes_per_image:,} per image. "
-                f"Increase max_corpus_bytes or use a larger corpus.")
-        print(f"  [ByteTrigramDataset] Corpus: {len(self.corpus):,} bytes, "
+                f"required {self.bytes_per_image:,} per image.")
+        print(f"  [ByteTrigramDataset] Corpus: {len(self.corpus):,} bytes "
+              f"({len(self.corpus) / 1e6:.1f} MB), "
               f"{self.bytes_per_image:,} bytes/image, "
               f"{len(self.corpus) // self.bytes_per_image:,} non-overlapping "
-              f"images available")
+              f"images available "
+              f"({len(self.corpus) - self.bytes_per_image:,} valid window starts)")
 
     def __len__(self):
         return self.size
@@ -1353,7 +1411,7 @@ def train(cfg: Dict[str, Any]):
         ds_size = cfg.get('ds_size', 20_000)
         val_size = cfg.get('val_size', 200)
         bt_corpus = cfg.get('bt_corpus', 'wikitext-103-raw-v1')
-        bt_max_corpus_bytes = cfg.get('bt_max_corpus_bytes', 500_000_000)
+        bt_max_corpus_bytes = cfg.get('bt_max_corpus_bytes', None)  # None = use full corpus
         train_ds = ByteTrigramDataset(
             size=ds_size, img_size=img_size, patch_size=patch_size,
             corpus_id=bt_corpus, seed=42,
@@ -1362,12 +1420,18 @@ def train(cfg: Dict[str, Any]):
             size=val_size, img_size=img_size, patch_size=patch_size,
             corpus_id=bt_corpus, seed=999,
             max_corpus_bytes=bt_max_corpus_bytes)
+        # num_workers=4 to overlap data loading with GPU compute. Unlike
+        # SentencePieceBitDataset (where the SPM tokenizer is expensive to
+        # fork), ByteTrigramDataset just indexes into a uint8 numpy array —
+        # workers fork via copy-on-write without ballooning RAM, and the
+        # batch-level data-load wallclock at large batch (e.g. 256 × ~1ms/item
+        # = ~256ms single-threaded) can match or exceed GPU compute time.
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=True, drop_last=True)
+            num_workers=4, pin_memory=True, drop_last=True)
         test_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=batch_size, shuffle=False,
-            num_workers=0, pin_memory=True)
+            num_workers=4, pin_memory=True)
         is_byte_trigram = True
 
     else:
