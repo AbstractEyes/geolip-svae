@@ -1,24 +1,26 @@
 """
-geolip_svae.inference.text_demo
-================================
-Runnable end-to-end demonstration of ``SentenceEncoder``.
+geolip_svae.tests.byte_trigram_similarity_test
+================================================
+Runnable diagnostic battery for ``SentenceEncoder`` (geolip_svae.inference.text).
 
 Auto-loads a byte-trigram-trained sphere-solver, resolves a codebook
 (HuggingFace fetch with fresh-extraction fallback), and runs the four
 diagnostic comparison classes from the OMEGA_CATALOG triage protocol
-against all three signature modes.
+against all three signature modes. Companion to noise_stress_test.py
+and sentencepiece_stress_test.py — same convention: a self-contained,
+runnable test module exercising a specific substrate / wrapper.
 
 Usage::
 
-    python -m geolip_svae.inference.text_demo
-    python -m geolip_svae.inference.text_demo --hf-version byte_trigram_proto_64_patch_2_v1
-    python -m geolip_svae.inference.text_demo --calibration byte_trigram_wikitext103_val
-    python -m geolip_svae.inference.text_demo --pad-strategy space --pool masked_mean
-    python -m geolip_svae.inference.text_demo --quick    # one pair per group
-    python -m geolip_svae.inference.text_demo --extract-fresh    # skip HF fetch
+    python -m geolip_svae.tests.byte_trigram_similarity_test
+    python -m geolip_svae.tests.byte_trigram_similarity_test --hf-version byte_trigram_proto_64_patch_2_v1
+    python -m geolip_svae.tests.byte_trigram_similarity_test --calibration byte_trigram_wikitext103_val
+    python -m geolip_svae.tests.byte_trigram_similarity_test --pad-strategy space --pool masked_mean
+    python -m geolip_svae.tests.byte_trigram_similarity_test --quick           # one pair per group
+    python -m geolip_svae.tests.byte_trigram_similarity_test --extract-fresh   # skip HF fetch
 
-What this script demonstrates
------------------------------
+What this test exercises
+------------------------
 1. Idiomatic load → engine → codebook attach → SentenceEncoder.
 2. Codebook resolution with graceful HF-fallback (covers the case where
    the model has been trained but no codebook has been uploaded yet).

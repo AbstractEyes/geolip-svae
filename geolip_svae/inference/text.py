@@ -264,21 +264,29 @@ class SentenceEncoder:
         device = next(self.engine.model.parameters()).device
         images = self.encode_text_batch(texts).to(device)
 
-        # Per-patch features [B, n_patches, feat_dim]
+        # Use the engine's resolution-aware path with mode='direct'.
+        # We deliberately go through engine.encode / engine.encode_axes
+        # rather than calling model() directly — that keeps text.py inside
+        # the proper inference pipeline. Direct mode is used because tile
+        # mode permutes patches across sub-tiles (each tile is row-major
+        # within itself; concatenated tile outputs are NOT row-major across
+        # the full image), which would break the bytes→patch index mapping
+        # that patch_real_mask is built against. The model is resolution-
+        # agnostic, so direct works at any img_size that fits in VRAM. For
+        # img_size large enough to require tiling, a tile-aware mask would
+        # be needed (deferred — not currently a use case for this wrapper).
         if mode == 'codebook':
-            # engine.encode_axes returns activations [B, n_patches, V, n_axes]
-            # Aggregate V → 1 via sum of |projections|.
-            out = self.engine.encode_axes(images)
-            acts = out['activations']                     # [B, P, V, n_axes]
+            # encode_axes pulls the codebook through the engine, projects
+            # M onto axes, returns activations [B, n_patches, V, n_axes]
+            out = self.engine.encode_axes(images, mode='direct')
+            acts = out['activations'].to(device)          # [B, P, V, n_axes]
             feat = acts.abs().sum(dim=2)                  # [B, P, n_axes]
         else:
-            enc = self.engine.encode(images)
+            enc = self.engine.encode(images, mode='direct')
             if mode == 'omega':
-                feat = enc['S']                           # [B, P, D]
+                feat = enc['S'].to(device)                # [B, P, D]
             else:  # 'omega_orig'
-                feat = enc['S_orig']                      # [B, P, D]
-
-        feat = feat.to(device)
+                feat = enc['S_orig'].to(device)           # [B, P, D]
 
         # Pool patches → sentence-level
         if pool == 'mean':
