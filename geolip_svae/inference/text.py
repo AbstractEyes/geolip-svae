@@ -112,16 +112,17 @@ class SentenceEncoder:
             raise ValueError(
                 f"img_size={img_size} must be divisible by patch_size={patch_size}"
             )
-        # Sanity-check the engine's model matches our patch_size — the
-        # ByteTrigramDataset.bytes_to_image layout is patch-aware.
-        model_ps = getattr(engine.model, 'patch_size', None)
-        #if model_ps is not None and model_ps != patch_size:
-        #    raise ValueError(
-        #        f"engine.model.patch_size={model_ps} does not match "
-        #        f"encoder patch_size={patch_size}. They MUST match — the "
-        #        f"byte-to-image layout is patch-aware and the model was "
-        #        f"trained on a specific patch_size."
-        #    )
+        # NOTE: encoder.patch_size and engine.model.patch_size are independent
+        # concerns. The encoder's controls how bytes are laid out in the
+        # (3, img_size, img_size) image via ByteTrigramDataset.bytes_to_image.
+        # The model's controls how its forward carves the image into patches
+        # for encoding (set at training time, immutable). These USUALLY match
+        # for in-distribution behavior — when they don't, the byte layout is
+        # off-distribution but the architecture still runs cleanly. Per
+        # CLAUDE.md "no core limiters" rule for the inference layer, we
+        # explicitly do NOT gate on this; the engine handles arbitrary
+        # patch_size at forward time and we want diagnostic overrides to work.
+        # The model will fail loudly if (img_size % model.patch_size != 0).
 
         self.engine = engine
         self.img_size = img_size
