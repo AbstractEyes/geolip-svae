@@ -205,22 +205,69 @@ class SentenceEncoder:
         return torch.stack([self.encode_text(t) for t in texts])
 
     def patch_real_mask(self, text: str) -> torch.Tensor:
-        """Boolean mask of which patches contain real (un-padded) text bytes.
+        """Boolean mask of which MODEL patches contain real (un-padded) text bytes.
 
-        For ``pad_strategy='repeat'`` all patches contain real content
-        (just repeated), so the mask is all True. For 'zero' and 'space',
-        only the prefix patches whose byte range is within the text length
-        are marked True. Use with ``pool='masked_mean'`` to ignore padded
-        patches when pooling.
+        Returned mask is in MODEL patch space — sized
+        ``(img_size // model.patch_size) ** 2`` — because that's the grid
+        the model's forward (and engine.encode / engine.encode_axes in
+        direct mode) emits per-patch features for. The encoder's own
+        patch_size controls byte layout (via ``bytes_to_image``), not the
+        feature grid. When the two patch_sizes differ (legitimate diagnostic
+        config — see Critical lessons #3 / #4), each encoder logical patch
+        decomposes into multiple model patches; this method handles both
+        the matching and non-matching cases uniformly.
 
-        Returns: ``Tensor[n_patches]`` of bool.
+        Implementation: lay out a byte-mask (0xFF for real bytes, 0x00 for
+        padded bytes) through ``bytes_to_image`` using the encoder's
+        patch_size. Result is a ``(3, H, W)`` image with +1 pixels for
+        real-byte content and -1 for padded. Aggregate to the model patch
+        grid by taking max over (channel, ps_model, ps_model) per model
+        patch — a model patch is "real" if ANY pixel within it has a real
+        byte contribution.
+
+        For ``pad_strategy='repeat'`` all model patches see (cycled) real
+        content so the mask is all True. Use with ``pool='masked_mean'``
+        to ignore padded patches.
+
+        Returns: ``Tensor[n_model_patches]`` of bool.
         """
+        model_ps = int(self.engine.model.patch_size)
+        if self.img_size % model_ps != 0:
+            raise ValueError(
+                f"img_size={self.img_size} must be divisible by "
+                f"model.patch_size={model_ps} for the model's forward to work"
+            )
+        gh_m = gw_m = self.img_size // model_ps
+        n_model_patches = gh_m * gw_m
+
         if self.pad_strategy == 'repeat':
-            return torch.ones(self.n_patches, dtype=torch.bool)
+            return torch.ones(n_model_patches, dtype=torch.bool)
+
         n_real = min(len(text.encode('utf-8')), self.bytes_per_image)
-        # Patch i covers bytes [i*bpp, (i+1)*bpp). Real if start < n_real.
-        starts = torch.arange(self.n_patches) * self.bytes_per_patch
-        return starts < n_real
+        if n_real >= self.bytes_per_image:
+            return torch.ones(n_model_patches, dtype=torch.bool)
+        if n_real == 0:
+            return torch.zeros(n_model_patches, dtype=torch.bool)
+
+        # Build a byte mask: 0xFF for real bytes, 0x00 for padded.
+        # Lay it out through the same path real bytes go through, so the
+        # spatial pixel locations of "real content" exactly match.
+        from geolip_svae.train import ByteTrigramDataset
+
+        byte_mask = np.zeros(self.bytes_per_image, dtype=np.uint8)
+        byte_mask[:n_real] = 0xFF
+        mask_img_np = ByteTrigramDataset.bytes_to_image(
+            byte_mask, self.img_size, self.patch_size,
+        )
+        # Pixel value: +1 if pixel comes from a real byte, -1 if from padding.
+        mask_img = torch.from_numpy(mask_img_np)            # (3, H, W)
+
+        # Aggregate to model patch grid: a model patch is "real" if any
+        # pixel within it is positive.
+        # (3, H, W) → (3, gh_m, ps_m, gw_m, ps_m); max over channel + ps_m × ps_m
+        blocks = mask_img.reshape(3, gh_m, model_ps, gw_m, model_ps)
+        patch_max = blocks.amax(dim=(0, 2, 4))              # (gh_m, gw_m)
+        return (patch_max > 0).flatten()                     # (n_model_patches,)
 
     # ── Signature computation ───────────────────────────────────────
 
