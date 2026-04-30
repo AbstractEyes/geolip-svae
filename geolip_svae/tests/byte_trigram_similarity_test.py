@@ -15,7 +15,7 @@ Usage::
     python -m geolip_svae.tests.byte_trigram_similarity_test
     python -m geolip_svae.tests.byte_trigram_similarity_test --hf-version byte_trigram_proto_64_patch_2_v1
     python -m geolip_svae.tests.byte_trigram_similarity_test --calibration byte_trigram_wikitext103_val
-    python -m geolip_svae.tests.byte_trigram_similarity_test --pad-strategy space --agg best_match
+    python -m geolip_svae.tests.byte_trigram_similarity_test --pad-strategy space --agg patch_mean
     python -m geolip_svae.tests.byte_trigram_similarity_test --quick           # one pair per group
     python -m geolip_svae.tests.byte_trigram_similarity_test --extract-fresh   # skip HF fetch
 
@@ -82,6 +82,17 @@ PARAPHRASE_PAIRS = [
 EDIT_PAIRS = [
     ("The cat sat on the mat.",
      "The cat sits on the mat."),
+    ("the cat and the dog are friends",
+     "the cat and the dog are friends"),  # duplicate
+    ("the cat and the dog are... friends",
+     "the cat and the dog aren't friends"),  # counterpoint adjudicated
+    ("the cat and the dog are friends",
+     "the cat and the dog are friendly"),  # minor edit
+
+    ("the cat and the dog are best friends",
+     "the cat and the dog are friends"),  # extra word
+    ("the cat and the dog are best friends",
+     "the cat and the dog are true friends"),  # similar words
     ("Many believe artificial intelligence will transform medicine.",
      "Many beleive artificial intellgence will transform medecine."),  # typos
 ]
@@ -241,9 +252,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         '--agg',
-        default='patch_mean',
+        default='best_match',
         choices=AGG_METHODS,
-        help="Per-patch cosine aggregation. Default: patch_mean.",
+        help="Per-patch cosine aggregation. Default: best_match.",
     )
     parser.add_argument(
         '--img-size', type=int, default=64,

@@ -269,17 +269,22 @@ def per_patch_similarity(
     mask_a: torch.Tensor,
     feat_b: torch.Tensor,
     mask_b: torch.Tensor,
-    agg: str = 'patch_mean',
+    agg: str = 'best_match',
 ) -> float:
     """Cosine similarity between two texts' per-patch features.
 
     Subsets each side to its real patches, computes the pairwise
     ``[K_a, K_b]`` cosine matrix, aggregates to a scalar via ``agg``:
 
-    - ``'patch_mean'``: mean over all entries (order-agnostic).
-    - ``'best_match'``: symmetric mean of row-max + col-max
-      (Hausdorff-like; tolerates length mismatch).
-    - ``'aligned'``: per-position cosine; requires ``K_a == K_b``.
+    - ``'best_match'`` (default): symmetric mean of row-max + col-max.
+      Hausdorff-like; tolerates length mismatch. Preserves identity:
+      similarity(x, x) = 1.
+    - ``'aligned'``: per-position cosine; preserves identity. Requires
+      ``K_a == K_b`` (raises otherwise).
+    - ``'patch_mean'``: mean over all entries of the [K_a, K_b] matrix.
+      Order-agnostic content-distribution similarity. Does NOT preserve
+      identity (similarity(x, x) < 1 whenever any two patches of x
+      differ from each other) — use only when that's what you want.
     """
     if agg not in AGG_METHODS:
         raise ValueError(f"agg={agg!r} not in {AGG_METHODS}")
