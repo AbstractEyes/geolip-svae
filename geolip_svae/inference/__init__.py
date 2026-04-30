@@ -139,15 +139,18 @@ from geolip_svae.inference.engine import (
     CodebookIncompatibleError,
 )
 
-# ── Text-side wrapper (byte-trigram sentence similarity) ──
+# ── Text-side wrapper (byte-trigram I/O + per-patch similarity) ──
 from geolip_svae.inference.text import (
     SentenceEncoder,
     PAD_STRATEGIES,
     SIGNATURE_MODES,
-    PER_ROW_MODES,
-    V_AGGREGATED_MODES,
     AGG_METHODS,
-    SIMILARITY_METRICS,
+    text_to_image,
+    image_to_text,
+    text_real_patch_mask,
+    text_features,
+    text_recovery_metrics,
+    per_patch_similarity,
 )
 
 # ── Legacy back-compat shims ──
@@ -199,10 +202,13 @@ __all__ = [
     'SentenceEncoder',
     'PAD_STRATEGIES',
     'SIGNATURE_MODES',
-    'PER_ROW_MODES',
-    'V_AGGREGATED_MODES',
     'AGG_METHODS',
-    'SIMILARITY_METRICS',
+    'text_to_image',
+    'image_to_text',
+    'text_real_patch_mask',
+    'text_features',
+    'text_recovery_metrics',
+    'per_patch_similarity',
     # Legacy
     'encode',
     'decode',

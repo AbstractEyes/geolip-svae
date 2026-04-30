@@ -52,6 +52,7 @@ from geolip_svae.inference import (
     SentenceEncoder,
     make_calibration,
     PAD_STRATEGIES,
+    SIGNATURE_MODES,
     AGG_METHODS,
     CodebookMissingError,
     CodebookIncompatibleError,
@@ -159,44 +160,26 @@ def _truncate(s: str, n: int = 50) -> str:
     return s if len(s) <= n else s[: n - 1] + '…'
 
 
-PRINT_MODES = ('M_flat', 'codebook_codes', 'codebook_sum')
-"""Three modes shown in the diagnostic table:
-   - M_flat:         per-row preserved (recommended for similarity)
-   - codebook_codes: per-row codebook quantization (recommended)
-   - codebook_sum:   V-aggregated (diagnostic — should CLT-collapse to ~1)
-The contrast between the first two and the last is the headline result:
-  if M_flat / codebook_codes give meaningful spread but codebook_sum
-  collapses to ~0.998, the per-row representations are doing real work.
-"""
-
-
 def print_pair_table(
     enc: SentenceEncoder,
     pairs: List[Tuple[str, str]],
     agg: str,
 ):
-    """Three-mode table for a list of (a, b) pairs.
-
-    Shows two per-row modes (M_flat, codebook_codes) plus codebook_sum
-    as a V-aggregated diagnostic comparison.
-    """
-    print(f"  {'mode':<14s} {'M_flat':>8s}  {'cb_codes':>9s}  {'cb_sum_NB':>10s}")
-    print(f"  {'─'*14} {'─'*8}  {'─'*9}  {'─'*10}")
+    """Per-pair table over both per-row signature modes (M, codes)."""
+    print(f"  {'':<14s} {'M':>8s}  {'codes':>8s}")
+    print(f"  {'─'*14} {'─'*8}  {'─'*8}")
     for text_a, text_b in pairs:
         sims = {}
-        for mode in PRINT_MODES:
+        for mode in SIGNATURE_MODES:
             try:
-                sims[mode] = enc.similarity(
-                    text_a, text_b, mode=mode, agg=agg,
-                )
+                sims[mode] = enc.similarity(text_a, text_b, mode=mode, agg=agg)
             except CodebookMissingError:
                 sims[mode] = float('nan')
         print(f"  A: {_truncate(text_a, 80)!r}")
         print(f"  B: {_truncate(text_b, 80)!r}")
         print(f"  {'per-patch':<14s} "
-              f"{sims['M_flat']:>+8.4f}  "
-              f"{sims['codebook_codes']:>+9.4f}  "
-              f"{sims['codebook_sum']:>+10.4f}")
+              f"{sims['M']:>+8.4f}  "
+              f"{sims['codes']:>+8.4f}")
         print()
 
 
@@ -260,10 +243,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--agg',
         default='patch_mean',
         choices=AGG_METHODS,
-        help=("Per-patch cosine aggregation. Operates on cosine SCALARS "
-              "after per-patch comparison; pre-cosine pooling on features "
-              "is intentionally not supported (architecture-incompatible). "
-              "Default: patch_mean."),
+        help="Per-patch cosine aggregation. Default: patch_mean.",
     )
     parser.add_argument(
         '--img-size', type=int, default=64,
@@ -335,55 +315,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ── 3. Build encoder ──
     print(f"\n[3/4] Building SentenceEncoder…")
-    try:
-        enc = SentenceEncoder(
-            engine,
-            img_size=args.img_size,
-            patch_size=cfg['patch_size'],
-            pad_strategy=args.pad_strategy,
-        )
-    except ValueError as e:
-        print(f"  ERROR: SentenceEncoder init failed: {e}")
-        return 5
+    enc = SentenceEncoder(
+        engine,
+        img_size=args.img_size,
+        patch_size=cfg['patch_size'],
+        pad=args.pad_strategy,
+    )
     print(f"  Encoder: img_size={enc.img_size}, patch_size={enc.patch_size}, "
-          f"pad_strategy={enc.pad_strategy!r}")
-    print(f"  Capacity: {enc.bytes_per_image:,} bytes/image, "
-          f"{enc.n_patches} patches × {enc.bytes_per_patch} bytes/patch")
+          f"pad={enc.pad!r}")
     print(f"  Per-patch aggregation: {args.agg!r}")
 
-    # ── 4a. Step 0 round-trip sanity check ──
+    # ── 4a. Round-trip sanity check ──
     print(f"\n[4a] Round-trip sanity check (text → image → recon → text)…")
-    print(f"  If real_byte_acc << model's training byte recovery (~99.6%),")
-    print(f"  per-patch features for these sentences are unreliable.\n")
     print(f"  {'sentence':<55s}  {'n_real':>6s}  {'real_acc':>8s}  "
-          f"{'real_l1':>7s}  {'recon_text_real':<40s}")
+          f"{'real_l1':>7s}  {'recon_text':<40s}")
     print(f"  {'─'*55}  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*40}")
     all_real_acc = []
     for group_name, pairs in TEST_GROUPS:
         for text in [pairs[0][0], pairs[0][1]] if args.quick \
                 else [t for p in pairs for t in p]:
-            m = enc.roundtrip_metrics(text)
+            m = enc.recovery(text)
             all_real_acc.append(m['real_byte_acc'])
             print(f"  {_truncate(text, 55):<55s}  "
                   f"{m['n_real_bytes']:>6d}  "
                   f"{m['real_byte_acc']:>8.4f}  "
                   f"{m['real_byte_l1']:>7.3f}  "
-                  f"{_truncate(m['recon_text_real'], 40):<40s}")
+                  f"{_truncate(m['recon_text'], 40):<40s}")
     mean_acc = sum(all_real_acc) / len(all_real_acc) if all_real_acc else 0.0
     print(f"\n  Mean real_byte_acc across test set: {mean_acc:.4f}")
-    if mean_acc < 0.95:
-        print(f"  WARNING: low real-byte recovery on test sentences. "
-              f"Per-patch similarity below may be unreliable.")
-    elif mean_acc < 0.99:
-        print(f"  Note: real-byte recovery somewhat below training floor "
-              f"(~99.6%); proceeding with similarity but with caution.")
-    else:
-        print(f"  Round-trip looks healthy; proceeding to similarity.")
 
-    # ── 4b. Run diagnostics ──
-    print(f"\n[4b] Diagnostic comparisons (per-patch cosine similarity)…")
-    print(f"  Three signature modes per pair: omega, omega_orig, codebook")
-    print(f"  Higher = more similar. Range [-1, 1] for cosine.\n")
+    # ── 4b. Per-patch similarity ──
+    print(f"\n[4b] Per-patch cosine similarity…")
+    print(f"  Modes: {SIGNATURE_MODES}.  Higher = more similar; range [-1, 1].\n")
 
     for group_name, pairs in TEST_GROUPS:
         if args.quick:
@@ -397,45 +360,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     labels: List[str] = []
     for group_name, pairs in TEST_GROUPS:
         a, b = pairs[0]
-        # Compact 4-char group prefix for matrix labels
         prefix = group_name.split()[0][:4].lower()
         sentences.extend([a, b])
         labels.extend([f"{prefix}-A", f"{prefix}-B"])
 
-    for mode in ('M_flat', 'codebook_codes'):
-        print(f"\n  Mode: {mode!r}  (per-row preserved)")
+    for mode in SIGNATURE_MODES:
+        print(f"\n  Mode: {mode!r}")
         try:
             print_similarity_matrix(
                 enc, sentences, labels, mode=mode, agg=args.agg,
             )
         except CodebookMissingError as e:
             print(f"    skipped ({type(e).__name__}: {e})")
-    # One V-aggregated diagnostic mode for contrast
-    print(f"\n  Mode: 'codebook_sum'  (V-aggregated — diagnostic only)")
-    try:
-        print_similarity_matrix(
-            enc, sentences, labels, mode='codebook_sum', agg=args.agg,
-        )
-    except CodebookMissingError as e:
-        print(f"    skipped ({type(e).__name__}: {e})")
 
-    # ── Reading guide ──
     print()
     print("─" * 70)
-    print("Reading guide:")
-    print("  M_flat: direct per-patch sphere-norm encoder rows (V*D dims).")
-    print("    Most byte-faithful representation; cosine measures byte-level")
-    print("    similarity between corresponding patches.")
-    print("  codebook_codes: per-row argmax over codebook axes, one-hot flat.")
-    print("    Cosine = Hamming-style overlap (fraction of rows landing on")
-    print("    the same polytope axis). Quantized but interpretable.")
-    print("  codebook_sum (DIAGNOSTIC): V-summed |projections|. Should")
-    print("    CLT-collapse to ~0.998 across all sentence pairs because the")
-    print("    sum-over-32 unit vectors is near-constant. Included for")
-    print("    contrast — if M_flat / codebook_codes show real spread but")
-    print("    codebook_sum collapses, per-row representations are working.")
-    print("  cross-domain pairs should be the lowest similarity floor; if")
-    print("    they're not, the model isn't separating distributions cleanly.")
+    print("Modes:")
+    print("  'M':     per-patch flat sphere-norm encoder rows [V*D].")
+    print("  'codes': per-row argmax over codebook axes, one-hot flat")
+    print("           [V*n_axes]. Requires attached codebook.")
     print("─" * 70)
     return 0
 
