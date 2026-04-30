@@ -37,6 +37,11 @@ Public API::
         CodebookMissingError, CodebookIncompatibleError,
     )
 
+    # Text-side wrapper (byte-trigram sentence similarity)
+    from geolip_svae.inference import (
+        SentenceEncoder,
+    )
+
     # Legacy flat-module API (back-compat shims)
     from geolip_svae.inference import (
         encode, decode, reconstruct, batched_forward, compute_axis_codebook,
@@ -75,6 +80,8 @@ Module layout
                    ``extract_codebook``
     engine       — ``InferenceEngine`` orchestrator, codebook lifecycle,
                    compatibility checks
+    text         — ``SentenceEncoder`` text-side wrapper for byte-trigram
+                   models: string → image, sentence signatures, similarity
     legacy       — pre-rebuild flat-module shims (``encode``, ``decode``,
                    ``reconstruct``, ``batched_forward``,
                    ``compute_axis_codebook``)
@@ -132,6 +139,15 @@ from geolip_svae.inference.engine import (
     CodebookIncompatibleError,
 )
 
+# ── Text-side wrapper (byte-trigram sentence similarity) ──
+from geolip_svae.inference.text import (
+    SentenceEncoder,
+    PAD_STRATEGIES,
+    SIGNATURE_MODES,
+    POOL_METHODS,
+    SIMILARITY_METRICS,
+)
+
 # ── Legacy back-compat shims ──
 from geolip_svae.inference.legacy import (
     encode,
@@ -177,6 +193,12 @@ __all__ = [
     'InferenceEngineDefaults',
     'CodebookMissingError',
     'CodebookIncompatibleError',
+    # Text wrapper
+    'SentenceEncoder',
+    'PAD_STRATEGIES',
+    'SIGNATURE_MODES',
+    'POOL_METHODS',
+    'SIMILARITY_METRICS',
     # Legacy
     'encode',
     'decode',

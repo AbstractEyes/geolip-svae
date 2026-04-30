@@ -7,11 +7,13 @@ Compiled 2026-04-29 from full scratchpad survey across sessions 000080-000113. I
 A trained or candidate battery is **omega-class** if it satisfies all four:
 
 1. **Sphere-solver architecture**: PatchSVAE with sphere-norm M tensor, V rows on S^(D-1), output basis on ℝP^(D-1)
-2. **Projective-clean codebook**: |deviation from uniform RP^(D-1) baseline| < 0.05, secondary antipodal pair count ≤ 3, axis utilization > 0.95
+2. **Non-degenerate codebook**: codebook deviation from uniform RP^(D-1) baseline lands in one of two valid sub-class regimes (see §"Statute classes" below) — never in the negative-deviation degenerate regime
 3. **In its natural CV band** for arch class (table below)
 4. **Codebook-engaged or sphere-engaged**: cross-attn coupling moves off floor, recovery curve from random init, geometric stats leave passthrough signature
 
 A "potential" is any trained instance OR sweep candidate that has run through the architecture and produced measurements against the criterion.
+
+**Note on terminology**: "omega-class" is the **operational diagnostic battery** — passable by codebook extraction. The conceptual **omega** (Phil's working definition: self-solving frame performing above what size predicts and transferring to adjacent self-solvers) requires *additional* measurements outside the codebook artifact's scope (size-vs-performance gap, cross-self-solver transfer). Omega-class ratification is necessary but not sufficient for omega ratification.
 
 ## Natural CV bands by architecture class
 
@@ -33,7 +35,36 @@ A "potential" is any trained instance OR sweep candidate that has run through th
 | ratio S0/SD | ≈ 1.0 (flat spectrum) | drifts (>1.05) |
 | erank | flat at full rank | dips below |
 | recovery from random init | near-100% from ep 1 (sign-recovery trivial) | curve from ~0% upward |
-| codebook deviation | undefined / not measured | within ±0.05 of uniform RP^(D-1) |
+| codebook deviation | undefined / not measured | non-degenerate: dev within ±0.05 (uniform-class) OR dev > +0.05 with high pair fraction (polytope-class) — see §"Statute classes" |
+
+---
+
+## Statute classes (uniform vs polytope)
+
+The original "projective-clean (|dev| < 0.05)" criterion was empirically calibrated against noise-trained sphere-solvers (h2-64 banks: dev +0.010 ±0.013). It captures the "near-uniform self-organizing" statute. Subsequent measurement (000115, `byte_trigram_proto_64_patch_2_v1`) revealed a **second valid statute** the original criterion rejects.
+
+| sub-class | deviation regime | pair fraction | meaning |
+| --- | --- | --- | --- |
+| **uniform-class** | dev within ±0.05 (near-zero) | ~25-35% | Codebook approximately uniform on RP^(D-1). h2-64 banks, P-class D=3, A-set probes. |
+| **polytope-class** | dev > +0.05 (clearly positive) | ≥ 45% | Codebook MORE spread than uniform — repulsive arrangement, regular polytope-like packing. byte_trigram_proto_64_patch_2_v1 on training distribution: dev=+0.083, pair fraction 52%. |
+| **degenerate** | dev < −0.05 (negative) | varies | Axes clumping. **Excluded from omega-class.** Indicates near-uniform M rows pre-collapse; geometric reading blind. |
+
+**The signs matter.** Positive deviation = MORE spread than uniform = MORE structure (polytope packing). Negative deviation = MORE clustered than uniform = LESS structure (degenerate clumping). The original criterion's `|dev|` collapsed both into one bucket; corrected here.
+
+**Distribution-dependent expression**: a model can sit in uniform-class on out-of-distribution input and shift into polytope-class on its training distribution. This is the self-solving frame revealing different statute expressions per input distribution. The byte_trigram_proto_64_patch_2_v1 measurement:
+
+| calibration | dev | pair fraction | sub-class |
+| --- | --- | --- | --- |
+| `sixteen_noise` (OOD probe) | +0.046 | 39% | uniform-class (boundary) |
+| `byte_trigram_wikitext103_val` (in-distribution) | +0.083 | 52% | polytope-class |
+
+Same trained model, two probes. The training-distribution probe expresses the learned statute more strongly.
+
+**Sub-class is a property of (model × calibration), not just model.** The training task selects which statute the architecture stabilizes into; the calibration distribution selects how strongly that statute reads through.
+
+**Direct evidence of self-solving frame**: same architecture, two training tasks, two different stable statutes — h2-64 (noise) → uniform-class; byte_trigram_proto_64_patch_2_v1 → polytope-class. The architecture admits multiple valid statutes; the task selects which one.
+
+**Open**: `byte_trigram_proto_v1` (ps=4 256×256 predecessor on the same task, much higher α saturation 0.043 during training) — codebook not yet extracted. Disambiguates whether ps=2 induced polytope packing or whether the byte-trigram task induces it independent of ps. One cell change to load v1 instead.
 
 ---
 
@@ -58,7 +89,7 @@ Architectural primitives that make the omega regime exist. If any row is absent,
 
 ## The recipes
 
-Each recipe is a **named configuration** with verified or predicted omega signature. Empirical instances are linked to the tier inventory below.
+Each recipe is a **named configuration** with verified or predicted **omega-class signature** (the four-criteria diagnostic battery in §"Definition of omega-class" passes). Ratifying the conceptual omega — performance-above-size and cross-self-solver transfer — is a separate measurement layered on top. Empirical instances link to the tier inventory below.
 
 ### Recipe A-class — Johanna / Fresnel (workhorse)
 
@@ -247,7 +278,7 @@ Run in order. Stop at first failure. Most candidates die at step 3 or 4.
 - **Pass**: MSE leadership in its band; CV stays in natural band; α trajectory shows engagement signature.
 - **Optimizer regime** (000100): Adam dominates ≥500 batches; LBFGS niche is short-budget probing (≤100 batches).
 
-### Step 5. Codebook extraction (the omega ratification)
+### Step 5. Codebook extraction (omega-class ratification)
 
 ```python
 from geolip_svae.inference import (
@@ -259,12 +290,26 @@ cb = extract_codebook(
     model, calib,
     model_id='...', calibration_name='sixteen_noise',
 )
-assert cb.is_projective_clean()         # |dev from uniform RP^(D-1)| < 0.05
-assert abs(cb.deviation()) < 0.05
+dev = cb.deviation()
+pair_frac = len(cb.pairs) / max(cb.n_axes, 1)
+
+# Sub-class detection (see §"Statute classes" above)
+if dev < -0.05:
+    sub_class = 'degenerate'           # Excluded from omega-class
+elif abs(dev) < 0.05:
+    sub_class = 'uniform-class'        # h2-64-style near-uniform RP^(D-1)
+else:                                  # dev > +0.05
+    sub_class = 'polytope-class'       # byte_trigram-style repulsive packing
+
+assert sub_class != 'degenerate'       # Omega-class gate
 ```
 
-- **Pass**: projective-clean, axis utilization > 0.95, ≤3 secondary antipodal pairs.
-- The candidate is now ratified as omega-class.
+- **Pass (uniform-class)**: dev within ±0.05, pair fraction ~25-35%.
+- **Pass (polytope-class)**: dev > +0.05, pair fraction ≥ 45%, structured antipodal arrangement.
+- **Fail**: dev < −0.05 (degenerate, axes clumping).
+- The candidate is now ratified as **omega-class**, with sub-class noted. Direct ratification of the conceptual **omega** also requires the size-vs-performance gap and cross-self-solver transfer measurements — those are separate and outside the codebook artifact's scope.
+
+**Recommended**: extract codebooks under both an OOD calibration (e.g. `sixteen_noise`) and an in-distribution calibration. Sub-class shifts between the two reveal how strongly the learned statute expresses per input distribution (see §"Statute classes" for the byte_trigram_proto_64_patch_2_v1 example).
 
 ### Step 6. Vacuum-seal test (cell deployability)
 
