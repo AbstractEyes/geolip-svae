@@ -44,7 +44,7 @@ polytope-class codebook this module projects against.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -116,12 +116,20 @@ class SentenceEncoder:
         engine: InferenceEngine,
         img_size: int = 64,
         patch_size: int = 2,
-        pad_strategy: str = 'repeat',
+        pad_strategy: str = 'space',
     ):
         if pad_strategy not in PAD_STRATEGIES:
             raise ValueError(
                 f"pad_strategy={pad_strategy!r} not in {PAD_STRATEGIES}"
             )
+        # 'repeat' makes patch_real_mask return all-True (every patch sees
+        # cycled content, so by the byte-overlap criterion every patch is
+        # "real"). That defeats the masking that per-patch similarity
+        # depends on, since similarity then averages over ALL 1024 patches'
+        # cycled content — which dominates any sentence-distinctive signal.
+        # Default is 'space' so the mask actually filters padding patches.
+        # Pass pad_strategy='repeat' explicitly only for diagnostics where
+        # the all-patches-real behavior is wanted.
         if img_size % patch_size != 0:
             raise ValueError(
                 f"img_size={img_size} must be divisible by patch_size={patch_size}"
@@ -211,6 +219,123 @@ class SentenceEncoder:
             chunk, self.img_size, self.patch_size,
         )
         return torch.from_numpy(img_np)
+
+    @torch.no_grad()
+    def decode_image(self, image: torch.Tensor) -> bytes:
+        """``(3, H, W)`` or ``(B, 3, H, W)`` image → raw byte stream(s).
+
+        Inverse of ``encode_text``'s byte→image step. Uses
+        ``ByteTrigramDataset.image_to_bytes`` with this encoder's
+        ``patch_size``. For single-image input, returns ``bytes`` of length
+        ``bytes_per_image``. For batched input, returns a list of bytes
+        objects, one per image.
+        """
+        from geolip_svae.train import ByteTrigramDataset
+
+        single = image.ndim == 3
+        if single:
+            image = image.unsqueeze(0)
+        # image_to_bytes: [B, 3, H, W] → [B, n_cells, 3] uint8 in cell-major
+        # order (matches bytes_to_image's input order; cell c ↔ trigram c).
+        bytes_t = ByteTrigramDataset.image_to_bytes(image, self.patch_size)
+        # Flatten to [B, bytes_per_image] in the original byte stream order
+        flat = bytes_t.reshape(bytes_t.shape[0], -1).cpu().numpy()
+        out = [bytes(row.astype(np.uint8)) for row in flat]
+        return out[0] if single else out
+
+    @torch.no_grad()
+    def reconstruct_text(self, text: str) -> str:
+        """Full round-trip: text → image → model recon → image → text.
+
+        Decodes the recon-image's REAL byte slice (the prefix that
+        corresponds to the original text bytes, excluding padded patches)
+        as UTF-8 with ``errors='replace'``. Use ``roundtrip_metrics`` for
+        per-byte accuracy figures.
+        """
+        return self.roundtrip_metrics(text)['recon_text_real']
+
+    @torch.no_grad()
+    def roundtrip_metrics(self, text: str) -> Dict[str, Any]:
+        """Verify text → image → model recon → image → text fidelity.
+
+        This is the Step 0 sanity check that all per-patch similarity
+        work depends on. If the model can't faithfully reconstruct the
+        bytes underlying these specific sentences, then per-patch
+        feature comparison over those sentences is comparing unreliable
+        encodings.
+
+        Returns a dict with:
+            n_real_bytes:      bytes contributed by the original sentence
+            recon_mse:         per-image MSE from engine.reconstruct
+            full_byte_acc:     fraction of all 12,288 bytes recovered exactly
+            full_byte_l1:      mean |orig - recon| in byte units (full image)
+            real_byte_acc:     fraction of the real-byte prefix recovered
+            real_byte_l1:      mean |orig - recon| over the real-byte prefix
+            orig_text:         the input text
+            recon_text_real:   UTF-8 decode of the real-byte prefix from
+                               the recon image (errors='replace')
+        """
+        from geolip_svae.train import ByteTrigramDataset
+
+        # Encode (same path encode_text uses)
+        chunk_np, n_real = self._pad_bytes(text)
+        img_np = ByteTrigramDataset.bytes_to_image(
+            chunk_np, self.img_size, self.patch_size,
+        )
+        img = torch.from_numpy(img_np)
+
+        # Forward through engine.reconstruct (resolution-aware, mode='direct'
+        # to keep the natural patch grid; same reasoning as signature()).
+        device = next(self.engine.model.parameters()).device
+        img_b = img.unsqueeze(0).to(device)
+        out = self.engine.reconstruct(img_b, mode='direct')
+        recon_img = out['recon'].cpu()
+        recon_mse = float(out['mse_per_image'][0]) if 'mse_per_image' in out \
+            else float('nan')
+
+        # Decode recon image back to bytes (same byte-stream order as input)
+        recon_bytes_t = ByteTrigramDataset.image_to_bytes(
+            recon_img, self.patch_size,
+        )
+        recon_bytes = recon_bytes_t[0].reshape(-1).cpu().numpy().astype(np.uint8)
+        orig_bytes = chunk_np.astype(np.uint8)
+
+        # Full-image byte accuracy
+        full_eq = (recon_bytes == orig_bytes)
+        full_byte_acc = float(full_eq.mean())
+        full_byte_l1 = float(np.abs(
+            recon_bytes.astype(np.int32) - orig_bytes.astype(np.int32)
+        ).mean())
+
+        # Real-byte-prefix accuracy (the part that actually encodes the sentence)
+        if n_real > 0:
+            real_eq = (recon_bytes[:n_real] == orig_bytes[:n_real])
+            real_byte_acc = float(real_eq.mean())
+            real_byte_l1 = float(np.abs(
+                recon_bytes[:n_real].astype(np.int32)
+                - orig_bytes[:n_real].astype(np.int32)
+            ).mean())
+            try:
+                recon_text_real = bytes(recon_bytes[:n_real]).decode(
+                    'utf-8', errors='replace',
+                )
+            except Exception:
+                recon_text_real = '<decode_error>'
+        else:
+            real_byte_acc = float('nan')
+            real_byte_l1 = float('nan')
+            recon_text_real = ''
+
+        return {
+            'n_real_bytes': int(n_real),
+            'recon_mse': recon_mse,
+            'full_byte_acc': full_byte_acc,
+            'full_byte_l1': full_byte_l1,
+            'real_byte_acc': real_byte_acc,
+            'real_byte_l1': real_byte_l1,
+            'orig_text': text,
+            'recon_text_real': recon_text_real,
+        }
 
     def encode_text_batch(self, texts: Sequence[str]) -> torch.Tensor:
         """Stack texts into ``(B, 3, img_size, img_size)`` batch."""

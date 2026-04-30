@@ -235,9 +235,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         '--pad-strategy',
-        default='repeat',
+        default='space',
         choices=PAD_STRATEGIES,
-        help="How to pad short text. Default: repeat.",
+        help=("How to pad short text. Default: space (gives a meaningful "
+              "patch_real_mask). Use 'repeat' only for diagnostics where "
+              "you specifically want all patches to count as real."),
     )
     parser.add_argument(
         '--agg',
@@ -334,8 +336,37 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{enc.n_patches} patches × {enc.bytes_per_patch} bytes/patch")
     print(f"  Per-patch aggregation: {args.agg!r}")
 
-    # ── 4. Run diagnostics ──
-    print(f"\n[4/4] Diagnostic comparisons (cosine similarity)…")
+    # ── 4a. Step 0 round-trip sanity check ──
+    print(f"\n[4a] Round-trip sanity check (text → image → recon → text)…")
+    print(f"  If real_byte_acc << model's training byte recovery (~99.6%),")
+    print(f"  per-patch features for these sentences are unreliable.\n")
+    print(f"  {'sentence':<55s}  {'n_real':>6s}  {'real_acc':>8s}  "
+          f"{'real_l1':>7s}  {'recon_text_real':<40s}")
+    print(f"  {'─'*55}  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*40}")
+    all_real_acc = []
+    for group_name, pairs in TEST_GROUPS:
+        for text in [pairs[0][0], pairs[0][1]] if args.quick \
+                else [t for p in pairs for t in p]:
+            m = enc.roundtrip_metrics(text)
+            all_real_acc.append(m['real_byte_acc'])
+            print(f"  {_truncate(text, 55):<55s}  "
+                  f"{m['n_real_bytes']:>6d}  "
+                  f"{m['real_byte_acc']:>8.4f}  "
+                  f"{m['real_byte_l1']:>7.3f}  "
+                  f"{_truncate(m['recon_text_real'], 40):<40s}")
+    mean_acc = sum(all_real_acc) / len(all_real_acc) if all_real_acc else 0.0
+    print(f"\n  Mean real_byte_acc across test set: {mean_acc:.4f}")
+    if mean_acc < 0.95:
+        print(f"  WARNING: low real-byte recovery on test sentences. "
+              f"Per-patch similarity below may be unreliable.")
+    elif mean_acc < 0.99:
+        print(f"  Note: real-byte recovery somewhat below training floor "
+              f"(~99.6%); proceeding with similarity but with caution.")
+    else:
+        print(f"  Round-trip looks healthy; proceeding to similarity.")
+
+    # ── 4b. Run diagnostics ──
+    print(f"\n[4b] Diagnostic comparisons (per-patch cosine similarity)…")
     print(f"  Three signature modes per pair: omega, omega_orig, codebook")
     print(f"  Higher = more similar. Range [-1, 1] for cosine.\n")
 
