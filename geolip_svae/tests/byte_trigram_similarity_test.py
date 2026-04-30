@@ -93,6 +93,10 @@ EDIT_PAIRS = [
      "the cat and the dog are friends"),  # extra word
     ("the cat and the dog are best friends",
      "the cat and the dog are true friends"),  # similar words
+
+    ("the cat and the dog are great friends",
+     "the cat and the dog are toxic friends"),  # same length, different meaning
+
     ("Many believe artificial intelligence will transform medicine.",
      "Many beleive artificial intellgence will transform medecine."),  # typos
 ]
