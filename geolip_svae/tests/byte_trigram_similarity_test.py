@@ -159,17 +159,32 @@ def _truncate(s: str, n: int = 50) -> str:
     return s if len(s) <= n else s[: n - 1] + '…'
 
 
+PRINT_MODES = ('M_flat', 'codebook_codes', 'codebook_sum')
+"""Three modes shown in the diagnostic table:
+   - M_flat:         per-row preserved (recommended for similarity)
+   - codebook_codes: per-row codebook quantization (recommended)
+   - codebook_sum:   V-aggregated (diagnostic — should CLT-collapse to ~1)
+The contrast between the first two and the last is the headline result:
+  if M_flat / codebook_codes give meaningful spread but codebook_sum
+  collapses to ~0.998, the per-row representations are doing real work.
+"""
+
+
 def print_pair_table(
     enc: SentenceEncoder,
     pairs: List[Tuple[str, str]],
     agg: str,
 ):
-    """Three-mode table for a list of (a, b) pairs."""
-    print(f"  {'mode':<14s} {'omega':>8s}  {'omega_orig':>11s}  {'codebook':>10s}")
-    print(f"  {'─'*14} {'─'*8}  {'─'*11}  {'─'*10}")
+    """Three-mode table for a list of (a, b) pairs.
+
+    Shows two per-row modes (M_flat, codebook_codes) plus codebook_sum
+    as a V-aggregated diagnostic comparison.
+    """
+    print(f"  {'mode':<14s} {'M_flat':>8s}  {'cb_codes':>9s}  {'cb_sum_NB':>10s}")
+    print(f"  {'─'*14} {'─'*8}  {'─'*9}  {'─'*10}")
     for text_a, text_b in pairs:
         sims = {}
-        for mode in ('omega', 'omega_orig', 'codebook'):
+        for mode in PRINT_MODES:
             try:
                 sims[mode] = enc.similarity(
                     text_a, text_b, mode=mode, agg=agg,
@@ -179,9 +194,9 @@ def print_pair_table(
         print(f"  A: {_truncate(text_a, 80)!r}")
         print(f"  B: {_truncate(text_b, 80)!r}")
         print(f"  {'per-patch':<14s} "
-              f"{sims['omega']:>+8.4f}  "
-              f"{sims['omega_orig']:>+11.4f}  "
-              f"{sims['codebook']:>+10.4f}")
+              f"{sims['M_flat']:>+8.4f}  "
+              f"{sims['codebook_codes']:>+9.4f}  "
+              f"{sims['codebook_sum']:>+10.4f}")
         print()
 
 
@@ -387,26 +402,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         sentences.extend([a, b])
         labels.extend([f"{prefix}-A", f"{prefix}-B"])
 
-    for mode in ('omega', 'codebook'):
-        print(f"\n  Mode: {mode!r}")
+    for mode in ('M_flat', 'codebook_codes'):
+        print(f"\n  Mode: {mode!r}  (per-row preserved)")
         try:
             print_similarity_matrix(
                 enc, sentences, labels, mode=mode, agg=args.agg,
             )
         except CodebookMissingError as e:
             print(f"    skipped ({type(e).__name__}: {e})")
+    # One V-aggregated diagnostic mode for contrast
+    print(f"\n  Mode: 'codebook_sum'  (V-aggregated — diagnostic only)")
+    try:
+        print_similarity_matrix(
+            enc, sentences, labels, mode='codebook_sum', agg=args.agg,
+        )
+    except CodebookMissingError as e:
+        print(f"    skipped ({type(e).__name__}: {e})")
 
     # ── Reading guide ──
     print()
     print("─" * 70)
     print("Reading guide:")
-    print("  omega vs omega_orig spread tells you cross-attn contribution.")
-    print("  codebook similarities are bounded by the n_axes basis — coarser")
-    print("    but more interpretable than raw spectral fingerprints.")
-    print("  If para-A vs para-B (paraphrase) similarity is much LOWER than")
-    print("    same-A vs same-B (same-domain different content), the model")
-    print("    is reading character-overlap, not semantics — expected for a")
-    print("    byte-reconstruction-trained encoder.")
+    print("  M_flat: direct per-patch sphere-norm encoder rows (V*D dims).")
+    print("    Most byte-faithful representation; cosine measures byte-level")
+    print("    similarity between corresponding patches.")
+    print("  codebook_codes: per-row argmax over codebook axes, one-hot flat.")
+    print("    Cosine = Hamming-style overlap (fraction of rows landing on")
+    print("    the same polytope axis). Quantized but interpretable.")
+    print("  codebook_sum (DIAGNOSTIC): V-summed |projections|. Should")
+    print("    CLT-collapse to ~0.998 across all sentence pairs because the")
+    print("    sum-over-32 unit vectors is near-constant. Included for")
+    print("    contrast — if M_flat / codebook_codes show real spread but")
+    print("    codebook_sum collapses, per-row representations are working.")
     print("  cross-domain pairs should be the lowest similarity floor; if")
     print("    they're not, the model isn't separating distributions cleanly.")
     print("─" * 70)

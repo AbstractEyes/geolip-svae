@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from geolip_svae.inference.engine import (
     InferenceEngine,
@@ -58,7 +59,43 @@ from geolip_svae.inference.engine import (
 # ── Module-level constants (validation surfaces) ────────────────────
 
 PAD_STRATEGIES = ('repeat', 'space', 'zero', 'truncate')
-SIGNATURE_MODES = ('omega', 'omega_orig', 'codebook')
+
+# Per-patch signature modes. The first two are the architecturally honest
+# per-row representations and should be preferred for similarity work.
+# The last three V-aggregate per-patch features and CLT-collapse to
+# near-constant vectors that produce ~0.998 cosine across any natural
+# inputs; they are kept for diagnostic comparison only.
+#
+#   'M_flat'         — per-patch flat M tensor [V*D].   PER-ROW preserved.
+#                      Direct sphere-norm encoder rows. The model recons
+#                      bytes through this, so it's the most byte-faithful
+#                      per-patch representation available. Recommended
+#                      default for sentence similarity.
+#   'codebook_codes' — per-row argmax over codebook axes, one-hot encoded
+#                      and flattened → [V*n_axes]. PER-ROW preserved.
+#                      Each patch becomes a one-hot sequence over the
+#                      learned polytope axes. Cosine on this measures
+#                      Hamming-style code overlap (fraction of rows that
+#                      land on the same axis). Requires attached codebook.
+#   'omega'          — S (cross-attn-coordinated singular values), [D].
+#                      V-aggregated via column norm of M_hat. CLT-collapse
+#                      risk for similarity (sum over V=32 unit vectors
+#                      → near-constant vector). Diagnostic only.
+#   'omega_orig'     — S_orig (pre-cross-attn singular values), [D].
+#                      Same V-aggregation problem. Diagnostic only.
+#   'codebook_sum'   — sum_abs of codebook activations over V → [n_axes].
+#                      V-aggregated; same CLT-collapse problem. Diagnostic
+#                      only. Was named 'codebook' in earlier API; renamed
+#                      to make the V-summing explicit.
+SIGNATURE_MODES = (
+    'M_flat',
+    'codebook_codes',
+    'omega',
+    'omega_orig',
+    'codebook_sum',
+)
+PER_ROW_MODES = ('M_flat', 'codebook_codes')         # preferred for similarity
+V_AGGREGATED_MODES = ('omega', 'omega_orig', 'codebook_sum')  # diagnostic only
 # Per-patch comparison aggregations. NO pre-cosine pooling — the model
 # was never trained with a pool operation; pooling per-patch features
 # into a sentence vector throws away the per-patch granularity that is
@@ -415,34 +452,47 @@ class SentenceEncoder:
     def signature(
         self,
         text: Union[str, Sequence[str]],
-        mode: str = 'omega',
+        mode: str = 'M_flat',
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-patch features and real-patch mask. NO pooling.
 
-        The model produces per-patch features (omega tokens, codebook
-        activations) by design. There is no learned "sentence centroid"
-        operation in this architecture — the lineage explicitly rejected
-        global pooling (CLAUDE.md: "No global average pooling — drops
-        accuracy from ~70% to ~29%"). This function therefore returns
-        per-patch features unmodified plus a mask indicating which
-        patches contain real (un-padded) bytes; aggregation, if any,
-        belongs in the comparison step (post-cosine on scalars), not
-        here on features.
+        Returns per-patch features in the requested representation,
+        unmodified along the patch axis, plus a mask indicating which
+        patches contain real (un-padded) bytes. Aggregation, if any,
+        happens AFTER cosine in similarity()/_per_patch_cosine — never
+        on the feature side.
 
         Args:
             text: a single string or sequence of strings.
-            mode: 'omega' | 'omega_orig' | 'codebook'.
+            mode: see ``SIGNATURE_MODES``. Two are recommended for
+                similarity work because they preserve per-row info:
 
-                'omega':       per-patch S_coordinated → [B, P, D]
-                'omega_orig':  per-patch S_orig (pre-cross-attn) → [B, P, D]
-                'codebook':    per-patch sum_abs over V of codebook-axis
-                               projections → [B, P, n_axes]. Requires
-                               ``engine.attach_codebook(cb)``.
+                'M_flat'         (default) — per-patch flat sphere-norm M
+                    tensor. Shape [B, P, V*D]. The most byte-faithful
+                    per-patch representation: the model recons bytes
+                    through this exact tensor, so its 128-dim entries
+                    encode the patch's bytes by construction.
+
+                'codebook_codes' — per-row argmax over codebook axes,
+                    one-hot encoded and flattened. Shape [B, P, V*n_axes].
+                    Each patch becomes a one-hot sequence over the
+                    polytope axes; cosine on this measures Hamming-style
+                    code overlap (fraction of rows landing on the same
+                    axis). Requires ``engine.attach_codebook(cb)``.
+
+            And three diagnostic-only modes that V-aggregate and
+            CLT-collapse to ~constant vectors (cosine ≈ 0.998 on any
+            natural inputs — see scratchpad Critical lesson #9):
+
+                'omega'         — coordinated S → [B, P, D]
+                'omega_orig'    — pre-cross-attn S_orig → [B, P, D]
+                'codebook_sum'  — sum_abs over V of codebook activations
+                                  → [B, P, n_axes]
 
         Returns:
-            features: ``[P, feat_dim]`` for single text input, or
-                      ``[B, P, feat_dim]`` for sequence input. CPU.
-            mask:     ``[P]`` or ``[B, P]`` of bool. CPU.
+            features: ``[P, feat_dim]`` for single text, ``[B, P, feat_dim]``
+                      for sequence input. On CPU.
+            mask:     ``[P]`` or ``[B, P]`` of bool. On CPU.
         """
         if mode not in SIGNATURE_MODES:
             raise ValueError(f"mode={mode!r} not in {SIGNATURE_MODES}")
@@ -457,16 +507,40 @@ class SentenceEncoder:
         # mode='direct' through the engine: keeps the resolution-aware
         # path (no model() bypass) but disables tile-mode patch permuting.
         # See Critical lessons #4/#5 in the scratchpad.
-        if mode == 'codebook':
+        if mode == 'M_flat':
+            # PER-ROW preserved: flat M tensor per patch.
+            enc = self.engine.encode(images, mode='direct')
+            M = enc['M'].to(device)                        # [B, P, V, D]
+            B, P, V, D = M.shape
+            feat = M.reshape(B, P, V * D)                  # [B, P, V*D]
+
+        elif mode == 'codebook_codes':
+            # PER-ROW preserved: per-row argmax over codebook axes,
+            # one-hot encoded and flattened. Each patch becomes a
+            # one-hot sequence over the polytope axes; cosine on
+            # flat one-hot = Hamming overlap rate scaled by V.
             out = self.engine.encode_axes(images, mode='direct')
-            acts = out['activations'].to(device)          # [B, P, V, n_axes]
-            feat = acts.abs().sum(dim=2)                  # [B, P, n_axes]
+            acts = out['activations'].to(device)           # [B, P, V, n_axes]
+            B, P, V, n_axes = acts.shape
+            # Use absolute value because codebook axes are projective
+            # (antipodal pairs collapsed); sign of projection is meaningless.
+            codes = acts.abs().argmax(dim=-1)              # [B, P, V] int64
+            one_hot = F.one_hot(codes, num_classes=n_axes).float()  # [B, P, V, n_axes]
+            feat = one_hot.reshape(B, P, V * n_axes)       # [B, P, V*n_axes]
+
+        elif mode == 'codebook_sum':
+            # V-AGGREGATED — diagnostic only.
+            out = self.engine.encode_axes(images, mode='direct')
+            acts = out['activations'].to(device)           # [B, P, V, n_axes]
+            feat = acts.abs().sum(dim=2)                   # [B, P, n_axes]
+
         else:
+            # V-AGGREGATED column-norm modes — diagnostic only.
             enc = self.engine.encode(images, mode='direct')
             if mode == 'omega':
-                feat = enc['S'].to(device)                # [B, P, D]
+                feat = enc['S'].to(device)                 # [B, P, D]
             else:  # 'omega_orig'
-                feat = enc['S_orig'].to(device)           # [B, P, D]
+                feat = enc['S_orig'].to(device)            # [B, P, D]
 
         masks = torch.stack([self.patch_real_mask(t) for t in texts])  # [B, P]
 
@@ -483,7 +557,7 @@ class SentenceEncoder:
         self,
         text_a: str,
         text_b: str,
-        mode: str = 'omega',
+        mode: str = 'M_flat',
         agg: str = 'patch_mean',
     ) -> float:
         """Per-patch sentence similarity. Cosine, no pre-cosine pooling.
@@ -522,7 +596,7 @@ class SentenceEncoder:
     def similarity_matrix(
         self,
         texts: Sequence[str],
-        mode: str = 'omega',
+        mode: str = 'M_flat',
         agg: str = 'patch_mean',
     ) -> torch.Tensor:
         """Full pairwise per-patch similarity matrix. NO pooling.
@@ -590,6 +664,8 @@ __all__ = [
     'SentenceEncoder',
     'PAD_STRATEGIES',
     'SIGNATURE_MODES',
+    'PER_ROW_MODES',
+    'V_AGGREGATED_MODES',
     'AGG_METHODS',
     'SIMILARITY_METRICS',
 ]

@@ -144,6 +144,8 @@ from geolip_svae.inference.text import (
     SentenceEncoder,
     PAD_STRATEGIES,
     SIGNATURE_MODES,
+    PER_ROW_MODES,
+    V_AGGREGATED_MODES,
     AGG_METHODS,
     SIMILARITY_METRICS,
 )
@@ -197,6 +199,8 @@ __all__ = [
     'SentenceEncoder',
     'PAD_STRATEGIES',
     'SIGNATURE_MODES',
+    'PER_ROW_MODES',
+    'V_AGGREGATED_MODES',
     'AGG_METHODS',
     'SIMILARITY_METRICS',
     # Legacy
