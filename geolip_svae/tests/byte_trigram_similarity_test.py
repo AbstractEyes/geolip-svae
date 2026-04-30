@@ -15,7 +15,7 @@ Usage::
     python -m geolip_svae.tests.byte_trigram_similarity_test
     python -m geolip_svae.tests.byte_trigram_similarity_test --hf-version byte_trigram_proto_64_patch_2_v1
     python -m geolip_svae.tests.byte_trigram_similarity_test --calibration byte_trigram_wikitext103_val
-    python -m geolip_svae.tests.byte_trigram_similarity_test --pad-strategy space --pool masked_mean
+    python -m geolip_svae.tests.byte_trigram_similarity_test --pad-strategy space --agg best_match
     python -m geolip_svae.tests.byte_trigram_similarity_test --quick           # one pair per group
     python -m geolip_svae.tests.byte_trigram_similarity_test --extract-fresh   # skip HF fetch
 
@@ -52,7 +52,7 @@ from geolip_svae.inference import (
     SentenceEncoder,
     make_calibration,
     PAD_STRATEGIES,
-    POOL_METHODS,
+    AGG_METHODS,
     CodebookMissingError,
     CodebookIncompatibleError,
     HF_REPO,
@@ -162,7 +162,7 @@ def _truncate(s: str, n: int = 50) -> str:
 def print_pair_table(
     enc: SentenceEncoder,
     pairs: List[Tuple[str, str]],
-    pool: str,
+    agg: str,
 ):
     """Three-mode table for a list of (a, b) pairs."""
     print(f"  {'mode':<14s} {'omega':>8s}  {'omega_orig':>11s}  {'codebook':>10s}")
@@ -172,13 +172,13 @@ def print_pair_table(
         for mode in ('omega', 'omega_orig', 'codebook'):
             try:
                 sims[mode] = enc.similarity(
-                    text_a, text_b, mode=mode, pool=pool, metric='cosine',
+                    text_a, text_b, mode=mode, agg=agg,
                 )
             except CodebookMissingError:
                 sims[mode] = float('nan')
         print(f"  A: {_truncate(text_a, 80)!r}")
         print(f"  B: {_truncate(text_b, 80)!r}")
-        print(f"  {'cosine':<14s} "
+        print(f"  {'per-patch':<14s} "
               f"{sims['omega']:>+8.4f}  "
               f"{sims['omega_orig']:>+11.4f}  "
               f"{sims['codebook']:>+10.4f}")
@@ -190,11 +190,11 @@ def print_similarity_matrix(
     sentences: List[str],
     labels: List[str],
     mode: str,
-    pool: str,
+    agg: str,
 ):
     """Compact pairwise similarity matrix with row labels."""
     sim = enc.similarity_matrix(
-        sentences, mode=mode, metric='cosine', pool=pool,
+        sentences, mode=mode, agg=agg,
     )
     n = len(sentences)
     label_w = max(len(l) for l in labels) + 1
@@ -240,11 +240,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="How to pad short text. Default: repeat.",
     )
     parser.add_argument(
-        '--pool',
-        default='mean',
-        choices=POOL_METHODS,
-        help=("Patch-pooling method. Use 'masked_mean' with non-repeat "
-              "padding to ignore padded patches. Default: mean."),
+        '--agg',
+        default='patch_mean',
+        choices=AGG_METHODS,
+        help=("Per-patch cosine aggregation. Operates on cosine SCALARS "
+              "after per-patch comparison; pre-cosine pooling on features "
+              "is intentionally not supported (architecture-incompatible). "
+              "Default: patch_mean."),
     )
     parser.add_argument(
         '--img-size', type=int, default=64,
@@ -330,7 +332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"pad_strategy={enc.pad_strategy!r}")
     print(f"  Capacity: {enc.bytes_per_image:,} bytes/image, "
           f"{enc.n_patches} patches × {enc.bytes_per_patch} bytes/patch")
-    print(f"  Pool method: {args.pool!r}")
+    print(f"  Per-patch aggregation: {args.agg!r}")
 
     # ── 4. Run diagnostics ──
     print(f"\n[4/4] Diagnostic comparisons (cosine similarity)…")
@@ -341,7 +343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.quick:
             pairs = pairs[:1]
         print(f"┌─ {group_name} {'─' * (66 - len(group_name))}")
-        print_pair_table(enc, pairs, pool=args.pool)
+        print_pair_table(enc, pairs, agg=args.agg)
 
     # ── Cross-set similarity matrix ──
     print(f"┌─ Pairwise similarity matrix (one example per group) {'─' * 16}")
@@ -358,7 +360,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n  Mode: {mode!r}")
         try:
             print_similarity_matrix(
-                enc, sentences, labels, mode=mode, pool=args.pool,
+                enc, sentences, labels, mode=mode, agg=args.agg,
             )
         except CodebookMissingError as e:
             print(f"    skipped ({type(e).__name__}: {e})")

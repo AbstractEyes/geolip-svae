@@ -44,7 +44,7 @@ polytope-class codebook this module projects against.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -59,8 +59,20 @@ from geolip_svae.inference.engine import (
 
 PAD_STRATEGIES = ('repeat', 'space', 'zero', 'truncate')
 SIGNATURE_MODES = ('omega', 'omega_orig', 'codebook')
-POOL_METHODS = ('mean', 'max', 'masked_mean')
-SIMILARITY_METRICS = ('cosine', 'l2')
+# Per-patch comparison aggregations. NO pre-cosine pooling — the model
+# was never trained with a pool operation; pooling per-patch features
+# into a sentence vector throws away the per-patch granularity that is
+# the architecture's actual output unit. Aggregation happens AFTER
+# per-patch cosine, on scalars.
+#   'patch_mean'  — pairwise [K_a, K_b] cosine matrix → mean of all entries
+#                   (order-agnostic; "average patch-pair similarity")
+#   'best_match'  — symmetric mean of (max-over-B per A patch,
+#                   max-over-A per B patch). Hausdorff-like; tolerates
+#                   length mismatch and partial overlap.
+#   'aligned'     — per-position cosine of real patches; requires
+#                   K_a == K_b. Order-aware.
+AGG_METHODS = ('patch_mean', 'best_match', 'aligned')
+SIMILARITY_METRICS = ('cosine',)  # only metric currently supported per-patch
 
 
 # ── SentenceEncoder ──────────────────────────────────────────────────
@@ -77,13 +89,15 @@ class SentenceEncoder:
         patch_size: patch size. Should match the model's training config.
         pad_strategy: how to pad short texts to fill the image:
 
-            'repeat'    (default) - repeat text bytes cyclically. Best for
-                                    short text; biases toward self-similarity
-                                    within text content.
+            'repeat'    (default) - repeat text bytes cyclically. Every patch
+                                    sees real (cycled) content; the patch-real
+                                    mask is all-True so all patches participate
+                                    in similarity.
             'space'              - 0x20 whitespace pad. Closer to wikitext
-                                    distribution than zeros.
-            'zero'               - 0x00 null pad. Most OOD on padded patches —
-                                    use only with ``pool='masked_mean'``.
+                                    distribution than zeros. Real patches are
+                                    only those whose pixel coverage includes
+                                    at least one un-padded sentence byte.
+            'zero'               - 0x00 null pad. Most OOD on padded patches.
             'truncate'           - never pad; raise if text shorter than
                                     image capacity.
 
@@ -226,8 +240,9 @@ class SentenceEncoder:
         byte contribution.
 
         For ``pad_strategy='repeat'`` all model patches see (cycled) real
-        content so the mask is all True. Use with ``pool='masked_mean'``
-        to ignore padded patches.
+        content so the mask is all True. The mask drives which patches
+        contribute to per-patch similarity; padded patches are skipped
+        entirely (NOT averaged in — see signature/similarity docs).
 
         Returns: ``Tensor[n_model_patches]`` of bool.
         """
@@ -269,40 +284,43 @@ class SentenceEncoder:
         patch_max = blocks.amax(dim=(0, 2, 4))              # (gh_m, gw_m)
         return (patch_max > 0).flatten()                     # (n_model_patches,)
 
-    # ── Signature computation ───────────────────────────────────────
+    # ── Per-patch signature (NO pooling) ────────────────────────────
 
     @torch.no_grad()
     def signature(
         self,
         text: Union[str, Sequence[str]],
         mode: str = 'omega',
-        pool: str = 'mean',
-    ) -> torch.Tensor:
-        """Compute sentence-level fingerprint.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-patch features and real-patch mask. NO pooling.
+
+        The model produces per-patch features (omega tokens, codebook
+        activations) by design. There is no learned "sentence centroid"
+        operation in this architecture — the lineage explicitly rejected
+        global pooling (CLAUDE.md: "No global average pooling — drops
+        accuracy from ~70% to ~29%"). This function therefore returns
+        per-patch features unmodified plus a mask indicating which
+        patches contain real (un-padded) bytes; aggregation, if any,
+        belongs in the comparison step (post-cosine on scalars), not
+        here on features.
 
         Args:
             text: a single string or sequence of strings.
             mode: 'omega' | 'omega_orig' | 'codebook'.
 
-                'omega':       S_coordinated pooled over patches → [D].
-                'omega_orig':  S_orig (pre-cross-attn) pooled → [D].
-                'codebook':    axis activations (sum_abs over V per patch)
-                               pooled over patches → [n_axes].
-                               Requires ``engine.attach_codebook(cb)`` first.
-
-            pool: 'mean' | 'max' | 'masked_mean'.
-
-                'masked_mean' uses ``patch_real_mask`` to ignore padded
-                patches. Only meaningful for ``pad_strategy != 'repeat'``.
+                'omega':       per-patch S_coordinated → [B, P, D]
+                'omega_orig':  per-patch S_orig (pre-cross-attn) → [B, P, D]
+                'codebook':    per-patch sum_abs over V of codebook-axis
+                               projections → [B, P, n_axes]. Requires
+                               ``engine.attach_codebook(cb)``.
 
         Returns:
-            ``Tensor`` of shape ``[feat_dim]`` for single text input,
-            ``[B, feat_dim]`` for sequence input. Always on CPU.
+            features: ``[P, feat_dim]`` for single text input, or
+                      ``[B, P, feat_dim]`` for sequence input. CPU.
+            mask:     ``[P]`` or ``[B, P]`` of bool. CPU.
         """
         if mode not in SIGNATURE_MODES:
             raise ValueError(f"mode={mode!r} not in {SIGNATURE_MODES}")
-        if pool not in POOL_METHODS:
-            raise ValueError(f"pool={pool!r} not in {POOL_METHODS}")
 
         single = isinstance(text, str)
         texts = [text] if single else list(text)
@@ -311,20 +329,10 @@ class SentenceEncoder:
         device = next(self.engine.model.parameters()).device
         images = self.encode_text_batch(texts).to(device)
 
-        # Use the engine's resolution-aware path with mode='direct'.
-        # We deliberately go through engine.encode / engine.encode_axes
-        # rather than calling model() directly — that keeps text.py inside
-        # the proper inference pipeline. Direct mode is used because tile
-        # mode permutes patches across sub-tiles (each tile is row-major
-        # within itself; concatenated tile outputs are NOT row-major across
-        # the full image), which would break the bytes→patch index mapping
-        # that patch_real_mask is built against. The model is resolution-
-        # agnostic, so direct works at any img_size that fits in VRAM. For
-        # img_size large enough to require tiling, a tile-aware mask would
-        # be needed (deferred — not currently a use case for this wrapper).
+        # mode='direct' through the engine: keeps the resolution-aware
+        # path (no model() bypass) but disables tile-mode patch permuting.
+        # See Critical lessons #4/#5 in the scratchpad.
         if mode == 'codebook':
-            # encode_axes pulls the codebook through the engine, projects
-            # M onto axes, returns activations [B, n_patches, V, n_axes]
             out = self.engine.encode_axes(images, mode='direct')
             acts = out['activations'].to(device)          # [B, P, V, n_axes]
             feat = acts.abs().sum(dim=2)                  # [B, P, n_axes]
@@ -335,23 +343,15 @@ class SentenceEncoder:
             else:  # 'omega_orig'
                 feat = enc['S_orig'].to(device)           # [B, P, D]
 
-        # Pool patches → sentence-level
-        if pool == 'mean':
-            sig = feat.mean(dim=1)
-        elif pool == 'max':
-            sig = feat.amax(dim=1)
-        else:  # 'masked_mean'
-            masks = torch.stack([
-                self.patch_real_mask(t) for t in texts
-            ]).to(device)                                  # [B, P]
-            mask_f = masks.float().unsqueeze(-1)           # [B, P, 1]
-            denom = mask_f.sum(dim=1).clamp_min(1.0)       # [B, 1]
-            sig = (feat * mask_f).sum(dim=1) / denom
+        masks = torch.stack([self.patch_real_mask(t) for t in texts])  # [B, P]
 
-        sig = sig.cpu()
-        return sig.squeeze(0) if single else sig
+        feat = feat.cpu()
+        masks = masks.cpu()
+        if single:
+            return feat.squeeze(0), masks.squeeze(0)
+        return feat, masks
 
-    # ── Similarity ──────────────────────────────────────────────────
+    # ── Per-patch similarity (NO pre-cosine pooling) ────────────────
 
     @torch.no_grad()
     def similarity(
@@ -359,72 +359,112 @@ class SentenceEncoder:
         text_a: str,
         text_b: str,
         mode: str = 'omega',
-        metric: str = 'cosine',
-        pool: str = 'mean',
+        agg: str = 'patch_mean',
     ) -> float:
-        """Pairwise similarity between two strings.
+        """Per-patch sentence similarity. Cosine, no pre-cosine pooling.
+
+        Pipeline:
+            1. Compute per-patch features + real-patch mask for both texts.
+            2. Subset to real patches only (drops padded patches entirely;
+               they don't contribute to the comparison).
+            3. Compute pairwise cosine matrix [K_a, K_b] between real
+               patches.
+            4. Aggregate to a scalar via ``agg`` (operates on cosine
+               scalars, NOT on features).
 
         Args:
-            metric: 'cosine' (default, range [-1, 1]) or 'l2' (negative
-                L2 distance, larger = more similar; range (-inf, 0]).
+            agg: how to aggregate the per-patch cosine matrix:
+                'patch_mean'  — mean over all entries of the [K_a, K_b]
+                                matrix. Order-agnostic.
+                'best_match'  — symmetric mean of (max-over-B per A patch,
+                                max-over-A per B patch). Hausdorff-like.
+                                Tolerates length mismatch.
+                'aligned'     — per-position cosine of real patches; mean.
+                                Requires K_a == K_b (raises otherwise).
 
         Returns:
-            Scalar Python float.
+            Scalar Python float in [-1, 1] (cosine range). Returns
+            ``float('nan')`` when either sentence has zero real patches.
         """
-        sigs = self.signature([text_a, text_b], mode=mode, pool=pool)
-        return _pair_metric(sigs[0], sigs[1], metric)
+        if agg not in AGG_METHODS:
+            raise ValueError(f"agg={agg!r} not in {AGG_METHODS}")
+
+        feat_a, mask_a = self.signature(text_a, mode=mode)
+        feat_b, mask_b = self.signature(text_b, mode=mode)
+        return _per_patch_cosine(feat_a[mask_a], feat_b[mask_b], agg)
 
     @torch.no_grad()
     def similarity_matrix(
         self,
         texts: Sequence[str],
         mode: str = 'omega',
-        metric: str = 'cosine',
-        pool: str = 'mean',
+        agg: str = 'patch_mean',
     ) -> torch.Tensor:
-        """Full pairwise similarity matrix.
+        """Full pairwise per-patch similarity matrix. NO pooling.
 
-        Returns: ``[N, N]`` tensor where ``M[i, j] = similarity(texts[i], texts[j])``.
-        Diagonal is the identity (1.0 for cosine, 0.0 for negative L2).
+        Returns: ``[N, N]`` tensor where
+        ``M[i, j] = similarity(texts[i], texts[j], mode, agg)``. Diagonal
+        is 1.0 (a sentence is identical to itself under any per-patch
+        cosine aggregation that respects the metric).
         """
-        sigs = self.signature(list(texts), mode=mode, pool=pool)  # [N, D]
-        return _matrix_metric(sigs, metric)
+        if agg not in AGG_METHODS:
+            raise ValueError(f"agg={agg!r} not in {AGG_METHODS}")
+
+        feats, masks = self.signature(list(texts), mode=mode)   # [N, P, D], [N, P]
+        n = len(texts)
+        out = torch.zeros(n, n)
+        # Subset each text to its real patches up front
+        real = [feats[i][masks[i]] for i in range(n)]            # list of [K_i, D]
+        for i in range(n):
+            for j in range(n):
+                out[i, j] = _per_patch_cosine(real[i], real[j], agg)
+        return out
 
 
-# ── Metric helpers (module-level for testability) ───────────────────
+# ── Per-patch cosine helpers (module-level for testability) ─────────
 
-def _pair_metric(a: torch.Tensor, b: torch.Tensor, metric: str) -> float:
-    """Scalar pairwise metric between two 1-D tensors."""
-    if metric == 'cosine':
-        a_n = a / a.norm().clamp_min(1e-12)
-        b_n = b / b.norm().clamp_min(1e-12)
-        return float((a_n * b_n).sum())
-    if metric == 'l2':
-        return float(-(a - b).norm())
-    raise ValueError(
-        f"Unknown metric: {metric!r}. Supported: {SIMILARITY_METRICS}"
-    )
+def _per_patch_cosine(
+    real_a: torch.Tensor,
+    real_b: torch.Tensor,
+    agg: str,
+) -> float:
+    """Per-patch cosine aggregation.
 
+    Args:
+        real_a: ``[K_a, feat_dim]`` features of text A's real patches only.
+        real_b: ``[K_b, feat_dim]`` features of text B's real patches only.
+        agg: one of ``AGG_METHODS``.
 
-def _matrix_metric(sigs: torch.Tensor, metric: str) -> torch.Tensor:
-    """[N, N] pairwise metric matrix from a [N, feat_dim] stack of signatures."""
-    if metric == 'cosine':
-        norms = sigs.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        unit = sigs / norms
-        return unit @ unit.T
-    if metric == 'l2':
-        # Pairwise L2 via expansion: -‖x_i - x_j‖
-        diffs = sigs.unsqueeze(0) - sigs.unsqueeze(1)         # [N, N, D]
-        return -diffs.norm(dim=-1)
-    raise ValueError(
-        f"Unknown metric: {metric!r}. Supported: {SIMILARITY_METRICS}"
-    )
+    Returns:
+        Scalar float, ``nan`` if either sentence has zero real patches.
+    """
+    if real_a.numel() == 0 or real_b.numel() == 0:
+        return float('nan')
+
+    a_n = real_a / real_a.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    b_n = real_b / real_b.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    sim = a_n @ b_n.T                                # [K_a, K_b]
+
+    if agg == 'patch_mean':
+        return float(sim.mean())
+    if agg == 'best_match':
+        a_best = sim.amax(dim=1).mean()              # mean over A's best matches in B
+        b_best = sim.amax(dim=0).mean()              # mean over B's best matches in A
+        return float((a_best + b_best) / 2)
+    if agg == 'aligned':
+        if real_a.shape[0] != real_b.shape[0]:
+            raise ValueError(
+                f"agg='aligned' requires same number of real patches; "
+                f"got K_a={real_a.shape[0]} K_b={real_b.shape[0]}"
+            )
+        return float((a_n * b_n).sum(dim=-1).mean())
+    raise ValueError(f"Unknown agg: {agg}. Supported: {AGG_METHODS}")
 
 
 __all__ = [
     'SentenceEncoder',
     'PAD_STRATEGIES',
     'SIGNATURE_MODES',
-    'POOL_METHODS',
+    'AGG_METHODS',
     'SIMILARITY_METRICS',
 ]
