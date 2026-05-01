@@ -509,7 +509,10 @@ class SpectralTokenizer:
 
         patches_flat = patches.reshape(1, n, -1)
         from geolip_svae.model import stitch_patches
-        image = stitch_patches(patches_flat, gh, gw, self.ps)
+        # experimental_codebook.py is 3-channel by construction (predates the
+        # configurable-channels refactor); passing explicitly to silence the
+        # default and document the assumption.
+        image = stitch_patches(patches_flat, gh, gw, self.ps, channels=3)
         return image.squeeze(0), ids, strings
 
     def compute_fingerprints(self, seed=42):

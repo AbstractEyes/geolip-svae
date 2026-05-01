@@ -1313,6 +1313,7 @@ def train(cfg: Dict[str, Any]):
     linear_readout = cfg.get('linear_readout', False)
     svd_mode       = cfg.get('svd_mode', 'default')
     match_params   = cfg.get('match_params', True)
+    channels       = cfg.get('channels', 3)
 
     # ── Training ──
     dataset       = cfg['dataset']
@@ -1394,6 +1395,7 @@ def train(cfg: Dict[str, Any]):
     # ── Model ──
     model_kwargs = dict(
         V=V, D=D, ps=patch_size, hidden=hidden, depth=depth, n_cross=n_cross,
+        channels=channels,
         linear_readout=linear_readout, svd_mode=svd_mode,
         match_params=match_params,
     )
@@ -1594,6 +1596,7 @@ def train(cfg: Dict[str, Any]):
                 'V': V, 'D': D, 'patch_size': patch_size,
                 'hidden': hidden, 'depth': depth, 'n_cross_layers': n_cross,
                 'n_heads': n_heads, 'smooth_mid': smooth_mid,
+                'channels': channels,
                 'linear_readout': linear_readout, 'svd_mode': svd_mode,
                 'match_params': match_params,
                 'target_cv': target_cv, 'dataset': dataset,
@@ -1962,6 +1965,7 @@ def train(cfg: Dict[str, Any]):
             'V': V, 'D': D, 'patch_size': patch_size,
             'hidden': hidden, 'depth': depth, 'n_cross_layers': n_cross,
             'n_heads': n_heads, 'smooth_mid': smooth_mid,
+            'channels': channels,
             'linear_readout': linear_readout, 'svd_mode': svd_mode,
             'match_params': match_params,
             'dataset': dataset, 'img_size': img_size, 'batch_size': batch_size,

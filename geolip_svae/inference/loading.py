@@ -142,9 +142,11 @@ def load_model(
     # n_heads / smooth_mid / linear_readout / svd_mode / match_params,
     # but final_report.json (in the same hf_version folder) preserved
     # them. We attempt the backfill silently when these are missing AND
-    # we know the hf_version to source the report from.
+    # we know the hf_version to source the report from. ``channels`` is
+    # included for completeness but defaults to 3 if absent (matches
+    # every existing checkpoint's behavior).
     backfillable = ('n_heads', 'smooth_mid', 'linear_readout',
-                    'svd_mode', 'match_params')
+                    'svd_mode', 'match_params', 'channels')
     missing_keys = [k for k in backfillable if k not in cfg]
     if missing_keys and hf_version:
         try:
@@ -176,6 +178,7 @@ def load_model(
         n_cross=cfg['n_cross_layers'],
         n_heads=cfg.get('n_heads', None),
         smooth_mid=cfg.get('smooth_mid', None),
+        channels=cfg.get('channels', 3),
     )
     # H2-class checkpoints include these; older Fresnel/Freckles/Johanna
     # checkpoints don't. Only pass if present so PatchSVAE defaults apply.

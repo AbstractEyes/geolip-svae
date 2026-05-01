@@ -65,7 +65,10 @@ def decode(model, svd: Dict[str, Any]) -> torch.Tensor:
     """
     from geolip_svae.model import stitch_patches
     decoded = model.decode_patches(svd['U'], svd['S'], svd['Vt'])
-    recon = stitch_patches(decoded, svd['gh'], svd['gw'], model.patch_size)
+    recon = stitch_patches(
+        decoded, svd['gh'], svd['gw'], model.patch_size,
+        channels=getattr(model, 'channels', 3),
+    )
     return model.boundary_smooth(recon)
 
 

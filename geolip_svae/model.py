@@ -191,20 +191,24 @@ def extract_patches(images: torch.Tensor, patch_size: int = 16):
 
 
 def stitch_patches(patches: torch.Tensor, gh: int, gw: int,
-                   patch_size: int = 16) -> torch.Tensor:
+                   patch_size: int = 16, channels: int = 3) -> torch.Tensor:
     """Stitch patches back into images.
 
     Args:
         patches: (B, N, C*patch_size*patch_size)
         gh, gw: grid dimensions
         patch_size: size of square patches
+        channels: image channel count C (must match how the patches were
+            extracted; defaults to 3 for back-compat with prior callers)
 
     Returns:
-        images: (B, 3, gh*patch_size, gw*patch_size)
+        images: (B, C, gh*patch_size, gw*patch_size)
     """
     B = patches.shape[0]
-    p = patches.reshape(B, gh, gw, 3, patch_size, patch_size)
-    return p.permute(0, 3, 1, 4, 2, 5).reshape(B, 3, gh * patch_size, gw * patch_size)
+    p = patches.reshape(B, gh, gw, channels, patch_size, patch_size)
+    return p.permute(0, 3, 1, 4, 2, 5).reshape(
+        B, channels, gh * patch_size, gw * patch_size,
+    )
 
 
 # ── Boundary Smoothing ──────────────────────────────────────────
@@ -369,11 +373,17 @@ class PatchSVAE(nn.Module):
         n_cross: number of spectral cross-attention layers (default 2)
         n_heads: attention heads (default: min(4, D) for D>=4, else 1)
         smooth_mid: BoundarySmooth hidden channels (default: 16 for ps>=16, else 8)
+        channels: image channel count C (default 3). Sets patch_dim = C*ps*ps
+            and the BoundarySmooth in/out channels. The geometric core
+            (sphere-norm M, SVD, cross-attn, codebook) is channel-agnostic;
+            channels only plumbs the encoder input dim, decoder output dim,
+            and the post-stitch boundary smoother.
         solver: 'default' or 'conduit'
     """
     def __init__(self, V: int = 256, D: int = 16, ps: int = 16,
                  hidden: int = 768, depth: int = 4, n_cross: int = 2,
                  n_heads: int = None, smooth_mid: int = None,
+                 channels: int = 3,
                  solver: str = 'default',
                  # ── Ablation toggles (F/G/H/L groups) ─────────────────
                  activation: str = 'gelu',
@@ -408,7 +418,8 @@ class PatchSVAE(nn.Module):
         self.matrix_v = V
         self.D = D
         self.patch_size = ps
-        self.patch_dim = 3 * ps * ps
+        self.channels = channels
+        self.patch_dim = channels * ps * ps
         self.mat_dim = V * D
 
         # Solver configuration
@@ -469,7 +480,7 @@ class PatchSVAE(nn.Module):
         ])
 
         # Boundary smoothing
-        self.boundary_smooth = BoundarySmooth(channels=3, mid=smooth_mid)
+        self.boundary_smooth = BoundarySmooth(channels=channels, mid=smooth_mid)
 
         # L group: optional init override
         if init_scheme != 'orthogonal':
@@ -630,14 +641,20 @@ class PatchSVAE(nn.Module):
         """Full encode → SVD → coordinate → decode → stitch pipeline.
 
         Args:
-            images: (B, 3, H, W) — H and W must be divisible by patch_size
+            images: (B, C, H, W) — C must equal self.channels (set at init,
+                default 3); H and W must be divisible by patch_size
 
         Returns:
             dict with keys:
-                recon: (B, 3, H, W) — reconstructed images
+                recon: (B, C, H, W) — reconstructed images
                 svd:   dict — full SVD decomposition (U, S, S_orig, Vt, M)
         """
         B, C, H, W = images.shape
+        if C != self.channels:
+            raise ValueError(
+                f"input has C={C} but model was built with "
+                f"channels={self.channels}"
+            )
         ps = self.patch_size
         gh, gw = H // ps, W // ps
 
@@ -649,7 +666,7 @@ class PatchSVAE(nn.Module):
 
         # Decode → stitch → smooth
         decoded = self.decode_patches(svd['U'], svd['S'], svd['Vt'])
-        recon = stitch_patches(decoded, gh, gw, ps)
+        recon = stitch_patches(decoded, gh, gw, ps, channels=self.channels)
         recon = self.boundary_smooth(recon)
 
         return {'recon': recon, 'svd': svd}
