@@ -321,9 +321,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     ),
 
     # ── H2-class (sphere-solver, the architecture used by h2-64 batteries) ──
-    'h2_64_single_svd_triton': dict(
+    't1_ps4_d4_v32_h128_svd': dict(
         # H2_linear_matched architecture
-        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        V=32, D=4, patch_size=4, hidden=128, depth=1, n_cross=1, n_heads=8,
         smooth_mid=16,
         svd_method='triton',
         #linear_readout=True, svd_mode='none', match_params=True,
@@ -333,11 +333,11 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
         # h2-class with V=32/D=4 lives in a different basin of CV-space because
         # of the small D and linear readout. Don't pull toward 0.215.
-        lr=1e-3, epochs=10, target_cv=1.0, cv_weight=0.01,
+        lr=1e-3, epochs=10, target_cv=1.0, cv_weight=0.1,
         # H2-class natural band (per measured runs): 0.80-1.05
         cv_band_lo=0.80, cv_band_hi=1.25,
         #allowed_types=[0],
-        hf_version='h2_64_single_svd_triton', save_every=5,
+        hf_version='t1_ps4_d4_v32_h128_svd', save_every=5,
         ds_size=1_000_000, val_size=10_000,
         # Diagnostics cadence
         report_every=200,
