@@ -859,3 +859,29 @@ class PatchSVAE(nn.Module):
         # Decode → stitch → smooth
         decoded = self.decode_patches(svd['U'], svd['S'], svd['Vt'])
         recon = stitch_patches(decoded, gh, gw, ps, channels=self.channels)
+        recon = self.boundary_smooth(recon)
+
+        return {'recon': recon, 'svd': svd}
+
+    @staticmethod
+    def effective_rank(S: torch.Tensor) -> torch.Tensor:
+        """Effective rank of singular value distribution.
+
+        erank = exp(-Σ p_i log p_i) where p_i = σ_i / Σσ
+
+        Architectural constant ≈ 15.88 for D=16.
+        """
+        p = S / (S.sum(-1, keepdim=True) + 1e-8)
+        p = p.clamp(min=1e-8)
+        return (-(p * p.log()).sum(-1)).exp()
+
+    @staticmethod
+    def s_delta(S_orig: torch.Tensor, S_coord: torch.Tensor) -> float:
+        """Mean absolute spectral shift from cross-attention.
+
+        Converges to modality-specific binding constants:
+            Images:  ~0.238
+            Noise:   ~0.350-0.407
+            Text:    ~0.350
+        """
+        return (S_coord - S_orig).abs().mean().item()
