@@ -1013,11 +1013,11 @@ def _omega_noise_factory(cfg: Dict[str, Any], channels: int) -> DatasetBundle:
     )
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=bs, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True,
+        num_workers=8, pin_memory=True, drop_last=True,
     )
     test_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=bs, shuffle=False,
-        num_workers=4, pin_memory=True,
+        num_workers=2, pin_memory=True,
     )
     return DatasetBundle(
         train_loader=train_loader, test_loader=test_loader, is_noise=True,

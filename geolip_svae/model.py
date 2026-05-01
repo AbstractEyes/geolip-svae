@@ -730,8 +730,7 @@ class PatchSVAE(nn.Module):
             # Column norms stand in as singular values
             S = M_hat.norm(dim=-2)
             # Vt is identity — decode reduces to U * S.unsqueeze(1)
-            Vt = torch.eye(self.D, device=M.device, dtype=M.dtype
-                            ).unsqueeze(0).expand(B * N, -1, -1)
+            Vt = torch.eye(self.D, device=M.device, dtype=M.dtype).unsqueeze(0).expand(B * N, -1, -1)
         elif self.svd_mode == 'fp32':
             # Low-precision SVD path (ablation variant)
             G = torch.bmm(M.transpose(1, 2), M)
@@ -765,8 +764,7 @@ class PatchSVAE(nn.Module):
             S = S_b.unsqueeze(1).expand(-1, N, -1).reshape(B * N, self.D)
             Vt = Vt_b.unsqueeze(1).expand(-1, N, -1, -1).reshape(
                 B * N, self.D, self.D)
-            U = torch.bmm(M, Vt.transpose(-2, -1)) / S.unsqueeze(1
-                                                                    ).clamp(min=1e-16)
+            U = torch.bmm(M, Vt.transpose(-2, -1)) / S.unsqueeze(1).clamp(min=1e-16)
         else:  # 'default' — production FLEigh path
             U, S, Vt = self._svd(M)
 
