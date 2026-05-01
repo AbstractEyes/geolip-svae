@@ -82,7 +82,7 @@ def text_to_image(
     kwarg). For an in-distribution forward, ``channels`` should equal
     the model's ``channels`` attribute.
     """
-    from geolip_svae.train import ByteTrigramDataset
+    from geolip_svae.dataset_presets import ByteTrigramDataset
     target = img_size * img_size * channels
     chunk, _ = _padded_bytes(text, target, pad)
     img = ByteTrigramDataset.bytes_to_image(
@@ -102,7 +102,7 @@ def image_to_text(
     If ``n_bytes`` is given, only the first ``n_bytes`` of the recovered
     byte stream are decoded (drops padded patches).
     """
-    from geolip_svae.train import ByteTrigramDataset
+    from geolip_svae.dataset_presets import ByteTrigramDataset
     if image.ndim == 3:
         image = image.unsqueeze(0)
     bytes_t = ByteTrigramDataset.image_to_bytes(image, patch_size, channels)
@@ -129,7 +129,7 @@ def text_real_patch_mask(
     coordinates by laying out a byte-level marker through ``bytes_to_image``
     and aggregating max-over-pixel to model patches.
     """
-    from geolip_svae.train import ByteTrigramDataset
+    from geolip_svae.dataset_presets import ByteTrigramDataset
 
     n_model_patches = (img_size // model_patch_size) ** 2
     if pad == 'repeat':
@@ -238,7 +238,7 @@ def text_recovery_metrics(
     was trained to encode; this confirms the round-trip works on the
     specific text under test before any similarity comparison.
     """
-    from geolip_svae.train import ByteTrigramDataset
+    from geolip_svae.dataset_presets import ByteTrigramDataset
 
     target = img_size * img_size * channels
     chunk, n_real = _padded_bytes(text, target, pad)
