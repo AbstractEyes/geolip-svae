@@ -321,6 +321,28 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     ),
 
     # ── H2-class (sphere-solver, the architecture used by h2-64 batteries) ──
+    'h2_64_single_svd': dict(
+        # H2_linear_matched architecture
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        #linear_readout=True, svd_mode='none', match_params=True,
+        # Training — gaussian only by default (foundation)
+        dataset='omega_noise', img_size=64, batch_size=128,
+        # H2-class natural attractor: CV ~0.85-0.92 on noise content, NOT the
+        # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
+        # h2-class with V=32/D=4 lives in a different basin of CV-space because
+        # of the small D and linear readout. Don't pull toward 0.215.
+        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        # H2-class natural band (per measured runs): 0.80-1.05
+        cv_band_lo=0.80, cv_band_hi=1.05,
+        #allowed_types=[0],
+        hf_version='h2_64_single_svd', save_every=5,
+        ds_size=1_000_000, val_size=10_000,
+        # Diagnostics cadence
+        report_every=200,
+    ),
+
+    # ── H2-class (sphere-solver, the architecture used by h2-64 batteries) ──
     'h2_64_1channel': dict(
         # H2_linear_matched architecture
         V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
