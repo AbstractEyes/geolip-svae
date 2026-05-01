@@ -356,6 +356,100 @@ def train(cfg: Dict[str, Any]):
               f"corpus: {cfg.get('sp_corpus', 'wikitext-2-raw-v1')}, "
               f"n_bits: {cfg.get('sp_n_bits', 16)}, "
               f"vocab: {_tds.vocab_size}, tokens/img: {_tds.n_patches}")
+
+    # ── Device + SVD pathway introspection ───────────────────────────
+    # Reports the actual hardware in use, the geolip-core backend state,
+    # and which SVD path the current cfg will engage at every forward.
+    # Useful when verifying that an --preset really hits the Triton kernel
+    # or when triaging why an h2-class run is slower than expected.
+    print("  " + "─" * 96)
+    if device.type == 'cuda':
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(idx)
+        props = torch.cuda.get_device_properties(idx)
+        gib = props.total_memory / (1024 ** 3)
+        print(f"  Device:       cuda:{idx} — {props.name} (sm_{cap[0]}{cap[1]}, "
+              f"{props.multi_processor_count} SMs, {gib:.1f} GiB)")
+        print(f"  Torch:        {torch.__version__}  "
+              f"cuda={torch.version.cuda}  cudnn={torch.backends.cudnn.version()}")
+    else:
+        print(f"  Device:       cpu")
+        print(f"  Torch:        {torch.__version__}  (CUDA unavailable)")
+
+    # geolip-core backend state — covers triton + FL eigh availability
+    try:
+        from geolip_core.linalg._backend import backend as _gc_backend
+        triton_str = (f"v{_gc_backend.triton_version}" if _gc_backend.has_triton
+                      else "not installed")
+        print(f"  geolip-core:  triton={triton_str}  "
+              f"use_triton={_gc_backend.use_triton}  "
+              f"use_fl_eigh={_gc_backend.use_fl_eigh}")
+    except Exception as _e:
+        _gc_backend = None
+        print(f"  geolip-core:  backend introspection failed ({_e})")
+
+    # Predict the SVD pathway the model will actually invoke.
+    # Mirrors the dispatch logic in:
+    #   - PatchSVAE.encode_patches (linear_readout / svd_mode branches)
+    #   - PatchSVAE._svd (solver='conduit' shortcut)
+    #   - geolip_core.linalg.batched_svd auto-dispatch (method='auto')
+    _on_cuda = (device.type == 'cuda')
+    _use_triton = bool(_gc_backend and _gc_backend.use_triton and _on_cuda)
+    _use_fl    = bool(_gc_backend and _gc_backend.use_fl_eigh and _on_cuda)
+
+    if linear_readout:
+        path = (f"linear-readout (sphere-solver) — SVD bypassed; "
+                f"learned nn.Linear(V*D, V*D) replaces U·S·Vt")
+    elif svd_mode == 'fp32':
+        path = "encode_patches fp32 ablation — torch.linalg.eigh @ fp32 (no autocast)"
+    elif svd_mode == 'fp64':
+        path = "encode_patches fp64 ablation — torch.linalg.eigh @ fp64 (no autocast)"
+    elif svd_mode == 'batch_shared':
+        path = (f"batch-shared SVD — single SVD per batch via dispatcher "
+                f"(method={svd_method!r})")
+    elif solver == 'conduit':
+        path = ("FLEighConduit @ fp64 — telemetry path (svd_method ignored, "
+                "ConduitPacket captured per forward)")
+    else:
+        # solver='default' + svd_mode='default' → batched_svd dispatcher
+        if svd_method == 'torch':
+            path = f"torch.linalg.svd @ {svd_compute_dtype}"
+        elif svd_method == 'fl' and _use_fl and svd_compute_dtype == 'fp32':
+            path = "FL eigh + Gram @ fp32 (forced)"
+        elif svd_method == 'gram_eigh':
+            path = f"torch.linalg.eigh + Gram @ {svd_compute_dtype} (forced)"
+        elif svd_method == 'triton' and _use_triton and 2 <= D <= 6:
+            path = (f"fused Triton N={D} kernel @ {svd_compute_dtype} (forced) "
+                    f"— BLOCK_M=128, JACOBI_ITERS={'12' if D==6 else '6'}")
+        elif svd_method == 'auto':
+            # Auto-dispatch logic from geolip_core.linalg.batched_svd
+            if 2 <= D <= 6 and _use_triton:
+                path = (f"fused Triton N={D} kernel @ {svd_compute_dtype} "
+                        f"— BLOCK_M=128, JACOBI_ITERS={'12' if D==6 else '6'}")
+            elif D <= 12 and _use_fl and svd_compute_dtype == 'fp32':
+                path = f"FL eigh + Gram @ fp32 (auto)"
+            elif _on_cuda:
+                path = f"torch.linalg.eigh + Gram @ {svd_compute_dtype} (auto, cuda)"
+            else:
+                path = f"torch.linalg.svd @ {svd_compute_dtype} (auto, cpu fallback)"
+        else:
+            # Method/compat mismatch — dispatcher will fall through; flag it.
+            path = (f"forced method={svd_method!r} but conditions unmet "
+                    f"— dispatcher will fall through to torch fallback")
+
+    print(f"  SVD path:     {path}")
+    print(f"  SVD config:   solver={solver!r}, svd_mode={svd_mode!r}, "
+          f"svd_method={svd_method!r}, compute_dtype={svd_compute_dtype!r}")
+    # Activations: only show non-default sites to keep output narrow.
+    _act_changes = [
+        f"{site}={name!r}" for site, name in model.activations.items()
+        if name != 'gelu'
+    ]
+    if _act_changes:
+        print(f"  Activations:  {', '.join(_act_changes)} (others: gelu)")
+    else:
+        print(f"  Activations:  all sites = 'gelu' (default)")
+    print(f"  Row-norm:     {row_norm!r}   Init scheme: {init_scheme!r}")
     print("=" * 100)
 
     # ── Helpers ──
