@@ -337,7 +337,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # H2-class natural band (per measured runs): 0.80-1.05
         cv_band_lo=0.80, cv_band_hi=1.05,
         #allowed_types=[0],
-        hf_version='h2_64_single_svd', save_every=5,
+        hf_version='h2_64_single_svd_triton', save_every=5,
         ds_size=1_000_000, val_size=10_000,
         # Diagnostics cadence
         report_every=200,
