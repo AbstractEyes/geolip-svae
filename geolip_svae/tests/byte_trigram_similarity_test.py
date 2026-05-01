@@ -335,9 +335,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         img_size=args.img_size,
         patch_size=cfg['patch_size'],
         pad=args.pad_strategy,
+        channels=cfg.get('channels', 3),
     )
     print(f"  Encoder: img_size={enc.img_size}, patch_size={enc.patch_size}, "
-          f"pad={enc.pad!r}")
+          f"pad={enc.pad!r}, channels={enc.channels}")
     print(f"  Per-patch aggregation: {args.agg!r}")
 
     # ── 4a. Round-trip sanity check ──

@@ -72,17 +72,22 @@ def text_to_image(
     img_size: int = 64,
     patch_size: int = 2,
     pad: str = 'space',
+    channels: int = 3,
 ) -> torch.Tensor:
-    """Encode a string as a ``(3, img_size, img_size)`` byte-trigram image.
+    """Encode a string as a ``(channels, img_size, img_size)`` byte-n-gram image.
 
-    Same path as training. ``patch_size`` here controls the byte→pixel
-    layout in ``ByteTrigramDataset.bytes_to_image``; it usually matches
-    the model's ``patch_size`` but is independent.
+    Same path as training. ``patch_size`` controls the byte→pixel layout
+    in ``ByteTrigramDataset.bytes_to_image``; ``channels`` is the n-gram
+    size (3 = RGB trigram, default; matches the dataset's ``channels``
+    kwarg). For an in-distribution forward, ``channels`` should equal
+    the model's ``channels`` attribute.
     """
     from geolip_svae.train import ByteTrigramDataset
-    target = img_size * img_size * 3
+    target = img_size * img_size * channels
     chunk, _ = _padded_bytes(text, target, pad)
-    img = ByteTrigramDataset.bytes_to_image(chunk, img_size, patch_size)
+    img = ByteTrigramDataset.bytes_to_image(
+        chunk, img_size, patch_size, channels,
+    )
     return torch.from_numpy(img)
 
 
@@ -90,8 +95,9 @@ def image_to_text(
     image: torch.Tensor,
     patch_size: int = 2,
     n_bytes: Optional[int] = None,
+    channels: int = 3,
 ) -> str:
-    """Decode a ``(3, H, W)`` image back to a UTF-8 string.
+    """Decode a ``(channels, H, W)`` image back to a UTF-8 string.
 
     If ``n_bytes`` is given, only the first ``n_bytes`` of the recovered
     byte stream are decoded (drops padded patches).
@@ -99,7 +105,7 @@ def image_to_text(
     from geolip_svae.train import ByteTrigramDataset
     if image.ndim == 3:
         image = image.unsqueeze(0)
-    bytes_t = ByteTrigramDataset.image_to_bytes(image, patch_size)
+    bytes_t = ByteTrigramDataset.image_to_bytes(image, patch_size, channels)
     flat = bytes_t.reshape(-1).cpu().numpy().astype(np.uint8)
     if n_bytes is not None:
         flat = flat[:n_bytes]
@@ -112,6 +118,7 @@ def text_real_patch_mask(
     patch_size: int,
     model_patch_size: int,
     pad: str,
+    channels: int = 3,
 ) -> torch.Tensor:
     """Boolean mask over the model's patch grid: True iff the patch
     overlaps at least one real (un-padded) text byte.
@@ -128,7 +135,7 @@ def text_real_patch_mask(
     if pad == 'repeat':
         return torch.ones(n_model_patches, dtype=torch.bool)
 
-    target = img_size * img_size * 3
+    target = img_size * img_size * channels
     n_real = min(len(text.encode('utf-8')), target)
     if n_real >= target:
         return torch.ones(n_model_patches, dtype=torch.bool)
@@ -138,10 +145,12 @@ def text_real_patch_mask(
     byte_mask = np.zeros(target, dtype=np.uint8)
     byte_mask[:n_real] = 0xFF
     mask_img = torch.from_numpy(
-        ByteTrigramDataset.bytes_to_image(byte_mask, img_size, patch_size)
+        ByteTrigramDataset.bytes_to_image(
+            byte_mask, img_size, patch_size, channels,
+        )
     )
     gh = gw = img_size // model_patch_size
-    blocks = mask_img.reshape(3, gh, model_patch_size, gw, model_patch_size)
+    blocks = mask_img.reshape(channels, gh, model_patch_size, gw, model_patch_size)
     return (blocks.amax(dim=(0, 2, 4)) > 0).flatten()
 
 
@@ -155,6 +164,7 @@ def text_features(
     patch_size: int = 2,
     pad: str = 'space',
     mode: str = 'M',
+    channels: int = 3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-patch features and real-patch mask for one or more texts.
 
@@ -180,7 +190,7 @@ def text_features(
 
     device = next(engine.model.parameters()).device
     images = torch.stack([
-        text_to_image(t, img_size, patch_size, pad) for t in texts
+        text_to_image(t, img_size, patch_size, pad, channels) for t in texts
     ]).to(device)
 
     # mode='direct' through the engine: tile mode permutes patches across
@@ -199,7 +209,7 @@ def text_features(
 
     model_ps = int(engine.model.patch_size)
     masks = torch.stack([
-        text_real_patch_mask(t, img_size, patch_size, model_ps, pad)
+        text_real_patch_mask(t, img_size, patch_size, model_ps, pad, channels)
         for t in texts
     ])
 
@@ -219,6 +229,7 @@ def text_recovery_metrics(
     img_size: int = 64,
     patch_size: int = 2,
     pad: str = 'space',
+    channels: int = 3,
 ) -> Dict[str, Any]:
     """Run text → image → model recon → image → text and report byte fidelity.
 
@@ -229,10 +240,10 @@ def text_recovery_metrics(
     """
     from geolip_svae.train import ByteTrigramDataset
 
-    target = img_size * img_size * 3
+    target = img_size * img_size * channels
     chunk, n_real = _padded_bytes(text, target, pad)
     img = torch.from_numpy(
-        ByteTrigramDataset.bytes_to_image(chunk, img_size, patch_size)
+        ByteTrigramDataset.bytes_to_image(chunk, img_size, patch_size, channels)
     )
     device = next(engine.model.parameters()).device
     out = engine.reconstruct(img.unsqueeze(0).to(device), mode='direct')
@@ -240,7 +251,7 @@ def text_recovery_metrics(
     recon_mse = float(out['mse_per_image'][0]) if 'mse_per_image' in out \
         else float('nan')
 
-    recon_bytes = ByteTrigramDataset.image_to_bytes(recon, patch_size)
+    recon_bytes = ByteTrigramDataset.image_to_bytes(recon, patch_size, channels)
     flat = recon_bytes.reshape(-1).numpy().astype(np.uint8)
     orig = chunk.astype(np.uint8)
 
@@ -316,22 +327,26 @@ def per_patch_similarity(
 class SentenceEncoder:
     """Bundles an ``InferenceEngine`` with text-side config.
 
-    Holds ``(engine, img_size, patch_size, pad)`` and delegates to the
-    module-level free functions. Use the free functions directly if
-    you'd rather not carry state.
+    Holds ``(engine, img_size, patch_size, pad, channels)`` and delegates
+    to the module-level free functions. Use the free functions directly
+    if you'd rather not carry state. ``channels`` should match the
+    model's ``channels`` attribute for in-distribution behavior.
     """
     engine: InferenceEngine
     img_size: int = 64
     patch_size: int = 2
     pad: str = 'space'
+    channels: int = 3
 
     def text_to_image(self, text: str) -> torch.Tensor:
-        return text_to_image(text, self.img_size, self.patch_size, self.pad)
+        return text_to_image(
+            text, self.img_size, self.patch_size, self.pad, self.channels,
+        )
 
     def image_to_text(
         self, image: torch.Tensor, n_bytes: Optional[int] = None,
     ) -> str:
-        return image_to_text(image, self.patch_size, n_bytes)
+        return image_to_text(image, self.patch_size, n_bytes, self.channels)
 
     def features(
         self,
@@ -340,13 +355,13 @@ class SentenceEncoder:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return text_features(
             self.engine, text,
-            self.img_size, self.patch_size, self.pad, mode,
+            self.img_size, self.patch_size, self.pad, mode, self.channels,
         )
 
     def recovery(self, text: str) -> Dict[str, Any]:
         return text_recovery_metrics(
             self.engine, text,
-            self.img_size, self.patch_size, self.pad,
+            self.img_size, self.patch_size, self.pad, self.channels,
         )
 
     def similarity(
