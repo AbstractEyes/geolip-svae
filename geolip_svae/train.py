@@ -2160,4 +2160,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main(['--preset', 'h2_64_1channel'])
+    main()
+    #main(['--preset', 'h2_64_1channel'])
