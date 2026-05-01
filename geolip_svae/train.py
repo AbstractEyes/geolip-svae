@@ -1,60 +1,94 @@
 """
-SVAE Unified Trainer (v2)
-==========================
-Single entry point for all model variants. Replaces the previous train.py.
+SVAE Unified Trainer
+=====================
+Single entry point for every PatchSVAE variant in the package.
 
-    Fresnel    (images):   python -m geolip_svae.train --preset fresnel_base
-    Johanna    (noise):    python -m geolip_svae.train --preset johanna_base
-    Alexandria (text):     python -m geolip_svae.train --preset alexandria_small
-    Freckles   (D=4 noise):python -m geolip_svae.train --preset freckles_64
-    Fresnel-64 (D=4 imgs): python -m geolip_svae.train --preset fresnel_64
-    H2-64      (sphere):   python -m geolip_svae.train --preset h2_64_single
-    BinTree    (substrate):python -m geolip_svae.train --preset bintree_proto
-    SP-bits    (substrate):python -m geolip_svae.train --preset sentencepiece_proto
+CLI
+---
+    python -m geolip_svae.train --preset NAME
+    python -m geolip_svae.train --list-presets
+    python -m geolip_svae.train --preset NAME --epochs 50 --no-upload
 
-    Streaming continuation:  python -m geolip_svae.train_streaming \
-                                 --hf-version v50_fresnel_64
+Common preset families (full catalog: ``--list-presets``):
 
-What v2 adds over v1
---------------------
-  * Architecture kwargs (linear_readout, svd_mode, match_params, smooth_mid)
-    plumbed through preset dict to PatchSVAE — enables h2-class architectures
-    that v1 could not build at all.
-  * johanna_F diagnostics restored: epoch_max_grad, per-layer alpha mean/std,
-    cv_in_band boolean, full per-step `history` list dumped to final_report.json.
-  * Mid-epoch reporting cadence via `report_every` (not just per-epoch).
-  * allowed_types filter for noise datasets — Gaussian-only foundation,
-    custom subset, or all 16.
-  * BinaryTreeDataset + bit-recovery metric for the substrate prototype.
-
-Existing behavior preserved
----------------------------
-  * Pretrained loading from HF
-  * Curriculum (patience-based and scheduled tier unlocks)
-  * HF checkpoint + TB upload
-  * All five existing presets (fresnel_*, johanna_*, alexandria_*) still run.
-
-Listed presets:
-    fresnel_tiny       TinyImageNet 64x64,  300 ep
-    fresnel_small      ImageNet-128 128x128, 50 ep
-    fresnel_base       ImageNet-256 256x256, 20 ep
-    johanna_tiny       Curriculum noise 64x64, 300 ep
-    johanna_small      Omega noise 128x128, 200 ep (pretrained from Gaussian)
-    johanna_base       Scheduled noise 256x256, 30 ep
-    alexandria_small   Wikipedia text 128x128, 100 ep (pretrained from Johanna)
-    freckles_64        Omega noise 64x64, 100 ep (D=4 noise specialist, 2.55M params)
-    freckles_256       Omega noise 256x256, 1 ep (init from freckles_64)
-    freckles_512       Omega noise 512x512, 1 ep (init from freckles_256)
-    fresnel_64         TinyImageNet 64x64 with Freckles geometry (D=4, 2.55M params)
-    h2_64_single       H2-class single battery, gaussian only — for reproducing
-                       individual h2-64 banks
-    bintree_proto      Binary-tree substrate prototype on h2-64 architecture
-    sentencepiece_proto T5-base SentencePiece-bit substrate (first real-data
-                       prototype on h2-64 architecture; one token per patch)
+    Fresnel    (images, V=256 D=16)         python -m geolip_svae.train --preset fresnel_base
+    Johanna    (noise,  V=256 D=16)         python -m geolip_svae.train --preset johanna_base
+    Alexandria (text,   V=256 D=16)         python -m geolip_svae.train --preset alexandria_small
+    Freckles   (noise,  V=48  D=4)          python -m geolip_svae.train --preset freckles_64
+    Fresnel-64 (images, V=48  D=4)          python -m geolip_svae.train --preset fresnel_64
+    H2-64      (sphere, V=32  D=4)          python -m geolip_svae.train --preset h2_64_single
+    BinTree    (substrate, h2-64 arch)      python -m geolip_svae.train --preset bintree_proto
+    SP-bits    (substrate, h2-64 arch)      python -m geolip_svae.train --preset sentencepiece_proto
+    ByteTri    (substrate, h2-64 arch)      python -m geolip_svae.train --preset byte_trigram_proto
 
 For long-running continuation of any trained model on streaming random crops
 (the "sublens perspective" mode that produced v50_fresnel_64's 140M+ images),
-see `geolip_svae.train_streaming`.
+see ``geolip_svae.train_streaming``.
+
+Module layout
+-------------
+The trainer is split across three sibling modules. Each owns a single
+responsibility so the loop stays narrow:
+
+    train.py             — the training loop, CLI, optimizer/scheduler,
+                           pretrained loading, HF upload helpers, codebook
+                           build hook. Reads PRESETS / dataset factories.
+    train_presets.py     — PRESETS registry + a fully-documented TEMPLATE
+                           dict listing every cfg key the trainer accepts
+                           with its default and accepted values.
+    dataset_presets.py   — DATASET_FACTORIES registry, all dataset classes,
+                           recovery metrics, eval helper. Exposes
+                           get_dataset_bundle(cfg, channels) → DatasetBundle.
+
+Key model-side modules consumed:
+
+    geolip_svae.model              — PatchSVAE, gram_eigh_svd dispatcher,
+                                     ACTIVATIONS / ACTIVATION_MODULES /
+                                     ACTIVATION_SITES, SVD_METHODS.
+    geolip_svae.inference          — engine, codebook, calibration,
+                                     train_codebook (post-train hook).
+
+Configuring a run
+-----------------
+A cfg dict is just a Python ``dict``. Required keys (V, D, patch_size,
+hidden, depth, n_cross, dataset, img_size, batch_size, lr, epochs,
+target_cv, hf_version) raise KeyError if missing; everything else is
+optional and falls through to the documented default. See
+``geolip_svae.train_presets.TEMPLATE`` for the canonical, fully-specified
+cfg dict — copy it to start a new preset.
+
+Architecture features that flow through cfg
+-------------------------------------------
+  * F/G/H/L group ablation toggles (activation, activations, row_norm,
+    svd_mode, linear_readout, match_params, init_scheme).
+  * SVD dispatcher (svd_method, svd_compute_dtype) — auto-routes through
+    geolip-core's batched_svd, which fires the fused Triton N=4 kernel
+    at D=4 on CUDA. Drops the historical need for the linear_readout
+    workaround at small D.
+  * Per-site activations — five named slots (enc_in, enc_block_inner,
+    dec_in, dec_block_inner, boundary_smooth) each pickable from a
+    21-entry registry. Defaults preserve pre-refactor GELU behavior
+    bit-for-bit.
+  * Channels — non-3-channel datasets (1-channel, 5-channel) by setting
+    cfg['channels'].
+
+Reporting
+---------
+  * johanna_F diagnostics: epoch_max_grad, per-layer alpha mean/std,
+    cv_in_band boolean, full per-step ``history`` dumped to final_report.json.
+  * Mid-epoch reporting cadence via ``report_every`` (in batches).
+  * allowed_types filter for noise datasets — Gaussian-only foundation,
+    custom subset, or all 16.
+  * Recovery metrics for substrate datasets (binary tree bits,
+    sentencepiece bits/tokens, byte-trigram).
+
+Codebook hook
+-------------
+At end-of-train, ``create_codebook(model, cfg, ...)`` is invoked
+(``cfg['build_codebook']=False`` to opt out). This extracts the final
+projective-axis Codebook artifact and runs the kNN-graph / local-PCA /
+optional ripser persistent-homology probes. Output lands under
+``save_dir/codebooks/`` and uploads to HF when enabled.
 """
 
 import os
@@ -87,21 +121,36 @@ except Exception:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PRESETS — moved to geolip_svae.train_presets
+# PRESETS — owned by geolip_svae.train_presets
 # ═══════════════════════════════════════════════════════════════════
-# Re-imported here so existing callers
-# (``from geolip_svae.train import PRESETS``) keep working.
-from geolip_svae.train_presets import PRESETS
+# The PRESETS catalog and the TEMPLATE dict (a fully-documented cfg
+# skeleton) live in ``train_presets.py``. That module is intentionally
+# torch-free, so non-trainer code can import the catalog without paying
+# for torch / torchvision / huggingface_hub. Authoring a new preset
+# does NOT require editing this file — add an entry to PRESETS in
+# train_presets.py and the trainer picks it up automatically.
+#
+# Re-exported here so legacy ``from geolip_svae.train import PRESETS``
+# call sites keep working.
+from geolip_svae.train_presets import PRESETS, TEMPLATE  # noqa: F401
 
 
-
 # ═══════════════════════════════════════════════════════════════════
-# DATASETS — moved to geolip_svae.dataset_presets
+# DATASETS — owned by geolip_svae.dataset_presets
 # ═══════════════════════════════════════════════════════════════════
-# All dataset classes, noise machinery, recovery metrics, and the eval
-# helper are now in dataset_presets.py. Re-imported here for trainer
-# use AND so existing callers (`from geolip_svae.train import
-# ByteTrigramDataset`, etc.) keep working transitionally.
+# All dataset classes, noise machinery, recovery metrics, the per-type
+# eval helper, and the DATASET_FACTORIES registry live in
+# ``dataset_presets.py``. The trainer's only contact with dataset
+# code is::
+#
+#     bundle = get_dataset_bundle(cfg, channels=channels)
+#
+# which returns a DatasetBundle with train/test loaders + flag booleans
+# (is_noise / is_text / is_image / is_tree / is_sentencepiece /
+# is_byte_trigram) describing what kind of data is flowing through.
+#
+# Re-exports below cover legacy ``from geolip_svae.train import
+# ByteTrigramDataset`` style call sites used by tests and notebooks.
 from geolip_svae.dataset_presets import (
     NOISE_NAMES, TIERS,
     _pink_noise, _brown_noise, _generate_noise,
