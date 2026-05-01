@@ -295,24 +295,84 @@ class SpectralCrossAttention(nn.Module):
 # Ablation helpers — support F/G/H/L groups as parameterized toggles
 # inside the PatchSVAE class.
 
+# Functional activations — used at sites that call act_fn(tensor) directly
+# (encoder/decoder outer activation in encode_patches / decode_patches).
+#
+# All entries are parameterless OR use safe defaults so that swapping does
+# NOT alter state_dict shape — every existing checkpoint reloads identically
+# regardless of which entry is selected. PReLU/RReLU intentionally excluded
+# (trainable params would silently inflate model size).
 ACTIVATIONS = {
-    'gelu': F.gelu,
-    'relu': F.relu,
-    'silu': F.silu,
-    'tanh': torch.tanh,
-    'identity': lambda x: x,
+    # Smooth, near-identity around 0
+    'gelu':         F.gelu,
+    'gelu_tanh':    lambda x: F.gelu(x, approximate='tanh'),
+    'silu':         F.silu,
+    'swish':        F.silu,                  # alias of silu
+    'mish':         F.mish,
+
+    # ReLU family
+    'relu':         F.relu,
+    'relu6':        F.relu6,
+    'leaky_relu':   F.leaky_relu,            # negative_slope=0.01
+    'elu':          F.elu,                   # alpha=1.0
+    'selu':         F.selu,
+    'celu':         F.celu,                  # alpha=1.0
+
+    # Bounded
+    'tanh':         torch.tanh,
+    'sigmoid':      torch.sigmoid,
+    'hardtanh':     F.hardtanh,              # min/max=-1/+1
+    'hardsigmoid':  F.hardsigmoid,
+    'hardswish':    F.hardswish,
+
+    # Shaped / shifted
+    'softplus':     F.softplus,              # beta=1, threshold=20
+    'softsign':     F.softsign,
+    'logsigmoid':   F.logsigmoid,
+    'tanhshrink':   F.tanhshrink,
+
+    # Pass-through
+    'identity':     lambda x: x,
 }
 
 # nn.Module factories for the SAME activation set, used inside
 # nn.Sequential blocks (encoder/decoder residual blocks, BoundarySmooth).
 # Each entry is a zero-arg callable that returns a fresh module.
 ACTIVATION_MODULES = {
-    'gelu': nn.GELU,
-    'relu': nn.ReLU,
-    'silu': nn.SiLU,
-    'tanh': nn.Tanh,
-    'identity': nn.Identity,
+    'gelu':         nn.GELU,
+    'gelu_tanh':    lambda: nn.GELU(approximate='tanh'),
+    'silu':         nn.SiLU,
+    'swish':        nn.SiLU,                 # alias of silu
+    'mish':         nn.Mish,
+
+    'relu':         nn.ReLU,
+    'relu6':        nn.ReLU6,
+    'leaky_relu':   nn.LeakyReLU,
+    'elu':          nn.ELU,
+    'selu':         nn.SELU,
+    'celu':         nn.CELU,
+
+    'tanh':         nn.Tanh,
+    'sigmoid':      nn.Sigmoid,
+    'hardtanh':     nn.Hardtanh,
+    'hardsigmoid':  nn.Hardsigmoid,
+    'hardswish':    nn.Hardswish,
+
+    'softplus':     nn.Softplus,
+    'softsign':     nn.Softsign,
+    'logsigmoid':   nn.LogSigmoid,
+    'tanhshrink':   nn.Tanhshrink,
+
+    'identity':     nn.Identity,
 }
+
+# Sanity invariant — keep the two registries aligned so that any name
+# valid in one is valid in the other. This catches typos when extending.
+assert set(ACTIVATIONS) == set(ACTIVATION_MODULES), (
+    f"ACTIVATIONS / ACTIVATION_MODULES key sets diverged: "
+    f"only-functional={set(ACTIVATIONS) - set(ACTIVATION_MODULES)}, "
+    f"only-module={set(ACTIVATION_MODULES) - set(ACTIVATIONS)}"
+)
 
 # Per-site activation slots inside PatchSVAE. Each entry resolves to one
 # of the keys in ACTIVATIONS / ACTIVATION_MODULES. Defaults preserve the
@@ -746,68 +806,4 @@ class PatchSVAE(nn.Module):
         # Reconstruct matrix from SVD components
         M_hat = torch.bmm(U_flat * S_flat.unsqueeze(1), Vt_flat)
 
-        # Residual MLP decoder — outer activation is configurable via
-        # self.activations['dec_in'] (defaults to GELU).
-        dec_in_act = ACTIVATIONS[self.activations['dec_in']]
-        h = dec_in_act(self.dec_in(M_hat.reshape(B * N, -1)))
-        for block in self.dec_blocks:
-            h = h + block(h)
-
-        return self.dec_out(h).reshape(B, N, -1)
-
-    def forward(self, images: torch.Tensor) -> dict:
-        """Full encode → SVD → coordinate → decode → stitch pipeline.
-
-        Args:
-            images: (B, C, H, W) — C must equal self.channels (set at init,
-                default 3); H and W must be divisible by patch_size
-
-        Returns:
-            dict with keys:
-                recon: (B, C, H, W) — reconstructed images
-                svd:   dict — full SVD decomposition (U, S, S_orig, Vt, M)
-        """
-        B, C, H, W = images.shape
-        if C != self.channels:
-            raise ValueError(
-                f"input has C={C} but model was built with "
-                f"channels={self.channels}"
-            )
-        ps = self.patch_size
-        gh, gw = H // ps, W // ps
-
-        # Extract patches
-        patches, gh, gw = extract_patches(images, ps)
-
-        # Encode → SVD → cross-attention
-        svd = self.encode_patches(patches)
-
-        # Decode → stitch → smooth
-        decoded = self.decode_patches(svd['U'], svd['S'], svd['Vt'])
-        recon = stitch_patches(decoded, gh, gw, ps, channels=self.channels)
-        recon = self.boundary_smooth(recon)
-
-        return {'recon': recon, 'svd': svd}
-
-    @staticmethod
-    def effective_rank(S: torch.Tensor) -> torch.Tensor:
-        """Effective rank of singular value distribution.
-
-        erank = exp(-Σ p_i log p_i) where p_i = σ_i / Σσ
-
-        Architectural constant ≈ 15.88 for D=16.
-        """
-        p = S / (S.sum(-1, keepdim=True) + 1e-8)
-        p = p.clamp(min=1e-8)
-        return (-(p * p.log()).sum(-1)).exp()
-
-    @staticmethod
-    def s_delta(S_orig: torch.Tensor, S_coord: torch.Tensor) -> float:
-        """Mean absolute spectral shift from cross-attention.
-
-        Converges to modality-specific binding constants:
-            Images:  ~0.238
-            Noise:   ~0.350-0.407
-            Text:    ~0.350
-        """
-        return (S_coord - S_orig).abs().mean().item()
+ 
