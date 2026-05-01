@@ -333,9 +333,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # 0.13-0.30 noise-substrate band (that's for V=256/D=16 class). The
         # h2-class with V=32/D=4 lives in a different basin of CV-space because
         # of the small D and linear readout. Don't pull toward 0.215.
-        lr=1e-3, epochs=20, target_cv=0.9, cv_weight=0.0,
+        lr=1e-3, epochs=10, target_cv=1.0, cv_weight=0.01,
         # H2-class natural band (per measured runs): 0.80-1.05
-        cv_band_lo=0.80, cv_band_hi=1.05,
+        cv_band_lo=0.80, cv_band_hi=1.25,
         #allowed_types=[0],
         hf_version='h2_64_single_svd_triton', save_every=5,
         ds_size=1_000_000, val_size=10_000,
