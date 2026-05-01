@@ -34,48 +34,46 @@ import torch.nn.functional as F
 
 from geolip_core.linalg.eigh import FLEigh, _FL_MAX_N
 from geolip_core.linalg.conduit import FLEighConduit, ConduitPacket
+from geolip_core.linalg import batched_svd as _gc_batched_svd
 
 
-def gram_eigh_svd(A: torch.Tensor):
-    """Thin SVD via Gram matrix eigendecomposition in fp64.
+SVD_METHODS = ('auto', 'fl', 'gram_eigh', 'triton', 'torch')
+SVD_COMPUTE_DTYPES = ('fp64', 'fp32')
 
-    Uses geolip-core FLEigh for N <= 12 on CUDA (optimized small-matrix eigh).
-    Falls back to torch.linalg.eigh on CPU or large N.
+
+def gram_eigh_svd(A: torch.Tensor, method: str = 'auto',
+                   compute_dtype: str = 'fp64'):
+    """Thin SVD — delegates to geolip_core.linalg.batched_svd (auto-dispatch).
+
+    Routing performed by batched_svd (method='auto'):
+        N=2..6, CUDA + Triton:    Fused Triton kernel (D=2..6 inclusive)
+        N<=12, CUDA, fp32:        Gram + FL eigh
+        N<=12, CUDA, fp64:        Gram + torch.linalg.eigh
+                                  (FLEigh returns fp32 V which silently caps
+                                   fp64 SVD orthogonality at ~1e-3 — the
+                                   dispatcher avoids FL on fp64 paths)
+        N>12 or CPU:              Gram + torch.linalg.eigh
+        Wide shape (M<N):         Transparent transpose
+
+    PatchSVAE inputs M to this function (B*N, V, D) with V >> D in the
+    canonical case, so the tall path is taken; the dedicated Triton kernel
+    fires for D ∈ {2,3,4,5,6} on CUDA when triton is installed.
 
     Args:
-        A: (B, M, N) tensor, M >= N
+        A:             (B, M, N) tensor
+        method:        'auto' | 'fl' | 'gram_eigh' | 'triton' | 'torch'
+                       Forwarded to batched_svd. 'auto' picks the best path
+                       per N/dtype/device. See SVD_METHODS for the full set.
+        compute_dtype: 'fp64' (default) or 'fp32' — internal precision.
+                       fp64 is required for stable eigenvector orthogonality;
+                       fp32 is faster but ill-conditioning can corrupt V.
 
     Returns:
         U: (B, M, N)  left singular vectors
         S: (B, N)     singular values (descending)
-        Vh: (B, N, N)  right singular vectors (transposed)
+        Vh: (B, N, N) right singular vectors (transposed)
     """
-    B, M, N = A.shape
-    orig_dtype = A.dtype
-
-    if N <= _FL_MAX_N and A.is_cuda:
-        with torch.amp.autocast('cuda', enabled=False):
-            A_d = A.double()
-            G = torch.bmm(A_d.transpose(1, 2), A_d)
-            eigenvalues, V = FLEigh()(G.float())
-            eigenvalues = eigenvalues.double().flip(-1)
-            V = V.double().flip(-1)
-            S = torch.sqrt(eigenvalues.clamp(min=1e-24))
-            U = torch.bmm(A_d, V) / S.unsqueeze(1).clamp(min=1e-16)
-            Vh = V.transpose(-2, -1).contiguous()
-        return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
-
-    with torch.amp.autocast('cuda', enabled=False):
-        A_d = A.double()
-        G = torch.bmm(A_d.transpose(1, 2), A_d)
-        G.diagonal(dim1=-2, dim2=-1).add_(1e-12)
-        eigenvalues, V = torch.linalg.eigh(G)
-        eigenvalues = eigenvalues.flip(-1)
-        V = V.flip(-1)
-        S = torch.sqrt(eigenvalues.clamp(min=1e-24))
-        U = torch.bmm(A_d, V) / S.unsqueeze(1).clamp(min=1e-16)
-        Vh = V.transpose(-2, -1).contiguous()
-    return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
+    return _gc_batched_svd(A, method=method, compute_dtype=compute_dtype)
 
 
 def gram_eigh_svd_conduit(A: torch.Tensor, conduit_solver: FLEighConduit):
@@ -219,11 +217,15 @@ class BoundarySmooth(nn.Module):
     Learns residual corrections at patch seams. Starts as identity
     (zero init on final conv) and gradually learns to smooth boundaries.
     """
-    def __init__(self, channels: int = 3, mid: int = 16):
+    def __init__(self, channels: int = 3, mid: int = 16,
+                 activation: str = 'gelu'):
         super().__init__()
+        # Activation is parameterless — swapping does not change state_dict shape.
+        # ACTIVATION_MODULES is defined later in the file; resolve lazily by name.
+        act_factory = ACTIVATION_MODULES[activation]
         self.net = nn.Sequential(
             nn.Conv2d(channels, mid, 3, padding=1),
-            nn.GELU(),
+            act_factory(),
             nn.Conv2d(mid, channels, 3, padding=1),
         )
         nn.init.zeros_(self.net[-1].weight)
@@ -300,6 +302,66 @@ ACTIVATIONS = {
     'tanh': torch.tanh,
     'identity': lambda x: x,
 }
+
+# nn.Module factories for the SAME activation set, used inside
+# nn.Sequential blocks (encoder/decoder residual blocks, BoundarySmooth).
+# Each entry is a zero-arg callable that returns a fresh module.
+ACTIVATION_MODULES = {
+    'gelu': nn.GELU,
+    'relu': nn.ReLU,
+    'silu': nn.SiLU,
+    'tanh': nn.Tanh,
+    'identity': nn.Identity,
+}
+
+# Per-site activation slots inside PatchSVAE. Each entry resolves to one
+# of the keys in ACTIVATIONS / ACTIVATION_MODULES. Defaults preserve the
+# pre-config behavior exactly: GELU on every site, with `enc_in` driven
+# by the legacy `activation` kwarg (still F-group ablation surface).
+ACTIVATION_SITES = (
+    'enc_in',           # outer activation in encode_patches (between enc_in and blocks)
+    'enc_block_inner',  # activation inside each encoder residual block
+    'dec_in',           # outer activation in decode_patches (between dec_in and blocks)
+    'dec_block_inner',  # activation inside each decoder residual block
+    'boundary_smooth',  # activation inside BoundarySmooth (between two convs)
+)
+DEFAULT_ACTIVATIONS = {site: 'gelu' for site in ACTIVATION_SITES}
+
+
+def _resolve_activations(activations, activation):
+    """Build the per-site activation dict.
+
+    Precedence:
+      explicit `activations[site]` > legacy `activation` kwarg (enc_in only) > 'gelu'
+
+    Args:
+        activations: None, or a dict mapping site name -> activation name.
+                     Unknown keys raise; missing keys fall through to defaults.
+        activation:  Legacy F-group kwarg. Acts as a shortcut for the
+                     'enc_in' slot only (matches pre-refactor behavior).
+
+    Returns: dict[str, str] with every key in ACTIVATION_SITES.
+    """
+    resolved = dict(DEFAULT_ACTIVATIONS)
+    # Legacy single-string kwarg: only affects enc_in (as before).
+    if activation is not None:
+        if activation not in ACTIVATIONS:
+            raise ValueError(
+                f"Unknown activation: {activation!r}. "
+                f"Valid: {sorted(ACTIVATIONS)}")
+        resolved['enc_in'] = activation
+    if activations:
+        for site, name in activations.items():
+            if site not in ACTIVATION_SITES:
+                raise ValueError(
+                    f"Unknown activation site: {site!r}. "
+                    f"Valid: {ACTIVATION_SITES}")
+            if name not in ACTIVATIONS:
+                raise ValueError(
+                    f"Unknown activation: {name!r} for site {site!r}. "
+                    f"Valid: {sorted(ACTIVATIONS)}")
+            resolved[site] = name
+    return resolved
 
 
 def _row_normalize(M: torch.Tensor, mode: str) -> torch.Tensor:
@@ -387,23 +449,51 @@ class PatchSVAE(nn.Module):
                  solver: str = 'default',
                  # ── Ablation toggles (F/G/H/L groups) ─────────────────
                  activation: str = 'gelu',
+                 activations: 'Optional[Dict[str, str]]' = None,
                  row_norm: str = 'sphere',
                  svd_mode: str = 'default',
+                 svd_method: str = 'auto',
+                 svd_compute_dtype: str = 'fp64',
                  linear_readout: bool = False,
                  match_params: bool = True,
                  init_scheme: str = 'orthogonal'):
         """
         Ablation toggles:
             activation:     'gelu' (default) | 'relu' | 'silu' | 'tanh' | 'identity'
-                            — activation on enc_in output (F group)
+                            — Legacy F-group ablation. Now equivalent to setting
+                            activations={'enc_in': activation} only; preserved
+                            for back-compat with existing configs and presets.
+            activations:    None (default) | dict[str,str] — fine-grained
+                            per-site activation control. Keys must be drawn
+                            from ACTIVATION_SITES:
+                                'enc_in'           outer activation in encode_patches
+                                'enc_block_inner'  activation inside each encoder block
+                                'dec_in'           outer activation in decode_patches
+                                'dec_block_inner'  activation inside each decoder block
+                                'boundary_smooth'  activation inside BoundarySmooth
+                            Values must be drawn from ACTIVATIONS keys (same
+                            registry as `activation`). Missing keys fall through
+                            to current defaults (all GELU; enc_in honors the
+                            legacy `activation` kwarg). All activations are
+                            parameterless modules — swapping does NOT change
+                            state_dict shape, so existing checkpoints reload.
             row_norm:       'sphere' (default) | 'layernorm' | 'scale' | 'none'
                             — normalization applied to encoded M rows (G group)
-            svd_mode:       'default' (use `solver` argument) | 'fp32' | 'fp64' |
+            svd_mode:       'default' (use `solver` + svd_method) | 'fp32' | 'fp64' |
                             'batch_shared' | 'none' (H group)
                             When 'none' AND linear_readout=True: SVD is bypassed
                             entirely and a learned linear readout replaces it.
                             Column norms of readout output stand in as S;
                             Vt is identity. This is the sphere-solver path.
+            svd_method:     'auto' (default) | 'fl' | 'gram_eigh' | 'triton' | 'torch'
+                            — Routing for the geolip-core dispatcher when
+                            svd_mode='default'. 'auto' picks the best path
+                            per N/dtype/device; fused Triton kernel fires for
+                            D∈{2,3,4,5,6} on CUDA when triton is installed.
+                            Ignored when solver='conduit' (conduit owns dispatch).
+            svd_compute_dtype: 'fp64' (default) | 'fp32' — internal SVD precision.
+                            fp64 is required for stable V orthogonality on the
+                            production sphere-norm path.
             linear_readout: False (default) | True — replace SVD with learned
                             nn.Linear(V*D → V*D) readout (H group)
             match_params:   True (default) | False — when linear_readout=True,
@@ -428,9 +518,21 @@ class PatchSVAE(nn.Module):
         self._conduit_solver = None  # lazy init
 
         # Ablation mode storage
-        self.activation_name = activation
+        self.activations = _resolve_activations(activations, activation)
+        # Back-compat alias: external code reading activation_name still works.
+        self.activation_name = self.activations['enc_in']
         self.row_norm_mode = row_norm
         self.svd_mode = svd_mode
+        # SVD dispatcher config (forwarded to gram_eigh_svd via _svd)
+        if svd_method not in SVD_METHODS:
+            raise ValueError(
+                f"Unknown svd_method: {svd_method!r}. Valid: {SVD_METHODS}")
+        if svd_compute_dtype not in SVD_COMPUTE_DTYPES:
+            raise ValueError(
+                f"Unknown svd_compute_dtype: {svd_compute_dtype!r}. "
+                f"Valid: {SVD_COMPUTE_DTYPES}")
+        self.svd_method = svd_method
+        self.svd_compute_dtype = svd_compute_dtype
         self.linear_readout = linear_readout
         self.match_params = match_params
         self.init_scheme = init_scheme
@@ -441,13 +543,17 @@ class PatchSVAE(nn.Module):
         if smooth_mid is None:
             smooth_mid = 16 if ps >= 16 else 8
 
+        # Resolve module factories for inner-block / boundary activations.
+        enc_block_act = ACTIVATION_MODULES[self.activations['enc_block_inner']]
+        dec_block_act = ACTIVATION_MODULES[self.activations['dec_block_inner']]
+
         # Encoder
         self.enc_in = nn.Linear(self.patch_dim, hidden)
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(hidden),
                 nn.Linear(hidden, hidden),
-                nn.GELU(),
+                enc_block_act(),
                 nn.Linear(hidden, hidden),
             ) for _ in range(depth)
         ])
@@ -467,7 +573,7 @@ class PatchSVAE(nn.Module):
             nn.Sequential(
                 nn.LayerNorm(hidden),
                 nn.Linear(hidden, hidden),
-                nn.GELU(),
+                dec_block_act(),
                 nn.Linear(hidden, hidden),
             ) for _ in range(depth)
         ])
@@ -480,7 +586,10 @@ class PatchSVAE(nn.Module):
         ])
 
         # Boundary smoothing
-        self.boundary_smooth = BoundarySmooth(channels=channels, mid=smooth_mid)
+        self.boundary_smooth = BoundarySmooth(
+            channels=channels, mid=smooth_mid,
+            activation=self.activations['boundary_smooth'],
+        )
 
         # L group: optional init override
         if init_scheme != 'orthogonal':
@@ -502,8 +611,12 @@ class PatchSVAE(nn.Module):
     def _svd(self, A: torch.Tensor):
         """SVD via Gram-eigh. Routes to conduit if configured.
 
-        solver='default': standard FLEigh, no telemetry
-        solver='conduit': FLEighConduit, stores ConduitPacket in self.last_conduit_packet
+        solver='default': geolip-core batched_svd dispatcher, parameterized by
+                          self.svd_method and self.svd_compute_dtype. No
+                          telemetry; for D∈{2..6} on CUDA+Triton this hits
+                          the fused N=4/etc. kernel.
+        solver='conduit': FLEighConduit. Owns dispatch — svd_method ignored.
+                          Stores ConduitPacket in self.last_conduit_packet.
         """
         if self.solver == 'conduit':
             conduit_solver = self._get_conduit_solver()
@@ -512,7 +625,10 @@ class PatchSVAE(nn.Module):
             return U, S, Vh
         else:
             self.last_conduit_packet = None
-            return gram_eigh_svd(A)
+            return gram_eigh_svd(
+                A, method=self.svd_method,
+                compute_dtype=self.svd_compute_dtype,
+            )
 
     def encode_patches(self, patches: torch.Tensor) -> dict:
         """Encode patches to omega tokens.
@@ -630,8 +746,10 @@ class PatchSVAE(nn.Module):
         # Reconstruct matrix from SVD components
         M_hat = torch.bmm(U_flat * S_flat.unsqueeze(1), Vt_flat)
 
-        # Residual MLP decoder
-        h = F.gelu(self.dec_in(M_hat.reshape(B * N, -1)))
+        # Residual MLP decoder — outer activation is configurable via
+        # self.activations['dec_in'] (defaults to GELU).
+        dec_in_act = ACTIVATIONS[self.activations['dec_in']]
+        h = dec_in_act(self.dec_in(M_hat.reshape(B * N, -1)))
         for block in self.dec_blocks:
             h = h + block(h)
 
