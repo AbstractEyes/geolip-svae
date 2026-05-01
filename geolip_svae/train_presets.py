@@ -321,10 +321,11 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     ),
 
     # ── H2-class (sphere-solver, the architecture used by h2-64 batteries) ──
-    'h2_64_single_svd': dict(
+    'h2_64_single_svd_triton': dict(
         # H2_linear_matched architecture
         V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
         smooth_mid=16,
+        svd_method='triton',
         #linear_readout=True, svd_mode='none', match_params=True,
         # Training — gaussian only by default (foundation)
         dataset='omega_noise', img_size=64, batch_size=128,
