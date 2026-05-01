@@ -276,15 +276,31 @@ class SpectralCrossAttention(nn.Module):
 
         Returns:
             S_coordinated: (B, N, D) — spectrally coordinated values
+
+        Notes
+        -----
+        Uses ``F.scaled_dot_product_attention`` so the N×N attention matrix
+        is never materialized — PyTorch routes to FlashAttention-2 (fp16/bf16
+        + Ampere+) or the memory-efficient backend (fp32, all CUDA),
+        both O(B·H·N·head_dim) memory instead of O(B·H·N²). At large N
+        (e.g. 512×512 images with patch_size=4 → N=16384) the explicit
+        QKᵀ approach allocates >100 GiB and OOMs; SDPA stays bounded.
+        Math is identical (default scale = head_dim**-0.5, same softmax,
+        no mask/dropout) — state_dict shapes unchanged, so older
+        checkpoints reload bit-for-bit.
         """
         B, N, D = S.shape
         S_n = self.norm(S)
         qkv = self.qkv(S_n).reshape(B, N, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        # Memory-efficient attention; equivalent to:
+        #   attn = (q @ k.transpose(-2, -1)) * self.scale
+        #   attn = attn.softmax(dim=-1)
+        #   out  = attn @ v
+        # but never allocates the (B, n_heads, N, N) attention matrix.
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, N, D)
         gate = torch.tanh(self.out_proj(out))
         alpha = self.alpha.unsqueeze(0).unsqueeze(0)
         return S * (1.0 + alpha * gate)
@@ -843,29 +859,3 @@ class PatchSVAE(nn.Module):
         # Decode → stitch → smooth
         decoded = self.decode_patches(svd['U'], svd['S'], svd['Vt'])
         recon = stitch_patches(decoded, gh, gw, ps, channels=self.channels)
-        recon = self.boundary_smooth(recon)
-
-        return {'recon': recon, 'svd': svd}
-
-    @staticmethod
-    def effective_rank(S: torch.Tensor) -> torch.Tensor:
-        """Effective rank of singular value distribution.
-
-        erank = exp(-Σ p_i log p_i) where p_i = σ_i / Σσ
-
-        Architectural constant ≈ 15.88 for D=16.
-        """
-        p = S / (S.sum(-1, keepdim=True) + 1e-8)
-        p = p.clamp(min=1e-8)
-        return (-(p * p.log()).sum(-1)).exp()
-
-    @staticmethod
-    def s_delta(S_orig: torch.Tensor, S_coord: torch.Tensor) -> float:
-        """Mean absolute spectral shift from cross-attention.
-
-        Converges to modality-specific binding constants:
-            Images:  ~0.238
-            Noise:   ~0.350-0.407
-            Text:    ~0.350
-        """
-        return (S_coord - S_orig).abs().mean().item()
