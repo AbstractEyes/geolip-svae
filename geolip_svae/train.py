@@ -87,11 +87,11 @@ except Exception:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PRESETS — moved to geolip_svae.train_config
+# PRESETS — moved to geolip_svae.train_presets
 # ═══════════════════════════════════════════════════════════════════
 # Re-imported here so existing callers
 # (``from geolip_svae.train import PRESETS``) keep working.
-from geolip_svae.train_config import PRESETS
+from geolip_svae.train_presets import PRESETS
 
 
 
