@@ -532,63 +532,70 @@ def _brown_noise(shape):
     )
 
 
-def _generate_noise(noise_type, s, rng):
+def _generate_noise(noise_type, s, rng, channels: int = 3):
+    """Generate one noise image of shape ``(channels, s, s)``.
+
+    The 16 noise types preserve their statistical character regardless of
+    channel count; ``channels`` only changes how many parallel channels
+    are produced. Default 3 reproduces the original RGB-shaped noise.
+    """
+    C = channels
     if noise_type == 0:
-        return torch.randn(3, s, s)
+        return torch.randn(C, s, s)
     elif noise_type == 1:
-        return torch.rand(3, s, s) * 2 - 1
+        return torch.rand(C, s, s) * 2 - 1
     elif noise_type == 2:
-        return (torch.rand(3, s, s) - 0.5) * 4
+        return (torch.rand(C, s, s) - 0.5) * 4
     elif noise_type == 3:
         lam = rng.uniform(0.5, 20.0)
-        return torch.poisson(torch.full((3, s, s), lam)) / lam - 1.0
+        return torch.poisson(torch.full((C, s, s), lam)) / lam - 1.0
     elif noise_type == 4:
-        img = _pink_noise((3, s, s)); return img / (img.std() + 1e-8)
+        img = _pink_noise((C, s, s)); return img / (img.std() + 1e-8)
     elif noise_type == 5:
-        img = _brown_noise((3, s, s)); return img / (img.std() + 1e-8)
+        img = _brown_noise((C, s, s)); return img / (img.std() + 1e-8)
     elif noise_type == 6:
-        img = torch.where(torch.rand(3, s, s) > 0.5,
-                          torch.ones(3, s, s) * 2, -torch.ones(3, s, s) * 2)
-        return img + torch.randn(3, s, s) * 0.1
+        img = torch.where(torch.rand(C, s, s) > 0.5,
+                          torch.ones(C, s, s) * 2, -torch.ones(C, s, s) * 2)
+        return img + torch.randn(C, s, s) * 0.1
     elif noise_type == 7:
-        return torch.randn(3, s, s) * (torch.rand(3, s, s) > 0.9).float() * 3
+        return torch.randn(C, s, s) * (torch.rand(C, s, s) > 0.9).float() * 3
     elif noise_type == 8:
         b = rng.randint(2, 16)
-        sm = torch.randn(3, s // b + 1, s // b + 1)
+        sm = torch.randn(C, s // b + 1, s // b + 1)
         return F.interpolate(sm.unsqueeze(0), size=s, mode='nearest').squeeze(0)
     elif noise_type == 9:
         gy = torch.linspace(-2, 2, s).unsqueeze(1).expand(s, s)
         gx = torch.linspace(-2, 2, s).unsqueeze(0).expand(s, s)
         a = rng.uniform(0, 2 * math.pi)
         return ((math.cos(a) * gx + math.sin(a) * gy)
-                .unsqueeze(0).expand(3, -1, -1)
-                + torch.randn(3, s, s) * 0.5)
+                .unsqueeze(0).expand(C, -1, -1)
+                + torch.randn(C, s, s) * 0.5)
     elif noise_type == 10:
         cs = rng.randint(2, 16)
         cy = torch.arange(s) // cs; cx = torch.arange(s) // cs
         return (((cy.unsqueeze(1) + cx.unsqueeze(0)) % 2).float()
-                .unsqueeze(0).expand(3, -1, -1) * 2 - 1
-                + torch.randn(3, s, s) * 0.3)
+                .unsqueeze(0).expand(C, -1, -1) * 2 - 1
+                + torch.randn(C, s, s) * 0.3)
     elif noise_type == 11:
         alpha = rng.uniform(0.2, 0.8)
-        return alpha * torch.randn(3, s, s) + (1 - alpha) * (torch.rand(3, s, s) * 2 - 1)
+        return alpha * torch.randn(C, s, s) + (1 - alpha) * (torch.rand(C, s, s) * 2 - 1)
     elif noise_type == 12:
-        img = torch.zeros(3, s, s); h2 = s // 2
-        img[:, :h2, :h2] = torch.randn(3, h2, h2)
-        img[:, :h2, h2:] = torch.rand(3, h2, h2) * 2 - 1
-        img[:, h2:, :h2] = _pink_noise((3, h2, h2)) / 2
-        img[:, h2:, h2:] = torch.where(torch.rand(3, h2, h2) > 0.5,
-                                         torch.ones(3, h2, h2),
-                                         -torch.ones(3, h2, h2))
+        img = torch.zeros(C, s, s); h2 = s // 2
+        img[:, :h2, :h2] = torch.randn(C, h2, h2)
+        img[:, :h2, h2:] = torch.rand(C, h2, h2) * 2 - 1
+        img[:, h2:, :h2] = _pink_noise((C, h2, h2)) / 2
+        img[:, h2:, h2:] = torch.where(torch.rand(C, h2, h2) > 0.5,
+                                         torch.ones(C, h2, h2),
+                                         -torch.ones(C, h2, h2))
         return img
     elif noise_type == 13:
-        return torch.tan(math.pi * (torch.rand(3, s, s) - 0.5)).clamp(-3, 3)
+        return torch.tan(math.pi * (torch.rand(C, s, s) - 0.5)).clamp(-3, 3)
     elif noise_type == 14:
-        return torch.empty(3, s, s).exponential_(1.0) - 1.0
+        return torch.empty(C, s, s).exponential_(1.0) - 1.0
     elif noise_type == 15:
-        u = torch.rand(3, s, s) - 0.5
+        u = torch.rand(C, s, s) - 0.5
         return -torch.sign(u) * torch.log1p(-2 * u.abs())
-    return torch.randn(3, s, s)
+    return torch.randn(C, s, s)
 
 
 class CurriculumNoiseDataset(torch.utils.data.Dataset):
@@ -597,9 +604,11 @@ class CurriculumNoiseDataset(torch.utils.data.Dataset):
     `allowed_types` overrides the curriculum entirely if provided.
     """
 
-    def __init__(self, size=500000, img_size=64, allowed_types=None):
+    def __init__(self, size=500000, img_size=64, allowed_types=None,
+                 channels: int = 3):
         self.size = size
         self.img_size = img_size
+        self.channels = channels
         self._rng = np.random.RandomState(42)
         self._call_count = 0
         if allowed_types is not None:
@@ -627,7 +636,9 @@ class CurriculumNoiseDataset(torch.utils.data.Dataset):
             self._rng = np.random.RandomState(int.from_bytes(os.urandom(4), 'big'))
             torch.manual_seed(int.from_bytes(os.urandom(4), 'big'))
         noise_type = self.active_types[idx % len(self.active_types)]
-        img = _generate_noise(noise_type, self.img_size, self._rng).clamp(-4, 4)
+        img = _generate_noise(
+            noise_type, self.img_size, self._rng, self.channels,
+        ).clamp(-4, 4)
         return img.float(), noise_type
 
 
@@ -638,9 +649,11 @@ class OmegaNoiseDataset(torch.utils.data.Dataset):
     runs pass allowed_types=[0]. Custom subsets are passed as iterables.
     """
 
-    def __init__(self, size=1280000, img_size=128, allowed_types=None):
+    def __init__(self, size=1280000, img_size=128, allowed_types=None,
+                 channels: int = 3):
         self.size = size
         self.img_size = img_size
+        self.channels = channels
         self._rng = np.random.RandomState(42)
         self._call_count = 0
         self.active_types = (list(allowed_types) if allowed_types is not None
@@ -655,7 +668,9 @@ class OmegaNoiseDataset(torch.utils.data.Dataset):
             self._rng = np.random.RandomState(int.from_bytes(os.urandom(4), 'big'))
             torch.manual_seed(int.from_bytes(os.urandom(4), 'big'))
         noise_type = self.active_types[idx % len(self.active_types)]
-        img = _generate_noise(noise_type, self.img_size, self._rng).clamp(-4, 4)
+        img = _generate_noise(
+            noise_type, self.img_size, self._rng, self.channels,
+        ).clamp(-4, 4)
         return img.float(), noise_type
 
 
@@ -1324,7 +1339,8 @@ def byte_recovery_metrics(orig_bytes: torch.Tensor,
 # PER-TYPE EVALUATION
 # ═══════════════════════════════════════════════════════════════════
 
-def eval_per_type(model, active_types, img_size, device, n_per_type=64):
+def eval_per_type(model, active_types, img_size, device, n_per_type=64,
+                   channels: int = 3):
     """MSE for each active noise type."""
     rng = np.random.RandomState(99)
     model.eval()
@@ -1332,7 +1348,7 @@ def eval_per_type(model, active_types, img_size, device, n_per_type=64):
     with torch.no_grad():
         for t in active_types:
             imgs = torch.stack([
-                _generate_noise(t, img_size, rng).clamp(-4, 4)
+                _generate_noise(t, img_size, rng, channels).clamp(-4, 4)
                 for _ in range(n_per_type)
             ]).to(device)
             out = model(imgs)
@@ -1480,9 +1496,11 @@ def train(cfg: Dict[str, Any]):
         ds_size = cfg.get('ds_size', 500_000)
         val_size = cfg.get('val_size', 10_000)
         train_ds = CurriculumNoiseDataset(size=ds_size, img_size=img_size,
-                                           allowed_types=allowed_types)
+                                           allowed_types=allowed_types,
+                                           channels=channels)
         val_ds = CurriculumNoiseDataset(size=val_size, img_size=img_size,
-                                         allowed_types=allowed_types)
+                                         allowed_types=allowed_types,
+                                         channels=channels)
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             num_workers=4, pin_memory=True, drop_last=True)
@@ -1496,14 +1514,18 @@ def train(cfg: Dict[str, Any]):
         val_size = cfg.get('val_size', 10_000)
         if dataset == 'scheduled_noise':
             train_ds = CurriculumNoiseDataset(size=ds_size, img_size=img_size,
-                                               allowed_types=allowed_types)
+                                               allowed_types=allowed_types,
+                                               channels=channels)
             val_ds = CurriculumNoiseDataset(size=val_size, img_size=img_size,
-                                             allowed_types=allowed_types)
+                                             allowed_types=allowed_types,
+                                             channels=channels)
         else:
             train_ds = OmegaNoiseDataset(size=ds_size, img_size=img_size,
-                                          allowed_types=allowed_types)
+                                          allowed_types=allowed_types,
+                                          channels=channels)
             val_ds = OmegaNoiseDataset(size=val_size, img_size=img_size,
-                                        allowed_types=allowed_types)
+                                        allowed_types=allowed_types,
+                                        channels=channels)
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             num_workers=4, pin_memory=True, drop_last=True)
@@ -1818,7 +1840,10 @@ def train(cfg: Dict[str, Any]):
             ds_obj = train_loader.dataset
             if hasattr(ds_obj, 'active_types'):
                 active = ds_obj.active_types
-            type_mse = eval_per_type(model, active, img_size, device, n_per_type=32)
+            type_mse = eval_per_type(
+                model, active, img_size, device,
+                n_per_type=32, channels=channels,
+            )
             type_str = " ".join(f"{NOISE_NAMES[t][:4]}={v:.3f}"
                                   for t, v in sorted(type_mse.items()))
 
@@ -2135,4 +2160,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main(['--preset', 'h2_64_5channel'])
+    main(['--preset', 'h2_64_1channel'])
