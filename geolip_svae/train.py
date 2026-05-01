@@ -674,13 +674,15 @@ def train(cfg: Dict[str, Any]):
     if tier_schedule:
         print(f"  Tier schedule: {tier_schedule}")
     if is_tree:
+        _tds = train_loader.dataset
         print(f"  Tree depth: {tree_depth}, "
-              f"n_nodes: {train_ds.n_nodes}, n_pad: {train_ds.n_pad}")
+              f"n_nodes: {_tds.n_nodes}, n_pad: {_tds.n_pad}")
     if is_sentencepiece:
+        _tds = train_loader.dataset
         print(f"  SP tokenizer: {cfg.get('sp_tokenizer', 'google-t5/t5-base')}, "
               f"corpus: {cfg.get('sp_corpus', 'wikitext-2-raw-v1')}, "
               f"n_bits: {cfg.get('sp_n_bits', 16)}, "
-              f"vocab: {train_ds.vocab_size}, tokens/img: {train_ds.n_patches}")
+              f"vocab: {_tds.vocab_size}, tokens/img: {_tds.n_patches}")
     print("=" * 100)
 
     # ── Helpers ──
@@ -1184,4 +1186,30 @@ def main(argv=None):
             if cfg.get('linear_readout'):
                 arch_tags.append('lin_readout')
             if cfg.get('svd_mode', 'default') != 'default':
-                a
+                arch_tags.append(f"svd={cfg['svd_mode']}")
+            arch = f" [{'+'.join(arch_tags)}]" if arch_tags else ""
+            pre = cfg.get('pretrained', 'scratch')
+            print(f"  {name:<22s} {ds:<20s} {sz}×{sz}  {ep:>3d} ep"
+                  f"  V={cfg['V']:<3d} D={cfg['D']:<3d}{arch}  from={pre}")
+        return
+
+    if not args.preset:
+        parser.print_help()
+        print("\nPresets:")
+        for name in PRESETS:
+            print(f"  {name}")
+        return
+
+    cfg = dict(PRESETS[args.preset])
+    if args.epochs is not None:
+        cfg['epochs'] = args.epochs
+    if args.no_upload:
+        cfg['upload'] = False
+
+    torch.set_float32_matmul_precision('high')
+    train(cfg)
+
+
+if __name__ == "__main__":
+    main()
+    #main(['--preset', 'h2_64_1channel'])
