@@ -35,12 +35,60 @@ recon to compute per-token recovery metrics.
 """
 from __future__ import annotations
 
+import gc
+import os
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+
+# ── Diagnostic timing + memory probe ────────────────────────────────
+# psutil ships with Colab. Fall back to resource.getrusage on any machine
+# where psutil is missing — both report process RSS.
+
+try:
+    import psutil
+    _PROC = psutil.Process(os.getpid())
+    def _rss_gb() -> float:
+        return _PROC.memory_info().rss / (1024 ** 3)
+except Exception:
+    import resource
+    def _rss_gb() -> float:
+        # Linux: ru_maxrss is kilobytes; macOS: bytes.
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return kb / (1024 ** 2)
+
+
+class _Step:
+    """Context manager that prints elapsed wall time + RSS delta around a
+    block. Output goes to stderr with explicit flush so prints don't get
+    buffered behind a long computation. Format::
+
+        [vocab_trigram] <label>... done in 12.3s (RSS 5.42 GB, +1.20 GB)
+    """
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __enter__(self) -> '_Step':
+        self.t0 = time.time()
+        self.rss0 = _rss_gb()
+        sys.stderr.write(f'  [vocab_trigram] {self.label}... ')
+        sys.stderr.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        dt = time.time() - self.t0
+        rss = _rss_gb()
+        sys.stderr.write(
+            f'done in {dt:.1f}s (RSS {rss:.2f} GB, '
+            f'{"+"if rss>=self.rss0 else ""}{rss-self.rss0:+.2f} GB)\n'
+        )
+        sys.stderr.flush()
 
 
 # ── Tokenizer + corpus loaders ──────────────────────────────────────
@@ -55,26 +103,37 @@ def _load_corpus_text(corpus_id: str, split: str = 'train',
                        max_chars: Optional[int] = None) -> str:
     """Load a corpus from HF datasets and return as a single concatenated string."""
     from datasets import load_dataset
-    if '/' in corpus_id:
-        repo, config = corpus_id.split('/', 1)
-        ds = load_dataset(repo, config, split=split)
-    else:
-        # wikitext-2-raw-v1 etc. — known shorthand for the wikitext repo
-        if corpus_id.startswith('wikitext'):
-            ds = load_dataset('Salesforce/wikitext', corpus_id, split=split)
+    with _Step(f"load_dataset({corpus_id!r}, split={split!r})"):
+        if '/' in corpus_id:
+            repo, config = corpus_id.split('/', 1)
+            ds = load_dataset(repo, config, split=split)
         else:
-            ds = load_dataset(corpus_id, split=split)
-    out_parts: List[str] = []
-    total = 0
-    for row in ds:
-        text = row.get('text') or row.get('content') or ''
-        if not text:
-            continue
-        out_parts.append(text)
-        total += len(text)
-        if max_chars is not None and total >= max_chars:
-            break
-    return '\n'.join(out_parts)
+            if corpus_id.startswith('wikitext'):
+                ds = load_dataset('Salesforce/wikitext', corpus_id, split=split)
+            else:
+                ds = load_dataset(corpus_id, split=split)
+
+    with _Step(f"iterate {len(ds):,} rows -> str (max_chars={max_chars})"):
+        out_parts: List[str] = []
+        total = 0
+        for row in ds:
+            text = row.get('text') or row.get('content') or ''
+            if not text:
+                continue
+            out_parts.append(text)
+            total += len(text)
+            if max_chars is not None and total >= max_chars:
+                break
+        sys.stderr.write(f'(parts={len(out_parts):,}, total_chars={total:,}) ')
+        sys.stderr.flush()
+
+    with _Step("join parts -> single str"):
+        joined = '\n'.join(out_parts)
+        sys.stderr.write(f'(len={len(joined):,}) ')
+        sys.stderr.flush()
+    del out_parts
+    gc.collect()
+    return joined
 
 
 # ── Token-aware byte stream ─────────────────────────────────────────
@@ -108,26 +167,24 @@ _STREAM_CACHE: Dict[Tuple[str, str, int, Optional[int]], 'TokenizedStream'] = {}
 def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
     """Build (or fetch from cache) the lookup [vocab_id -> utf-8 bytes].
 
-    This decodes each vocab token EXACTLY ONCE. For T5-base that's 32128
-    decode calls regardless of corpus size — vs the previous per-token
-    decode in the corpus loop which scales with the corpus (~150M calls
-    for full wikitext-103 = 25-125 minutes of pure decode overhead).
-
-    Cache key is the tokenizer's name_or_path so the second dataset
-    instantiation in the same process (e.g. test_ds in vocab_trigram_factory)
-    pays nothing.
+    Decodes each vocab token EXACTLY ONCE. ~32128 calls for T5-base
+    regardless of corpus size, ~1-2s. Cached at module level keyed on
+    the tokenizer's name_or_path.
     """
     key = getattr(tokenizer, 'name_or_path', repr(tokenizer))
     cached = _VOCAB_BYTES_CACHE.get(key)
     if cached is not None:
+        sys.stderr.write(f'  [vocab_trigram] vocab_id_to_bytes: cache hit ({key})\n')
+        sys.stderr.flush()
         return cached
 
-    vocab_size = tokenizer.vocab_size
-    table: List[bytes] = [b''] * vocab_size
-    for tid in range(vocab_size):
-        s = tokenizer.decode([tid], skip_special_tokens=False,
-                              clean_up_tokenization_spaces=False)
-        table[tid] = s.encode('utf-8')
+    with _Step(f"build vocab lookup ({tokenizer.vocab_size} tokens)"):
+        vocab_size = tokenizer.vocab_size
+        table: List[bytes] = [b''] * vocab_size
+        for tid in range(vocab_size):
+            s = tokenizer.decode([tid], skip_special_tokens=False,
+                                  clean_up_tokenization_spaces=False)
+            table[tid] = s.encode('utf-8')
     _VOCAB_BYTES_CACHE[key] = table
     return table
 
@@ -135,53 +192,103 @@ def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
 def _build_tokenized_stream(text: str, tokenizer) -> TokenizedStream:
     """Tokenize text and emit a byte stream plus per-token boundaries.
 
-    Implementation:
-        1. Tokenize the corpus in one shot (single Rust call).
-        2. Look up each token's byte form via a precomputed
-           vocab_size-sized table (built once per tokenizer, cached).
-        3. Compute per-token byte_lengths via numpy fancy indexing.
-        4. Concatenate the byte stream via b''.join (C-implemented).
-
-    No per-token Python work scales with the corpus.
+    Heavily instrumented because this is where multi-GB allocations happen.
+    Each step prints elapsed wall time + current RSS + delta so the
+    runtime memory profile is observable during the slow build.
     """
     # Stream-level cache — same tokenizer + same text → reuse.
     cache_key = (
         getattr(tokenizer, 'name_or_path', repr(tokenizer)),
-        # Hash a prefix of the text (full hash on 500MB is also fine but
-        # this is sufficient given the corpus_id is part of the key path
-        # at the dataset level too).
         text[:256],
         len(text),
         None,
     )
     cached_stream = _STREAM_CACHE.get(cache_key)
     if cached_stream is not None:
+        sys.stderr.write(
+            f'  [vocab_trigram] _build_tokenized_stream: stream cache hit '
+            f'({len(cached_stream.bytes_arr):,} bytes, '
+            f'{len(cached_stream.token_ids):,} tokens)\n'
+        )
+        sys.stderr.flush()
         return cached_stream
 
-    # 1. One-shot tokenization (single Rust call regardless of corpus size).
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=False)
-    ids_list: List[int] = enc['input_ids']
-    ids_arr = np.asarray(ids_list, dtype=np.int64)
+    sys.stderr.write(
+        f'  [vocab_trigram] === build_tokenized_stream START '
+        f'(text_len={len(text):,} chars, tokenizer={getattr(tokenizer, "name_or_path", "?")}) ===\n'
+        f'  [vocab_trigram] starting RSS: {_rss_gb():.2f} GB\n'
+    )
+    sys.stderr.flush()
 
-    # 2. Vocab → bytes lookup (built once per tokenizer, cached).
+    # 1. Tokenize. Single Rust call. Returns BatchEncoding holding a
+    #    Python list of ~150M ints for full wikitext-103 train. The list
+    #    itself can balloon to ~5+ GB of Python overhead (each int boxed).
+    with _Step(f"tokenizer(text, add_special_tokens=False)"):
+        enc = tokenizer(text, add_special_tokens=False,
+                        return_offsets_mapping=False,
+                        return_attention_mask=False,
+                        return_token_type_ids=False)
+        ids_list: List[int] = enc['input_ids']
+        n_tokens = len(ids_list)
+        sys.stderr.write(f'(n_tokens={n_tokens:,}) ')
+        sys.stderr.flush()
+    # Drop the BatchEncoding wrapper + source text — not needed past this
+    # point. Source text dominates the closure here for big corpora.
+    del enc
+    gc.collect()
+
+    # 2. Convert ids list -> int64 array. ~1.2 GB for 150M tokens.
+    with _Step(f"np.asarray(ids, int64) [n={n_tokens:,}]"):
+        ids_arr = np.asarray(ids_list, dtype=np.int64)
+    # Free the Python list immediately — it's now redundant with ids_arr
+    # and was the largest single Python-overhead allocation in this fn.
+    del ids_list
+    gc.collect()
+    sys.stderr.write(f'  [vocab_trigram] post-list-del RSS: {_rss_gb():.2f} GB\n')
+    sys.stderr.flush()
+
+    # 3. Vocab lookup (cached after first call per tokenizer).
     id_to_bytes = _vocab_id_to_bytes(tokenizer)
 
-    # 3. Per-token byte lengths via fancy indexing.
-    length_lookup = np.fromiter(
-        (len(b) for b in id_to_bytes),
-        dtype=np.int64, count=len(id_to_bytes),
-    )
-    byte_lengths = length_lookup[ids_arr]            # O(N) numpy op
+    # 4. Per-token byte lengths via fancy indexing.
+    with _Step(f"fancy-index byte_lengths [n={n_tokens:,}]"):
+        length_lookup = np.fromiter(
+            (len(b) for b in id_to_bytes),
+            dtype=np.int64, count=len(id_to_bytes),
+        )
+        byte_lengths = length_lookup[ids_arr]
 
-    # 4. Cumulative byte offsets — sentinel includes total length.
-    starts = np.empty(len(ids_arr) + 1, dtype=np.int64)
-    starts[0] = 0
-    np.cumsum(byte_lengths, out=starts[1:])
+    # 5. Cumulative byte offsets — sentinel includes total length.
+    with _Step(f"cumsum -> token_starts [n={n_tokens+1:,}]"):
+        starts = np.empty(n_tokens + 1, dtype=np.int64)
+        starts[0] = 0
+        np.cumsum(byte_lengths, out=starts[1:])
+        total_bytes = int(starts[-1])
+        sys.stderr.write(f'(total_bytes={total_bytes:,}) ')
+        sys.stderr.flush()
+    del byte_lengths
+    gc.collect()
 
-    # 5. Concatenate the byte stream. b''.join is C-speed; the genexpr
-    #    indexes a precomputed list, no per-element Python computation.
-    bytes_blob = b''.join(id_to_bytes[i] for i in ids_list)
-    bytes_arr = np.frombuffer(bytes_blob, dtype=np.uint8).copy()
+    # 6. Concatenate the byte stream. b''.join over the ids_arr — but we
+    #    need a Python iterable of bytes objects. Walking ids_arr through
+    #    a precomputed lookup is the lightest path. For 150M tokens this
+    #    is the second-biggest hit (after step 1) — both wall time and
+    #    peak RAM (the resulting blob is ~600 MB for full wikitext-103).
+    with _Step(f"b''.join byte stream [n={n_tokens:,} -> {total_bytes:,} B]"):
+        # tolist() once is faster than iterating ids_arr through numpy
+        # __getitem__ which boxes each element.
+        ids_for_join = ids_arr.tolist()
+        bytes_blob = b''.join(id_to_bytes[i] for i in ids_for_join)
+        del ids_for_join
+    gc.collect()
+
+    # 7. Final byte_arr (frombuffer + copy = own the memory; allows del bytes_blob).
+    with _Step(f"np.frombuffer copy -> bytes_arr [{len(bytes_blob):,} B]"):
+        bytes_arr = np.frombuffer(bytes_blob, dtype=np.uint8).copy()
+    del bytes_blob
+    gc.collect()
+    sys.stderr.write(f'  [vocab_trigram] post-blob-del RSS: {_rss_gb():.2f} GB\n')
+    sys.stderr.flush()
 
     stream = TokenizedStream(
         bytes_arr=bytes_arr,
@@ -242,13 +349,27 @@ class VocabTrigramDataset(Dataset):
         # which gives reproducible per-sample offset arithmetic.
         self.stride = stride if stride is not None else self.bytes_per_image
 
+        sys.stderr.write(
+            f'\n  [vocab_trigram] === VocabTrigramDataset.__init__ '
+            f'(corpus={corpus!r}, split={split!r}, '
+            f'n_samples={n_samples:,}, img={img_size}x{img_size}x{channels}, '
+            f'bytes/image={self.bytes_per_image:,}) ===\n'
+            f'  [vocab_trigram] starting RSS: {_rss_gb():.2f} GB\n'
+        )
+        sys.stderr.flush()
+
         # 1. Load corpus + tokenizer
         text = _load_corpus_text(corpus, split=split, max_chars=max_corpus_chars)
-        tok = _load_tokenizer(tokenizer)
+        with _Step(f"AutoTokenizer.from_pretrained({tokenizer!r})"):
+            tok = _load_tokenizer(tokenizer)
         self.tokenizer_name = tokenizer
 
         # 2. Tokenize and build the byte stream
         self.stream = _build_tokenized_stream(text, tok)
+        # Drop source text — _build_tokenized_stream copied what it needs.
+        del text
+        gc.collect()
+
         self.vocab_size = self.stream.vocab_size
         if len(self.stream.bytes_arr) < self.bytes_per_image:
             raise RuntimeError(
@@ -258,24 +379,32 @@ class VocabTrigramDataset(Dataset):
             )
 
         # 3. Pre-compute per-sample byte windows (random offsets, fixed seed)
-        rng = np.random.default_rng(seed)
-        max_offset = len(self.stream.bytes_arr) - self.bytes_per_image
-        self._offsets = rng.integers(0, max_offset + 1, size=n_samples,
-                                      dtype=np.int64)
+        with _Step(f"sample offsets (n_samples={n_samples:,})"):
+            rng = np.random.default_rng(seed)
+            max_offset = len(self.stream.bytes_arr) - self.bytes_per_image
+            self._offsets = rng.integers(0, max_offset + 1, size=n_samples,
+                                          dtype=np.int64)
 
-        # 4. Pre-compute per-sample token boundary slices.
-        # For each sample we record the indices into stream.token_starts of
-        # the tokens whose first byte falls within [offset, offset+capacity).
-        # The boundary array per sample is then
-        # stream.token_starts[lo:hi+1] - offset (relative to the image).
-        self._sample_lo = np.empty(n_samples, dtype=np.int64)
-        self._sample_hi = np.empty(n_samples, dtype=np.int64)
-        ts = self.stream.token_starts
-        # token_starts is sorted. For each sample, find the first token
-        # whose start >= offset, and the first token whose start >= offset+cap.
-        offsets_end = self._offsets + self.bytes_per_image
-        self._sample_lo[:] = np.searchsorted(ts, self._offsets, side='left')
-        self._sample_hi[:] = np.searchsorted(ts, offsets_end, side='left')
+        # 4. Pre-compute per-sample token boundary slices via two binary
+        # searches. searchsorted on n_samples=1M against ~150M token_starts
+        # is ~1-2s each; this is the last step that scales with n_samples.
+        with _Step(f"searchsorted boundaries (n_samples={n_samples:,} vs "
+                    f"n_tokens={len(self.stream.token_starts):,})"):
+            self._sample_lo = np.empty(n_samples, dtype=np.int64)
+            self._sample_hi = np.empty(n_samples, dtype=np.int64)
+            ts = self.stream.token_starts
+            offsets_end = self._offsets + self.bytes_per_image
+            self._sample_lo[:] = np.searchsorted(ts, self._offsets, side='left')
+            self._sample_hi[:] = np.searchsorted(ts, offsets_end, side='left')
+
+        sys.stderr.write(
+            f'  [vocab_trigram] === __init__ DONE — '
+            f'final RSS: {_rss_gb():.2f} GB '
+            f'(stream: {len(self.stream.bytes_arr):,} B, '
+            f'{len(self.stream.token_ids):,} tokens; '
+            f'{n_samples:,} sample windows pre-computed) ===\n'
+        )
+        sys.stderr.flush()
 
     # ── Trainer-compatible interface ────────────────────────────────
 
