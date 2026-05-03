@@ -94,8 +94,33 @@ class _Step:
 # ── Tokenizer + corpus loaders ──────────────────────────────────────
 
 def _load_tokenizer(name: str):
-    """Load an HF AutoTokenizer (handles sentencepiece, BPE, and wordpiece)."""
+    """Load an HF AutoTokenizer, FORCING the Rust-fast path.
+
+    `use_fast=True` is just a hint — AutoTokenizer silently falls back to
+    the slow Python class if the matching Fast subclass isn't importable
+    (e.g. `tokenizers` package missing/incompatible). For T5 specifically
+    we explicitly try `T5TokenizerFast` first and fail loudly if it's not
+    available — slow T5Tokenizer at ~1 MB/s on 500 MB of text is a
+    multi-minute trap that's better surfaced than silently endured.
+    """
     from transformers import AutoTokenizer
+    if 't5' in name.lower():
+        try:
+            from transformers import T5TokenizerFast
+            tok = T5TokenizerFast.from_pretrained(name)
+            sys.stderr.write(
+                f'  [vocab_trigram] forced T5TokenizerFast '
+                f'(class={type(tok).__name__}, is_fast={getattr(tok, "is_fast", "?")})\n'
+            )
+            sys.stderr.flush()
+            return tok
+        except Exception as e:
+            sys.stderr.write(
+                f'  [vocab_trigram] T5TokenizerFast UNAVAILABLE ({type(e).__name__}: {e}) — '
+                f'falling back to AutoTokenizer with use_fast=True. '
+                f'Tokenization will likely run at slow-Python speed.\n'
+            )
+            sys.stderr.flush()
     return AutoTokenizer.from_pretrained(name, use_fast=True)
 
 
@@ -162,6 +187,66 @@ class TokenizedStream:
 
 _VOCAB_BYTES_CACHE: Dict[str, List[bytes]] = {}
 _STREAM_CACHE: Dict[Tuple[str, str, int, Optional[int]], 'TokenizedStream'] = {}
+
+# Disk cache root — where pre-tokenized streams persist across processes.
+# Override via SVAE_PROTO_CACHE_DIR env var if /content isn't writable.
+_DISK_CACHE_DIR = os.environ.get(
+    'SVAE_PROTO_CACHE_DIR',
+    os.path.expanduser('~/.cache/svae_proto/exp_001_vocab_trigram_recall'),
+)
+
+
+def _disk_cache_path(corpus_id: str, tokenizer_name: str,
+                      max_chars: Optional[int], split: str) -> str:
+    """Stable path for the cached TokenizedStream npz."""
+    import hashlib
+    key = f'{corpus_id}|{tokenizer_name}|{max_chars}|{split}'
+    h = hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]
+    safe = corpus_id.replace('/', '__').replace('-', '_')[:32]
+    return os.path.join(_DISK_CACHE_DIR, f'{safe}__{split}__{h}.npz')
+
+
+def _load_stream_from_disk(path: str) -> Optional['TokenizedStream']:
+    if not os.path.exists(path):
+        return None
+    with _Step(f"load disk cache {path}"):
+        try:
+            data = np.load(path, allow_pickle=False)
+            stream = TokenizedStream(
+                bytes_arr=data['bytes_arr'],
+                token_starts=data['token_starts'],
+                token_ids=data['token_ids'],
+                vocab_size=int(data['vocab_size']),
+            )
+            sys.stderr.write(
+                f'(stream: {len(stream.bytes_arr):,} B, '
+                f'{len(stream.token_ids):,} tokens) '
+            )
+            sys.stderr.flush()
+            return stream
+        except Exception as e:
+            sys.stderr.write(f'(load failed: {type(e).__name__}: {e}) ')
+            sys.stderr.flush()
+            return None
+
+
+def _save_stream_to_disk(path: str, stream: 'TokenizedStream') -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with _Step(f"save disk cache {path}"):
+        try:
+            # np.savez (NOT savez_compressed) — uncompressed write is much
+            # faster and load uses memmap-friendly format. ~3 GB total for
+            # full wikitext-103.
+            np.savez(path,
+                     bytes_arr=stream.bytes_arr,
+                     token_starts=stream.token_starts,
+                     token_ids=stream.token_ids,
+                     vocab_size=np.asarray(stream.vocab_size, dtype=np.int64))
+            sys.stderr.write(f'(written) ')
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f'(save failed: {type(e).__name__}: {e}) ')
+            sys.stderr.flush()
 
 
 def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
@@ -440,17 +525,42 @@ class VocabTrigramDataset(Dataset):
         )
         sys.stderr.flush()
 
-        # 1. Load corpus + tokenizer
-        text = _load_corpus_text(corpus, split=split, max_chars=max_corpus_chars)
-        with _Step(f"AutoTokenizer.from_pretrained({tokenizer!r})"):
-            tok = _load_tokenizer(tokenizer)
         self.tokenizer_name = tokenizer
 
-        # 2. Tokenize and build the byte stream
-        self.stream = _build_tokenized_stream(text, tok)
-        # Drop source text — _build_tokenized_stream copied what it needs.
-        del text
-        gc.collect()
+        # 1. Disk cache check FIRST — if a previous run cached this exact
+        # (corpus, tokenizer, max_chars, split) tuple to disk, load it
+        # directly and skip both the corpus iteration and the tokenize.
+        # Only the vocab_size needs the tokenizer; we'll lazy-load the
+        # tokenizer only on cache miss.
+        cache_path = _disk_cache_path(corpus, tokenizer, max_corpus_chars, split)
+        sys.stderr.write(
+            f'  [vocab_trigram] disk cache path: {cache_path}\n'
+        )
+        sys.stderr.flush()
+
+        cached = _load_stream_from_disk(cache_path)
+        if cached is not None:
+            self.stream = cached
+            sys.stderr.write(
+                f'  [vocab_trigram] disk cache HIT — '
+                f'skipping corpus load + tokenize\n'
+            )
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(
+                f'  [vocab_trigram] disk cache MISS — building stream...\n'
+            )
+            sys.stderr.flush()
+            # 2. Load corpus + tokenizer
+            text = _load_corpus_text(corpus, split=split, max_chars=max_corpus_chars)
+            with _Step(f"AutoTokenizer.from_pretrained({tokenizer!r})"):
+                tok = _load_tokenizer(tokenizer)
+            # 3. Tokenize and build the byte stream
+            self.stream = _build_tokenized_stream(text, tok)
+            del text, tok
+            gc.collect()
+            # 4. Persist for future runs
+            _save_stream_to_disk(cache_path, self.stream)
 
         self.vocab_size = self.stream.vocab_size
         if len(self.stream.bytes_arr) < self.bytes_per_image:
