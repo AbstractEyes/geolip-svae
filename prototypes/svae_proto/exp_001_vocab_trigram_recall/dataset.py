@@ -191,30 +191,26 @@ def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
 
 def _build_tokenized_stream(text: str, tokenizer,
                               chunk_chars: int = 2_000_000) -> TokenizedStream:
-    """Build byte stream + token boundaries via SOURCE-BYTES + CHUNKED tokenize.
+    """Build byte stream + token boundaries via VOCAB-LOOKUP + CHUNKED tokenize.
 
-    Memory peak is bounded by the chunk size, NOT the corpus size — for
-    full wikitext-103 (~540 MB text, ~150M tokens) peak stays around
-    5-6 GB instead of the 30-65 GB the single-shot tokenize hit.
+    Memory peak is bounded by chunk size, NOT corpus size. Tokenization
+    runs WITHOUT return_offsets_mapping which on T5's sentencepiece
+    backend triggers a slow per-character walk — observed at ~1 MB/s.
+    Without it, the same Fast tokenizer hits 30-100 MB/s.
 
     Approach:
-        1. byte_stream = text.encode('utf-8') ONCE — that's the byte_arr
-           we return. Source text bytes ARE the byte stream; no per-token
-           reconstruction needed.
-        2. Tokenize text in ~2 MB chunks with return_offsets_mapping=True
-           so each chunk gives us per-token CHAR offsets within the chunk.
-        3. Per chunk: build a small char→byte map (handles multi-byte UTF-8
-           chars correctly) and translate local char offsets to GLOBAL byte
-           offsets in the full byte stream.
-        4. Drop per-chunk intermediates aggressively; concatenate the
-           accumulated arrays at the end.
+        1. Build a vocab_id -> utf-8 bytes lookup table ONCE (32K calls).
+        2. Tokenize text in ~2 MB chunks (no offset_mapping).
+        3. Per chunk: compute per-token byte_lengths via fancy indexing,
+           cumsum to local byte starts, join token bytes via b''.join into
+           a chunk-scoped bytes blob.
+        4. Accumulate chunk_ids, chunk_byte_blobs, chunk_byte_starts.
+        5. Concatenate at end into final ids_arr / bytes_arr / token_starts.
 
-    Why this avoids the 65 GB blowup:
-        - No 150M-element Python list of ints (the BatchEncoding only ever
-          holds ~600K ints per chunk, immediately copied to numpy).
-        - No b''.join over 150M items + no precomputed vocab byte lookup.
-        - Single 540 MB allocation for the byte stream, lives once, no
-          intermediate bytes_blob copy.
+    The byte stream is the CANONICAL TOKEN form (sentencepiece's decode
+    of each token's id), not the raw source text bytes. For our purposes
+    this is identical: training sees these bytes, eval compares against
+    these bytes. Self-consistent.
     """
     # Stream-level cache — same tokenizer + same text → reuse.
     cache_key = (
@@ -235,44 +231,44 @@ def _build_tokenized_stream(text: str, tokenizer,
 
     n_chars = len(text)
     n_chunks = (n_chars + chunk_chars - 1) // chunk_chars
+    is_fast = bool(getattr(tokenizer, 'is_fast', False))
     sys.stderr.write(
         f'  [vocab_trigram] === build_tokenized_stream START '
         f'(text_len={n_chars:,} chars, '
-        f'tokenizer={getattr(tokenizer, "name_or_path", "?")}, '
-        f'strategy=source_bytes+chunked_tokenize, '
+        f'tokenizer={type(tokenizer).__name__} is_fast={is_fast}, '
+        f'strategy=vocab_lookup+chunked_tokenize, '
         f'n_chunks={n_chunks} of ~{chunk_chars:,} chars each) ===\n'
         f'  [vocab_trigram] starting RSS: {_rss_gb():.2f} GB\n'
     )
     sys.stderr.flush()
-
-    # 1. Source byte stream — single allocation.
-    with _Step(f"text.encode('utf-8')"):
-        text_bytes = text.encode('utf-8')
-        n_total_bytes = len(text_bytes)
-        sys.stderr.write(f'(total_bytes={n_total_bytes:,}) ')
+    if not is_fast:
+        sys.stderr.write(
+            f'  [vocab_trigram] WARNING: tokenizer.is_fast=False — '
+            f'falling back to slow Python tokenizer. Tokenization will be '
+            f'~30-100x slower than the Rust fast path. Install/upgrade '
+            f'`tokenizers` package and retry.\n'
+        )
         sys.stderr.flush()
 
-    with _Step(f"np.frombuffer(text_bytes, uint8).copy()"):
-        bytes_arr = np.frombuffer(text_bytes, dtype=np.uint8).copy()
-    del text_bytes
-    gc.collect()
-    sys.stderr.write(
-        f'  [vocab_trigram] post-byte-encode RSS: {_rss_gb():.2f} GB\n'
+    # 1. Vocab lookup — built once per tokenizer, cached at module level.
+    id_to_bytes = _vocab_id_to_bytes(tokenizer)
+    length_lookup = np.fromiter(
+        (len(b) for b in id_to_bytes),
+        dtype=np.int64, count=len(id_to_bytes),
     )
-    sys.stderr.flush()
 
-    # 2. Chunked tokenization with offset mapping — bounded peak per chunk.
+    # 2. Chunked tokenization — NO offset_mapping (slow path on T5 sentencepiece).
     chunk_ids: List[np.ndarray] = []
-    chunk_byte_starts: List[np.ndarray] = []   # global byte offsets
+    chunk_bytes_blobs: List[bytes] = []        # one bytes blob per chunk
+    chunk_local_starts: List[np.ndarray] = []  # token start offsets WITHIN each chunk
+    chunk_byte_lengths: List[int] = []         # total byte length of each chunk
     char_cursor = 0
-    byte_cursor = 0
     t_chunked_start = time.time()
 
-    # Per-step timing accumulators — reset every report so we can see if
-    # any one operation is anomalously slow per chunk.
+    # Per-step timing accumulators
     t_slice  = 0.0
     t_tokens = 0.0
-    t_offset = 0.0
+    t_bytes  = 0.0
     t_post   = 0.0
 
     for chunk_idx in range(n_chunks):
@@ -282,66 +278,57 @@ def _build_tokenized_stream(text: str, tokenizer,
         chunk_text = text[start_char:end_char]
         t_slice += time.time() - _t0
 
-        # Tokenize the chunk — small input, single Rust call, small output.
+        # Tokenize chunk — small input, single Rust call, no offset_mapping.
         _t0 = time.time()
         enc = tokenizer(chunk_text, add_special_tokens=False,
-                        return_offsets_mapping=True,
                         return_attention_mask=False,
                         return_token_type_ids=False)
-        local_ids = np.asarray(enc['input_ids'], dtype=np.int64)
-        local_offsets = np.asarray(enc['offset_mapping'], dtype=np.int64)
+        local_ids_list = enc['input_ids']
+        local_ids = np.asarray(local_ids_list, dtype=np.int64)
         t_tokens += time.time() - _t0
 
-        # Per-chunk char→byte map. ~2 MB for a 2 MB chunk.
+        # Per-token bytes via vocab lookup; cumsum -> local byte offsets;
+        # join into a single chunk-scoped bytes blob.
         _t0 = time.time()
-        chunk_bytes = chunk_text.encode('utf-8')
-        chunk_byte_arr = np.frombuffer(chunk_bytes, dtype=np.uint8)
-        is_char_start = (chunk_byte_arr & 0xC0) != 0x80
-        local_char_byte_starts = np.flatnonzero(is_char_start).astype(np.int64)
-        if len(local_char_byte_starts) != len(chunk_text):
-            raise RuntimeError(
-                f"chunk {chunk_idx}: char count mismatch — "
-                f"{len(local_char_byte_starts)} utf-8 vs {len(chunk_text)} str"
-            )
-        local_char_starts = np.clip(local_offsets[:, 0], 0, len(chunk_text) - 1)
-        local_byte_starts = local_char_byte_starts[local_char_starts]
-        global_byte_starts = local_byte_starts + byte_cursor
-        t_offset += time.time() - _t0
+        byte_lengths = length_lookup[local_ids]
+        local_starts = np.empty(len(local_ids) + 1, dtype=np.int64)
+        local_starts[0] = 0
+        np.cumsum(byte_lengths, out=local_starts[1:])
+        chunk_blob = b''.join(id_to_bytes[i] for i in local_ids_list)
+        t_bytes += time.time() - _t0
 
         _t0 = time.time()
         chunk_ids.append(local_ids)
-        chunk_byte_starts.append(global_byte_starts)
+        chunk_bytes_blobs.append(chunk_blob)
+        chunk_local_starts.append(local_starts)
+        chunk_byte_lengths.append(int(local_starts[-1]))
         char_cursor = end_char
-        byte_cursor += len(chunk_bytes)
-        del enc, local_offsets, chunk_text, chunk_bytes, chunk_byte_arr
-        del is_char_start, local_char_byte_starts, local_char_starts
-        del local_byte_starts, global_byte_starts, local_ids
+        del enc, chunk_text, local_ids_list, byte_lengths, chunk_blob, local_starts, local_ids
         t_post += time.time() - _t0
 
-        # Print heartbeat — every chunk for the first 10 so we see early
-        # if anything is anomalously slow, then every 25 to keep the log
-        # readable for the long tail.
-        is_heartbeat = (chunk_idx < 10) or ((chunk_idx + 1) % 25 == 0) or \
+        # Heartbeat
+        is_heartbeat = (chunk_idx < 5) or ((chunk_idx + 1) % 25 == 0) or \
                         (chunk_idx + 1 == n_chunks)
         if is_heartbeat:
             gc.collect()
             elapsed = time.time() - t_chunked_start
+            mb_per_s = (start_char + chunk_chars) / max(1.0, elapsed) / 1e6
             sys.stderr.write(
                 f'  [vocab_trigram] chunk {chunk_idx+1:>4}/{n_chunks} '
-                f'({elapsed:6.1f}s tot, RSS {_rss_gb():.2f} GB) | '
-                f'breakdown so far: slice={t_slice:.1f}s '
-                f'tokenize={t_tokens:.1f}s offset_map={t_offset:.1f}s '
-                f'append={t_post:.1f}s\n'
+                f'({elapsed:6.1f}s tot, {mb_per_s:5.1f} MB/s, '
+                f'RSS {_rss_gb():.2f} GB) | '
+                f'slice={t_slice:.1f} tok={t_tokens:.1f} '
+                f'bytes={t_bytes:.1f} append={t_post:.1f}\n'
             )
             sys.stderr.flush()
 
     sys.stderr.write(
-        f'  [vocab_trigram] chunked tokenize DONE in {time.time()-t_chunked_start:.1f}s '
-        f'(RSS {_rss_gb():.2f} GB)\n'
+        f'  [vocab_trigram] chunked tokenize DONE in '
+        f'{time.time()-t_chunked_start:.1f}s (RSS {_rss_gb():.2f} GB)\n'
     )
     sys.stderr.flush()
 
-    # 3. Concatenate per-chunk arrays into the final buffers.
+    # 3. Concatenate per-chunk arrays.
     with _Step(f"np.concatenate chunk_ids ({len(chunk_ids)} chunks)"):
         ids_arr = np.concatenate(chunk_ids)
         n_tokens = len(ids_arr)
@@ -350,16 +337,38 @@ def _build_tokenized_stream(text: str, tokenizer,
     del chunk_ids
     gc.collect()
 
-    with _Step(f"np.concatenate chunk_byte_starts + sentinel"):
+    # 4. Concatenate chunk byte blobs into one big bytes object then numpy.
+    n_total_bytes = sum(chunk_byte_lengths)
+    with _Step(f"b''.join chunk_bytes_blobs ({n_total_bytes:,} B)"):
+        bytes_blob = b''.join(chunk_bytes_blobs)
+    del chunk_bytes_blobs
+    gc.collect()
+
+    with _Step(f"np.frombuffer bytes_arr ({n_total_bytes:,} B)"):
+        bytes_arr = np.frombuffer(bytes_blob, dtype=np.uint8).copy()
+    del bytes_blob
+    gc.collect()
+
+    # 5. Build global token_starts by shifting per-chunk local starts by
+    #    cumulative chunk byte offsets.
+    with _Step(f"build global token_starts ({n_tokens+1:,})"):
+        cum_chunk_offsets = np.cumsum([0] + chunk_byte_lengths[:-1])
         token_starts = np.empty(n_tokens + 1, dtype=np.int64)
-        token_starts[:-1] = np.concatenate(chunk_byte_starts)
+        out_pos = 0
+        for ci, local_starts in enumerate(chunk_local_starts):
+            n_in_chunk = len(local_starts) - 1
+            token_starts[out_pos:out_pos + n_in_chunk] = (
+                local_starts[:-1] + cum_chunk_offsets[ci]
+            )
+            out_pos += n_in_chunk
         token_starts[-1] = n_total_bytes
-    del chunk_byte_starts
+    del chunk_local_starts, chunk_byte_lengths, cum_chunk_offsets
     gc.collect()
 
     sys.stderr.write(
         f'  [vocab_trigram] === build_tokenized_stream DONE — '
-        f'final RSS: {_rss_gb():.2f} GB ===\n'
+        f'final RSS: {_rss_gb():.2f} GB '
+        f'(stream: {n_total_bytes:,} B, {n_tokens:,} tokens) ===\n'
     )
     sys.stderr.flush()
 
