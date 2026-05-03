@@ -18,6 +18,11 @@ from typing import Any, Dict
 
 
 # Common cfg keys shared by all three variants.
+#
+# Naming convention: every hf_version starts with the experiment id
+# (`exp_001_*`) so all artifacts on HuggingFace sort cleanly under the
+# experiment that produced them. Override `hf_version` (or `hf_repo`)
+# per run via run.py's --hf-version / --hf-repo flags if needed.
 _BASE: Dict[str, Any] = dict(
     # Dataset
     dataset='vocab_trigram',           # registered at runtime by run.py
@@ -36,10 +41,11 @@ _BASE: Dict[str, Any] = dict(
     cv_band_lo=0.80,
     cv_band_hi=1.25,
 
-    # Output
-    save_every=10,
+    # Output / IO
+    save_every=10,                     # one checkpoint upload per 10 epochs
     report_every=200,
-    upload=False,                      # local until results are graduated
+    upload=True,                       # uploads to hf_repo via HF_TOKEN
+    hf_repo='AbstractPhil/geolip-svae-text',
 
     # Codebook hook stays default-on so post-train artifact captures the
     # axes alongside the vocab eval.
@@ -62,7 +68,7 @@ CFG_PROTO_64: Dict[str, Any] = dict(
     # Training
     img_size=64, batch_size=128,
     lr=1e-4, epochs=100,
-    hf_version='proto001_vocab_h2_64',
+    hf_version='exp_001_vocab_h2_64',
 )
 
 
@@ -82,7 +88,7 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
 
     img_size=64, batch_size=128,
     lr=1e-4, epochs=100,
-    hf_version='proto001_vocab_freckles_64',
+    hf_version='exp_001_vocab_freckles_64',
 )
 
 
@@ -100,5 +106,5 @@ CFG_FRESNEL_128: Dict[str, Any] = dict(
 
     img_size=128, batch_size=64,
     lr=1e-4, epochs=50,
-    hf_version='proto001_vocab_fresnel_128',
+    hf_version='exp_001_vocab_fresnel_128',
 )

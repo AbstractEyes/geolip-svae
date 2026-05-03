@@ -81,6 +81,15 @@ def main(argv=None):
                              'the trainer imports huggingface_hub. On Colab, '
                              'pass `userdata.get("HF_TOKEN")` from a cell '
                              'before `!python -m ...` (see README).')
+    parser.add_argument('--hf-repo', default=None,
+                        help='Override hf_repo (default from cfg.py: '
+                             'AbstractPhil/geolip-svae-text).')
+    parser.add_argument('--hf-version', default=None,
+                        help='Override hf_version (the per-run name used as '
+                             'both the HF prefix and the local run identifier). '
+                             'Default from cfg.py uses the exp_001_* prefix.')
+    parser.add_argument('--no-upload', action='store_true',
+                        help='Disable HF upload for this run (overrides cfg).')
     args = parser.parse_args(argv)
 
     # Set HF_TOKEN BEFORE importing the trainer — its module-level auth
@@ -96,10 +105,23 @@ def main(argv=None):
     # 2. Pick + override cfg
     from . import cfg as cfg_mod
     cfg: Dict[str, Any] = dict(getattr(cfg_mod, _VARIANTS[args.variant]))
+
+    # First-class CLI overrides (precedence: CLI flag > --cfg-override > cfg.py)
+    if args.hf_repo is not None:
+        cfg['hf_repo'] = args.hf_repo
+    if args.hf_version is not None:
+        cfg['hf_version'] = args.hf_version
+    if args.no_upload:
+        cfg['upload'] = False
+
+    # Generic overrides last so they can override the explicit flags too
     cfg.update(_parse_overrides(args.cfg_override))
+
     print(f"  [proto001] variant={args.variant}, "
           f"epochs={cfg['epochs']}, batch={cfg['batch_size']}, "
           f"img_size={cfg['img_size']}, V={cfg['V']}, D={cfg['D']}")
+    print(f"  [proto001] hf_repo={cfg['hf_repo']!r}, "
+          f"hf_version={cfg['hf_version']!r}, upload={cfg.get('upload', True)}")
 
     # 3. Train (unless skipping)
     if not args.skip_train:
