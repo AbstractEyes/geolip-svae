@@ -848,7 +848,7 @@ class PatchSVAE(nn.Module):
                 f"channels={self.channels}"
             )
         ps = self.patch_size
-        gh, gw = H // ps, W // ps
+        #gh, gw = H // ps, W // ps
 
         # Extract patches
         patches, gh, gw = extract_patches(images, ps)

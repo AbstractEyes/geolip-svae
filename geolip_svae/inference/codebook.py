@@ -41,6 +41,9 @@ import torch
 # rebuild (scratchpad 000107). The four functions are pure tensor
 # operations on M; they do not depend on any model class.
 
+# This will be expanded as needed, but for now these are the only directly tested
+# aggregation methods. The 'cat' method is a passthrough that leaves it to the caller to handle the extra dimension(s).
+# This is less than ideal, but it's a research variable - so we can add more methods as needed without changing the API.
 SUPPORTED_AGG = ('mean', 'median', 'first', 'cat')
 
 
@@ -436,14 +439,33 @@ def extract_codebook(
     Args:
         model: any model whose forward returns ``dict`` with
             ``'svd' → 'M'`` of shape ``[B, n_patches, V, D]``.
-        calibration_images: ``[N, C, H, W]``.
+        calibration_images: ``[N, C, H, W]``
+            The content and size of these images is a research variable.
+            Many tests show that the codebook emerges even with pure noise, but the images
+            must be large enough to activate the full V (rows of M) and D (columns of M).
+            This is a verifiable research variable: the codebook is visible in each patch, however
+            the sample and patch aggregation methods affect the clarity of the codebook.
+            Without enough calibration images, the codebook may be incomplete (missing axes) or degenerate
+            (spurious axes, low mean projective angle, etc.). Research is ongoing to understand the
+            relationship between calibration and codebook quality.
         sample_agg: 'mean' (default), 'median', 'first', 'cat'.
+            How to aggregate M across the N calibration samples.
+            'mean' and 'median' produce a single codebook; 'cat' produces one per sample.
         patch_agg: 'mean' (default), 'median', 'first', 'cat'. Ignored
+            'mean' and 'median' produce one M per image by aggregating across patches;
             if ``patch_idx`` is set.
         patch_idx: if set, use only this single patch index per image
             (legacy A0–A3 verification path). Default ``None`` =
             per-patch averaging (the corrected default from 000104).
+            Research shows that the codebook emerges in EACH patch,
+            so the codebook is visible even at a single patch index.
+            This is a verifiable legacy path for the research.
         threshold: antipodal cosine threshold (default -0.9).
+            Antipodal pairs must have cosine below this to be considered valid.
+            Antipodal pairs are identified by mutual-strongest matching, but this
+            threshold is a sanity check to prevent degenerate pairs in low-D models.
+            This requires ablation to set properly per model architecture;
+            -0.9 is a good starting point for D=3, D=4 models.
         batch_size: forward-pass chunk size.
         model_id: free-form identifier saved in metadata
             (e.g. ``'v40_freckles_noise'``, ``'h2-64/battery_0'``).
