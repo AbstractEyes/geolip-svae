@@ -189,12 +189,32 @@ def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
     return table
 
 
-def _build_tokenized_stream(text: str, tokenizer) -> TokenizedStream:
-    """Tokenize text and emit a byte stream plus per-token boundaries.
+def _build_tokenized_stream(text: str, tokenizer,
+                              chunk_chars: int = 2_000_000) -> TokenizedStream:
+    """Build byte stream + token boundaries via SOURCE-BYTES + CHUNKED tokenize.
 
-    Heavily instrumented because this is where multi-GB allocations happen.
-    Each step prints elapsed wall time + current RSS + delta so the
-    runtime memory profile is observable during the slow build.
+    Memory peak is bounded by the chunk size, NOT the corpus size — for
+    full wikitext-103 (~540 MB text, ~150M tokens) peak stays around
+    5-6 GB instead of the 30-65 GB the single-shot tokenize hit.
+
+    Approach:
+        1. byte_stream = text.encode('utf-8') ONCE — that's the byte_arr
+           we return. Source text bytes ARE the byte stream; no per-token
+           reconstruction needed.
+        2. Tokenize text in ~2 MB chunks with return_offsets_mapping=True
+           so each chunk gives us per-token CHAR offsets within the chunk.
+        3. Per chunk: build a small char→byte map (handles multi-byte UTF-8
+           chars correctly) and translate local char offsets to GLOBAL byte
+           offsets in the full byte stream.
+        4. Drop per-chunk intermediates aggressively; concatenate the
+           accumulated arrays at the end.
+
+    Why this avoids the 65 GB blowup:
+        - No 150M-element Python list of ints (the BatchEncoding only ever
+          holds ~600K ints per chunk, immediately copied to numpy).
+        - No b''.join over 150M items + no precomputed vocab byte lookup.
+        - Single 540 MB allocation for the byte stream, lives once, no
+          intermediate bytes_blob copy.
     """
     # Stream-level cache — same tokenizer + same text → reuse.
     cache_key = (
@@ -213,86 +233,127 @@ def _build_tokenized_stream(text: str, tokenizer) -> TokenizedStream:
         sys.stderr.flush()
         return cached_stream
 
+    n_chars = len(text)
+    n_chunks = (n_chars + chunk_chars - 1) // chunk_chars
     sys.stderr.write(
         f'  [vocab_trigram] === build_tokenized_stream START '
-        f'(text_len={len(text):,} chars, tokenizer={getattr(tokenizer, "name_or_path", "?")}) ===\n'
+        f'(text_len={n_chars:,} chars, '
+        f'tokenizer={getattr(tokenizer, "name_or_path", "?")}, '
+        f'strategy=source_bytes+chunked_tokenize, '
+        f'n_chunks={n_chunks} of ~{chunk_chars:,} chars each) ===\n'
         f'  [vocab_trigram] starting RSS: {_rss_gb():.2f} GB\n'
     )
     sys.stderr.flush()
 
-    # 1. Tokenize. Single Rust call. Returns BatchEncoding holding a
-    #    Python list of ~150M ints for full wikitext-103 train. The list
-    #    itself can balloon to ~5+ GB of Python overhead (each int boxed).
-    with _Step(f"tokenizer(text, add_special_tokens=False)"):
-        enc = tokenizer(text, add_special_tokens=False,
-                        return_offsets_mapping=False,
-                        return_attention_mask=False,
-                        return_token_type_ids=False)
-        ids_list: List[int] = enc['input_ids']
-        n_tokens = len(ids_list)
-        sys.stderr.write(f'(n_tokens={n_tokens:,}) ')
+    # 1. Source byte stream — single allocation.
+    with _Step(f"text.encode('utf-8')"):
+        text_bytes = text.encode('utf-8')
+        n_total_bytes = len(text_bytes)
+        sys.stderr.write(f'(total_bytes={n_total_bytes:,}) ')
         sys.stderr.flush()
-    # Drop the BatchEncoding wrapper + source text — not needed past this
-    # point. Source text dominates the closure here for big corpora.
-    del enc
-    gc.collect()
 
-    # 2. Convert ids list -> int64 array. ~1.2 GB for 150M tokens.
-    with _Step(f"np.asarray(ids, int64) [n={n_tokens:,}]"):
-        ids_arr = np.asarray(ids_list, dtype=np.int64)
-    # Free the Python list immediately — it's now redundant with ids_arr
-    # and was the largest single Python-overhead allocation in this fn.
-    del ids_list
+    with _Step(f"np.frombuffer(text_bytes, uint8).copy()"):
+        bytes_arr = np.frombuffer(text_bytes, dtype=np.uint8).copy()
+    del text_bytes
     gc.collect()
-    sys.stderr.write(f'  [vocab_trigram] post-list-del RSS: {_rss_gb():.2f} GB\n')
+    sys.stderr.write(
+        f'  [vocab_trigram] post-byte-encode RSS: {_rss_gb():.2f} GB\n'
+    )
     sys.stderr.flush()
 
-    # 3. Vocab lookup (cached after first call per tokenizer).
-    id_to_bytes = _vocab_id_to_bytes(tokenizer)
+    # 2. Chunked tokenization with offset mapping — bounded peak per chunk.
+    chunk_ids: List[np.ndarray] = []
+    chunk_byte_starts: List[np.ndarray] = []   # global byte offsets
+    char_cursor = 0
+    byte_cursor = 0
+    t_chunked_start = time.time()
 
-    # 4. Per-token byte lengths via fancy indexing.
-    with _Step(f"fancy-index byte_lengths [n={n_tokens:,}]"):
-        length_lookup = np.fromiter(
-            (len(b) for b in id_to_bytes),
-            dtype=np.int64, count=len(id_to_bytes),
-        )
-        byte_lengths = length_lookup[ids_arr]
+    for chunk_idx in range(n_chunks):
+        start_char = char_cursor
+        end_char = min(start_char + chunk_chars, n_chars)
+        chunk_text = text[start_char:end_char]
 
-    # 5. Cumulative byte offsets — sentinel includes total length.
-    with _Step(f"cumsum -> token_starts [n={n_tokens+1:,}]"):
-        starts = np.empty(n_tokens + 1, dtype=np.int64)
-        starts[0] = 0
-        np.cumsum(byte_lengths, out=starts[1:])
-        total_bytes = int(starts[-1])
-        sys.stderr.write(f'(total_bytes={total_bytes:,}) ')
+        # Tokenize the chunk — small input, single Rust call, small output.
+        enc = tokenizer(chunk_text, add_special_tokens=False,
+                        return_offsets_mapping=True,
+                        return_attention_mask=False,
+                        return_token_type_ids=False)
+        local_ids = np.asarray(enc['input_ids'], dtype=np.int64)
+        local_offsets = np.asarray(enc['offset_mapping'], dtype=np.int64)
+        # local_offsets[:, 0] = char start of each token within chunk_text
+
+        # Per-chunk char→byte map. ~2 MB for a 2 MB chunk. UTF-8 char
+        # starts are bytes that are NOT continuation bytes (mask 0xC0 != 0x80).
+        chunk_bytes = chunk_text.encode('utf-8')
+        chunk_byte_arr = np.frombuffer(chunk_bytes, dtype=np.uint8)
+        is_char_start = (chunk_byte_arr & 0xC0) != 0x80
+        local_char_byte_starts = np.flatnonzero(is_char_start).astype(np.int64)
+
+        # Sanity: char count from byte-pattern walk must match Python char count
+        if len(local_char_byte_starts) != len(chunk_text):
+            raise RuntimeError(
+                f"chunk {chunk_idx}: char count mismatch — "
+                f"{len(local_char_byte_starts)} from utf-8 walk vs "
+                f"{len(chunk_text)} from Python str"
+            )
+
+        # Translate local CHAR offsets → local BYTE offsets → global byte offsets
+        local_char_starts = local_offsets[:, 0]
+        # Clamp char offsets to valid range (guards against tokenizer edge cases)
+        local_char_starts = np.clip(local_char_starts, 0, len(chunk_text) - 1)
+        local_byte_starts = local_char_byte_starts[local_char_starts]
+        global_byte_starts = local_byte_starts + byte_cursor
+
+        chunk_ids.append(local_ids)
+        chunk_byte_starts.append(global_byte_starts)
+
+        char_cursor = end_char
+        byte_cursor += len(chunk_bytes)
+
+        # Drop everything chunk-local before next iteration.
+        del enc, local_offsets, chunk_text, chunk_bytes, chunk_byte_arr
+        del is_char_start, local_char_byte_starts, local_char_starts
+        del local_byte_starts, global_byte_starts, local_ids
+        if (chunk_idx + 1) % 50 == 0 or chunk_idx + 1 == n_chunks:
+            gc.collect()
+            elapsed = time.time() - t_chunked_start
+            sys.stderr.write(
+                f'  [vocab_trigram] chunked tokenize {chunk_idx+1}/{n_chunks} '
+                f'({elapsed:.1f}s, RSS {_rss_gb():.2f} GB)\n'
+            )
+            sys.stderr.flush()
+
+    sys.stderr.write(
+        f'  [vocab_trigram] chunked tokenize DONE in {time.time()-t_chunked_start:.1f}s '
+        f'(RSS {_rss_gb():.2f} GB)\n'
+    )
+    sys.stderr.flush()
+
+    # 3. Concatenate per-chunk arrays into the final buffers.
+    with _Step(f"np.concatenate chunk_ids ({len(chunk_ids)} chunks)"):
+        ids_arr = np.concatenate(chunk_ids)
+        n_tokens = len(ids_arr)
+        sys.stderr.write(f'(n_tokens={n_tokens:,}) ')
         sys.stderr.flush()
-    del byte_lengths
+    del chunk_ids
     gc.collect()
 
-    # 6. Concatenate the byte stream. b''.join over the ids_arr — but we
-    #    need a Python iterable of bytes objects. Walking ids_arr through
-    #    a precomputed lookup is the lightest path. For 150M tokens this
-    #    is the second-biggest hit (after step 1) — both wall time and
-    #    peak RAM (the resulting blob is ~600 MB for full wikitext-103).
-    with _Step(f"b''.join byte stream [n={n_tokens:,} -> {total_bytes:,} B]"):
-        # tolist() once is faster than iterating ids_arr through numpy
-        # __getitem__ which boxes each element.
-        ids_for_join = ids_arr.tolist()
-        bytes_blob = b''.join(id_to_bytes[i] for i in ids_for_join)
-        del ids_for_join
+    with _Step(f"np.concatenate chunk_byte_starts + sentinel"):
+        token_starts = np.empty(n_tokens + 1, dtype=np.int64)
+        token_starts[:-1] = np.concatenate(chunk_byte_starts)
+        token_starts[-1] = n_total_bytes
+    del chunk_byte_starts
     gc.collect()
 
-    # 7. Final byte_arr (frombuffer + copy = own the memory; allows del bytes_blob).
-    with _Step(f"np.frombuffer copy -> bytes_arr [{len(bytes_blob):,} B]"):
-        bytes_arr = np.frombuffer(bytes_blob, dtype=np.uint8).copy()
-    del bytes_blob
-    gc.collect()
-    sys.stderr.write(f'  [vocab_trigram] post-blob-del RSS: {_rss_gb():.2f} GB\n')
+    sys.stderr.write(
+        f'  [vocab_trigram] === build_tokenized_stream DONE — '
+        f'final RSS: {_rss_gb():.2f} GB ===\n'
+    )
     sys.stderr.flush()
 
     stream = TokenizedStream(
         bytes_arr=bytes_arr,
-        token_starts=starts,
+        token_starts=token_starts,
         token_ids=ids_arr,
         vocab_size=tokenizer.vocab_size,
     )
