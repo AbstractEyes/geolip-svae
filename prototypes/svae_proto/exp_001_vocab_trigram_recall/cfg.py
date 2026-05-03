@@ -92,7 +92,7 @@ CFG_PROTO_64: Dict[str, Any] = dict(
     # Training — h2_64_single's lr=1e-3, byte_trigram_proto_64's data scale
     img_size=64, batch_size=1024,
     lr=1e-3, epochs=100,
-    #ds_size=1_000_000, val_size=10_000,
+    ds_size=1_000_000, val_size=10_000,
     save_every=5,
     report_every=500,                  # ~2 reports/epoch at ~975 batches/ep
 
