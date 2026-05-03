@@ -1,5 +1,5 @@
 """
-prototypes.001_vocab_trigram_recall.run
+svae_proto.exp_001_vocab_trigram_recall.run
 ========================================
 Thin launcher for experiment 001.
 
@@ -15,9 +15,9 @@ What it does:
 
 Usage
 -----
-    python -m prototypes.001_vocab_trigram_recall.run --variant proto_64
-    python -m prototypes.001_vocab_trigram_recall.run --variant freckles_64
-    python -m prototypes.001_vocab_trigram_recall.run --variant fresnel_128
+    python -m svae_proto.exp_001_vocab_trigram_recall.run --variant proto_64
+    python -m svae_proto.exp_001_vocab_trigram_recall.run --variant freckles_64
+    python -m svae_proto.exp_001_vocab_trigram_recall.run --variant fresnel_128
 
 Override epochs / save dir / etc. via standard cfg keys passed through
 ``--cfg-override key=value``.

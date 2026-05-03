@@ -1,5 +1,5 @@
 """
-prototypes.001_vocab_trigram_recall.cfg
+svae_proto.exp_001_vocab_trigram_recall.cfg
 ========================================
 cfg dict(s) for the vocabulary trigram experiment.
 

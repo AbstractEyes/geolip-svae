@@ -1,5 +1,5 @@
 """
-prototypes.001_vocab_trigram_recall.dataset
+svae_proto.exp_001_vocab_trigram_recall.dataset
 ============================================
 Vocabulary-aware byte-trigram dataset.
 
@@ -12,11 +12,11 @@ token come back as a unit" rather than just "did each byte come back".
 
 The dataset is registered into ``DATASET_FACTORIES`` only at runtime by
 the experiment's ``run.py`` — never by importing this module. See the
-prototypes/ contract.
+svae_proto/ contract.
 
 Usage
 -----
-    from prototypes.001_vocab_trigram_recall.dataset import (
+    from svae_proto.exp_001_vocab_trigram_recall.dataset import (
         VocabTrigramDataset, vocab_trigram_factory,
     )
 

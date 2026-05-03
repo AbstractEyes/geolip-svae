@@ -1,5 +1,5 @@
 """
-prototypes.001_vocab_trigram_recall.eval
+svae_proto.exp_001_vocab_trigram_recall.eval
 =========================================
 Token-level recovery metrics for the vocabulary trigram experiment.
 
@@ -15,7 +15,7 @@ Computes:
 
 Usage
 -----
-    from prototypes.001_vocab_trigram_recall.eval import run_vocab_eval
+    from svae_proto.exp_001_vocab_trigram_recall.eval import run_vocab_eval
 
     report = run_vocab_eval(
         model, dataset, device='cuda',

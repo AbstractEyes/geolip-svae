@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# svae-proto — sister package to geolip-svae for experimental scaffolding.
+#
+# This is intentionally a SEPARATE installable package, NOT an optional
+# extra of geolip-svae. The contract:
+#
+#   pip install geolip-svae        → main package only, no svae-proto, no
+#                                     svae-proto deps. Production environments
+#                                     stay slim.
+#   pip install ./svae_proto       → installs svae-proto, which lists
+#                                     geolip-svae as a runtime dep so the
+#                                     core comes along automatically.
+#   pip install -e ./svae_proto    → editable install for active experiment
+#                                     development.
+#
+# Each experiment lives under svae_proto/exp_NNN_<slug>/ and MAY pull in
+# its own heavy dependencies (tokenizers, datasets, ripser, etc.) without
+# polluting the main package's dep tree. The contract documented in
+# svae_proto/README.md is load-bearing: prototypes depend on geolip_svae;
+# the core never imports anything from svae_proto.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[project]
+name = "svae-proto"
+version = "0.1.0"
+description = "Experimental scaffolding sister package for geolip-svae"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "AbstractPhil"},
+]
+keywords = ["svd", "autoencoder", "experimental", "prototypes", "geolip-svae"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core deps — every experiment can rely on these.
+# Heavy / experiment-specific deps go in [project.optional-dependencies]
+# below, scoped per-experiment, so users only install what they need.
+#
+# Note: geolip-svae is NOT on PyPI — it's a direct GitHub dep. If you've
+# already installed it from a different source (local checkout, fork,
+# specific tag), pip will respect that existing installation and skip
+# the URL-based one here. To pin a specific commit / tag / branch,
+# override at install time:
+#     pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@<ref>#subdirectory=svae_proto"
+dependencies = [
+    # The whole point of this package — pulls in core PatchSVAE + trainer.
+    "geolip-svae @ git+https://github.com/AbstractEyes/geolip-svae.git",
+    # Common across most experiments
+    "numpy>=1.24.0",
+    "torch>=2.1.0",
+]
+
+[project.optional-dependencies]
+
+# ── Per-experiment opt-in dependency groups ────────────────────────────────
+# Pattern: pip install "svae-proto[exp_001]"  installs core + exp_001 deps.
+# Add new groups as experiments need them; never bake heavy deps into the
+# core dependency list.
+
+# Experiment 001 — vocab_trigram_recall
+exp_001 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+]
+
+# Aggregate — everything across all experiments. Useful when iterating
+# across multiple in one workspace.
+all = [
+    "svae-proto[exp_001]",
+]
+
+[project.urls]
+Homepage = "https://github.com/AbstractEyes/geolip-svae"
+Repository = "https://github.com/AbstractEyes/geolip-svae"
+
+[tool.setuptools.packages.find]
+# Only ship the svae_proto namespace; do not re-package geolip_svae.
+include = ["svae_proto*"]
