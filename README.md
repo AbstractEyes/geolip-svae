@@ -545,33 +545,90 @@ run trained models pay zero cost for experiment infrastructure.
 
 Neither package is on PyPI — both install from GitHub. svae-proto's
 `pyproject.toml` lives in the `svae_proto/` subdirectory, so the URL
-fragment `#subdirectory=svae_proto` is required.
+fragment `#subdirectory=svae_proto` is required. svae-proto declares
+`geolip-svae` as a runtime dep (also via git URL), so installing
+svae-proto pulls the core package along automatically — one URL is
+enough for both.
+
+### Terminal — set up an environment before running anything
 
 ```bash
-# ─── From GitHub (recommended) ──────────────────────────────────────
-
 # Main package only — production install
-pip install git+https://github.com/AbstractEyes/geolip-svae.git
+pip install "git+https://github.com/AbstractEyes/geolip-svae.git"
 
-# Add the experimental scaffolding (also pulls geolip-svae as dep)
-pip install "git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+# Main + experimental scaffolding in one command (single URL — svae-proto
+# pulls geolip-svae transitively):
+pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
 
-# With one experiment's heavy deps:
+# With experiment 001's heavy deps (transformers / datasets / sentencepiece):
 pip install "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
 
-# Everything across all experiments:
+# Everything across every experiment:
 pip install "svae-proto[all] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
 
-# ─── From a local clone (development) ───────────────────────────────
+# Pin to a specific tag / branch / commit:
+pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0.9.0#subdirectory=svae_proto"
+```
 
+### Colab notebook — inline cell at top of notebook (or above an experiment call)
+
+In Colab / Jupyter notebook cells, prefix shell commands with `!`. The
+notebook environment persists installs across cells but not across
+runtime restarts, so a self-contained install cell at the top of the
+notebook (or directly above the experiment block) is the typical pattern.
+
+The recommended Colab install cell — uninstall first to guarantee any
+chained packages re-resolve from source, then a single pip command for
+the dep tree:
+
+```python
+# ── Standalone install cell — paste at top of notebook ──────────────
+!pip uninstall -y geolip-svae svae-proto geolip-core \
+                  geofractal geometricvocab wide_compiler
+!pip install --no-cache-dir \
+    "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+```
+
+That single `pip install` does:
+1. Clones `geolip-svae` repo once.
+2. Reads `svae_proto/pyproject.toml` (because of `#subdirectory=svae_proto`).
+3. Sees the dep `geolip-svae @ git+...` and installs the core from the same clone.
+4. Sees the core's dep `geolip-core @ git+...` and installs that too.
+5. Resolves `[exp_001]` extras (transformers, datasets, sentencepiece) plus the rest of the dep tree (torch, etc.) in a single resolution pass.
+
+`--no-cache-dir` complements the explicit uninstall — it bypasses pip's
+wheel cache so every install is a fresh build of the latest commit. The
+uninstall list includes sibling packages (`geofractal`, `geometricvocab`,
+`wide_compiler`) that may be in your stack — extend or trim it to match
+what's actually installed.
+
+Drop the `[exp_001]` to install just the proto core. Drop the entire
+trailing URL term and use the `git+...geolip-svae.git` URL alone if you
+want only the main package.
+
+> **Colab notebook is not a terminal.** The `!` prefix invokes a fresh
+> shell per cell; environment variables / `cd` / activated virtualenvs do
+> not persist between cells. Within a single cell you can chain shell
+> commands with `&&` or `\` line continuations as shown above. Use `%cd`
+> (the magic, not the `!cd` shell builtin) if you actually need the
+> working directory to persist across cells.
+
+### Local clone — active development on the source
+
+```bash
 git clone https://github.com/AbstractEyes/geolip-svae.git
 cd geolip-svae
 
 pip install .                          # main package
 pip install ./svae_proto               # add svae-proto
-pip install -e ./svae_proto            # editable svae-proto
+pip install -e ./svae_proto            # editable for live source edits
 pip install "./svae_proto[exp_001]"    # with experiment 001 deps
 ```
+
+Editable install (`-e`) reads source files directly from the clone, so
+`git pull` is enough to pick up upstream changes — no reinstall needed.
+In a notebook context, restart the runtime after `git pull` to clear
+Python's module cache.
 
 The contract: **prototypes depend on `geolip_svae`; the package never
 imports prototypes**. Delete the entire `svae_proto/` directory at any
