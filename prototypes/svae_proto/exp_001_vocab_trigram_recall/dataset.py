@@ -93,35 +93,103 @@ class _Step:
 
 # ── Tokenizer + corpus loaders ──────────────────────────────────────
 
-def _load_tokenizer(name: str):
-    """Load an HF AutoTokenizer, FORCING the Rust-fast path.
+class _TokenizerWrapper:
+    """Unified interface over either an HF tokenizer OR a raw sentencepiece
+    SentencePieceProcessor. Exposes the methods this dataset actually uses:
 
-    `use_fast=True` is just a hint — AutoTokenizer silently falls back to
-    the slow Python class if the matching Fast subclass isn't importable
-    (e.g. `tokenizers` package missing/incompatible). For T5 specifically
-    we explicitly try `T5TokenizerFast` first and fail loudly if it's not
-    available — slow T5Tokenizer at ~1 MB/s on 500 MB of text is a
-    multi-minute trap that's better surfaced than silently endured.
+        encode_chunk(text)       -> List[int]      (fast, single C++ call for SP)
+        decode_id_to_bytes(tid)  -> bytes
+        vocab_size               -> int
+        name_or_path             -> str
+
+    Why two backends:
+    * For SentencePiece-based tokenizers (T5, mT5, ALBERT, XLNet) we go
+      DIRECT to spm.SentencePieceProcessor. This bypasses HF's wrapper
+      entirely — no GIL thrashing, no Rust-tokenizers compatibility games,
+      no silent fallback to the slow path. Empirically 30-100 MB/s.
+    * For everything else, we keep the HF AutoTokenizer path (Fast when
+      available, Slow as a last resort).
+    """
+    def __init__(self, sp=None, hf=None, name: str = ''):
+        self._sp = sp
+        self._hf = hf
+        self.name_or_path = name
+        if sp is not None:
+            self.vocab_size = sp.GetPieceSize()
+            self.backend = 'sentencepiece'
+        else:
+            self.vocab_size = hf.vocab_size
+            self.backend = 'huggingface'
+
+    def encode_chunk(self, text: str):
+        """Tokenize a chunk; return a Python list of int ids."""
+        if self._sp is not None:
+            return self._sp.EncodeAsIds(text)
+        enc = self._hf(text, add_special_tokens=False,
+                        return_attention_mask=False,
+                        return_token_type_ids=False)
+        return enc['input_ids']
+
+    def decode_id_to_bytes(self, tid: int) -> bytes:
+        """Get utf-8 bytes for a single token id (used to build vocab lookup)."""
+        if self._sp is not None:
+            return self._sp.IdToPiece(tid).encode('utf-8')
+        return self._hf.decode([tid], skip_special_tokens=False,
+                                clean_up_tokenization_spaces=False).encode('utf-8')
+
+
+def _load_tokenizer(name: str) -> _TokenizerWrapper:
+    """Load a tokenizer, preferring the C++ SentencePieceProcessor for SP-based
+    models (T5, mT5, ALBERT, XLNet, etc.) and falling back to HF AutoTokenizer
+    otherwise.
+
+    The HF "fast" path silently falls back to the slow Python tokenizer when
+    the installed `tokenizers` Rust binding can't parse the saved tokenizer.json
+    — empirically observed at ~1 MB/s on T5 + Colab. The direct SP path
+    avoids this entirely: SentencePieceProcessor is pure C++ and processes
+    at 30-100 MB/s regardless of HF's plumbing state.
     """
     from transformers import AutoTokenizer
-    if 't5' in name.lower():
+
+    is_sp_model = any(prefix in name.lower()
+                      for prefix in ('t5', 'mt5', 'albert', 'xlnet'))
+    if is_sp_model:
         try:
-            from transformers import T5TokenizerFast
-            tok = T5TokenizerFast.from_pretrained(name)
+            import sentencepiece as spm
+            # Need the spiece.model file path; AutoTokenizer downloads & caches it.
+            hf = AutoTokenizer.from_pretrained(name)
+            # vocab_file points to the cached spiece.model
+            spiece_path = getattr(hf, 'vocab_file', None) or \
+                          getattr(hf, 'sp_model_file', None)
+            if spiece_path and os.path.exists(spiece_path):
+                sp = spm.SentencePieceProcessor()
+                sp.Load(spiece_path)
+                sys.stderr.write(
+                    f'  [vocab_trigram] using DIRECT SentencePiece backend '
+                    f'(spiece.model={spiece_path}, vocab={sp.GetPieceSize()})\n'
+                )
+                sys.stderr.flush()
+                return _TokenizerWrapper(sp=sp, name=name)
             sys.stderr.write(
-                f'  [vocab_trigram] forced T5TokenizerFast '
-                f'(class={type(tok).__name__}, is_fast={getattr(tok, "is_fast", "?")})\n'
+                f'  [vocab_trigram] SP-direct backend unavailable: '
+                f'spiece.model not found at {spiece_path!r}. Falling back to HF.\n'
             )
             sys.stderr.flush()
-            return tok
+            return _TokenizerWrapper(hf=hf, name=name)
         except Exception as e:
             sys.stderr.write(
-                f'  [vocab_trigram] T5TokenizerFast UNAVAILABLE ({type(e).__name__}: {e}) — '
-                f'falling back to AutoTokenizer with use_fast=True. '
-                f'Tokenization will likely run at slow-Python speed.\n'
+                f'  [vocab_trigram] SP-direct setup failed '
+                f'({type(e).__name__}: {e}); falling back to HF AutoTokenizer.\n'
             )
             sys.stderr.flush()
-    return AutoTokenizer.from_pretrained(name, use_fast=True)
+
+    hf = AutoTokenizer.from_pretrained(name, use_fast=True)
+    sys.stderr.write(
+        f'  [vocab_trigram] using HF backend '
+        f'(class={type(hf).__name__}, is_fast={getattr(hf, "is_fast", False)})\n'
+    )
+    sys.stderr.flush()
+    return _TokenizerWrapper(hf=hf, name=name)
 
 
 def _load_corpus_text(corpus_id: str, split: str = 'train',
@@ -249,27 +317,25 @@ def _save_stream_to_disk(path: str, stream: 'TokenizedStream') -> None:
             sys.stderr.flush()
 
 
-def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
+def _vocab_id_to_bytes(tokenizer: '_TokenizerWrapper') -> List[bytes]:
     """Build (or fetch from cache) the lookup [vocab_id -> utf-8 bytes].
 
-    Decodes each vocab token EXACTLY ONCE. ~32128 calls for T5-base
-    regardless of corpus size, ~1-2s. Cached at module level keyed on
-    the tokenizer's name_or_path.
+    Uses the wrapper's decode_id_to_bytes which dispatches to either
+    SentencePieceProcessor.IdToPiece or HF tokenizer.decode. Cached
+    at module level keyed on the tokenizer's name_or_path.
     """
-    key = getattr(tokenizer, 'name_or_path', repr(tokenizer))
+    key = tokenizer.name_or_path
     cached = _VOCAB_BYTES_CACHE.get(key)
     if cached is not None:
         sys.stderr.write(f'  [vocab_trigram] vocab_id_to_bytes: cache hit ({key})\n')
         sys.stderr.flush()
         return cached
 
-    with _Step(f"build vocab lookup ({tokenizer.vocab_size} tokens)"):
-        vocab_size = tokenizer.vocab_size
-        table: List[bytes] = [b''] * vocab_size
-        for tid in range(vocab_size):
-            s = tokenizer.decode([tid], skip_special_tokens=False,
-                                  clean_up_tokenization_spaces=False)
-            table[tid] = s.encode('utf-8')
+    with _Step(f"build vocab lookup ({tokenizer.vocab_size} tokens, "
+                f"backend={tokenizer.backend})"):
+        table: List[bytes] = [b''] * tokenizer.vocab_size
+        for tid in range(tokenizer.vocab_size):
+            table[tid] = tokenizer.decode_id_to_bytes(tid)
     _VOCAB_BYTES_CACHE[key] = table
     return table
 
@@ -316,24 +382,15 @@ def _build_tokenized_stream(text: str, tokenizer,
 
     n_chars = len(text)
     n_chunks = (n_chars + chunk_chars - 1) // chunk_chars
-    is_fast = bool(getattr(tokenizer, 'is_fast', False))
     sys.stderr.write(
         f'  [vocab_trigram] === build_tokenized_stream START '
         f'(text_len={n_chars:,} chars, '
-        f'tokenizer={type(tokenizer).__name__} is_fast={is_fast}, '
+        f'backend={tokenizer.backend}, '
         f'strategy=vocab_lookup+chunked_tokenize, '
         f'n_chunks={n_chunks} of ~{chunk_chars:,} chars each) ===\n'
         f'  [vocab_trigram] starting RSS: {_rss_gb():.2f} GB\n'
     )
     sys.stderr.flush()
-    if not is_fast:
-        sys.stderr.write(
-            f'  [vocab_trigram] WARNING: tokenizer.is_fast=False — '
-            f'falling back to slow Python tokenizer. Tokenization will be '
-            f'~30-100x slower than the Rust fast path. Install/upgrade '
-            f'`tokenizers` package and retry.\n'
-        )
-        sys.stderr.flush()
 
     # 1. Vocab lookup — built once per tokenizer, cached at module level.
     id_to_bytes = _vocab_id_to_bytes(tokenizer)
@@ -363,12 +420,10 @@ def _build_tokenized_stream(text: str, tokenizer,
         chunk_text = text[start_char:end_char]
         t_slice += time.time() - _t0
 
-        # Tokenize chunk — small input, single Rust call, no offset_mapping.
+        # Tokenize chunk via the wrapper. For SP backend this is one C++
+        # call into SentencePieceProcessor.EncodeAsIds; no GIL thrashing.
         _t0 = time.time()
-        enc = tokenizer(chunk_text, add_special_tokens=False,
-                        return_attention_mask=False,
-                        return_token_type_ids=False)
-        local_ids_list = enc['input_ids']
+        local_ids_list = tokenizer.encode_chunk(chunk_text)
         local_ids = np.asarray(local_ids_list, dtype=np.int64)
         t_tokens += time.time() - _t0
 
@@ -388,7 +443,7 @@ def _build_tokenized_stream(text: str, tokenizer,
         chunk_local_starts.append(local_starts)
         chunk_byte_lengths.append(int(local_starts[-1]))
         char_cursor = end_char
-        del enc, chunk_text, local_ids_list, byte_lengths, chunk_blob, local_starts, local_ids
+        del chunk_text, local_ids_list, byte_lengths, chunk_blob, local_starts, local_ids
         t_post += time.time() - _t0
 
         # Heartbeat
