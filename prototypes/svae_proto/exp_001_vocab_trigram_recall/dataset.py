@@ -268,58 +268,70 @@ def _build_tokenized_stream(text: str, tokenizer,
     byte_cursor = 0
     t_chunked_start = time.time()
 
+    # Per-step timing accumulators — reset every report so we can see if
+    # any one operation is anomalously slow per chunk.
+    t_slice  = 0.0
+    t_tokens = 0.0
+    t_offset = 0.0
+    t_post   = 0.0
+
     for chunk_idx in range(n_chunks):
+        _t0 = time.time()
         start_char = char_cursor
         end_char = min(start_char + chunk_chars, n_chars)
         chunk_text = text[start_char:end_char]
+        t_slice += time.time() - _t0
 
         # Tokenize the chunk — small input, single Rust call, small output.
+        _t0 = time.time()
         enc = tokenizer(chunk_text, add_special_tokens=False,
                         return_offsets_mapping=True,
                         return_attention_mask=False,
                         return_token_type_ids=False)
         local_ids = np.asarray(enc['input_ids'], dtype=np.int64)
         local_offsets = np.asarray(enc['offset_mapping'], dtype=np.int64)
-        # local_offsets[:, 0] = char start of each token within chunk_text
+        t_tokens += time.time() - _t0
 
-        # Per-chunk char→byte map. ~2 MB for a 2 MB chunk. UTF-8 char
-        # starts are bytes that are NOT continuation bytes (mask 0xC0 != 0x80).
+        # Per-chunk char→byte map. ~2 MB for a 2 MB chunk.
+        _t0 = time.time()
         chunk_bytes = chunk_text.encode('utf-8')
         chunk_byte_arr = np.frombuffer(chunk_bytes, dtype=np.uint8)
         is_char_start = (chunk_byte_arr & 0xC0) != 0x80
         local_char_byte_starts = np.flatnonzero(is_char_start).astype(np.int64)
-
-        # Sanity: char count from byte-pattern walk must match Python char count
         if len(local_char_byte_starts) != len(chunk_text):
             raise RuntimeError(
                 f"chunk {chunk_idx}: char count mismatch — "
-                f"{len(local_char_byte_starts)} from utf-8 walk vs "
-                f"{len(chunk_text)} from Python str"
+                f"{len(local_char_byte_starts)} utf-8 vs {len(chunk_text)} str"
             )
-
-        # Translate local CHAR offsets → local BYTE offsets → global byte offsets
-        local_char_starts = local_offsets[:, 0]
-        # Clamp char offsets to valid range (guards against tokenizer edge cases)
-        local_char_starts = np.clip(local_char_starts, 0, len(chunk_text) - 1)
+        local_char_starts = np.clip(local_offsets[:, 0], 0, len(chunk_text) - 1)
         local_byte_starts = local_char_byte_starts[local_char_starts]
         global_byte_starts = local_byte_starts + byte_cursor
+        t_offset += time.time() - _t0
 
+        _t0 = time.time()
         chunk_ids.append(local_ids)
         chunk_byte_starts.append(global_byte_starts)
-
         char_cursor = end_char
         byte_cursor += len(chunk_bytes)
-
-        # Drop everything chunk-local before next iteration.
         del enc, local_offsets, chunk_text, chunk_bytes, chunk_byte_arr
         del is_char_start, local_char_byte_starts, local_char_starts
         del local_byte_starts, global_byte_starts, local_ids
-        if (chunk_idx + 1) % 50 == 0 or chunk_idx + 1 == n_chunks:
+        t_post += time.time() - _t0
+
+        # Print heartbeat — every chunk for the first 10 so we see early
+        # if anything is anomalously slow, then every 25 to keep the log
+        # readable for the long tail.
+        is_heartbeat = (chunk_idx < 10) or ((chunk_idx + 1) % 25 == 0) or \
+                        (chunk_idx + 1 == n_chunks)
+        if is_heartbeat:
             gc.collect()
             elapsed = time.time() - t_chunked_start
             sys.stderr.write(
-                f'  [vocab_trigram] chunked tokenize {chunk_idx+1}/{n_chunks} '
-                f'({elapsed:.1f}s, RSS {_rss_gb():.2f} GB)\n'
+                f'  [vocab_trigram] chunk {chunk_idx+1:>4}/{n_chunks} '
+                f'({elapsed:6.1f}s tot, RSS {_rss_gb():.2f} GB) | '
+                f'breakdown so far: slice={t_slice:.1f}s '
+                f'tokenize={t_tokens:.1f}s offset_map={t_offset:.1f}s '
+                f'append={t_post:.1f}s\n'
             )
             sys.stderr.flush()
 
