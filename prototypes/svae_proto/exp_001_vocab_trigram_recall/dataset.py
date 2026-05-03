@@ -101,38 +101,96 @@ class TokenizedStream:
     vocab_size: int
 
 
+_VOCAB_BYTES_CACHE: Dict[str, List[bytes]] = {}
+_STREAM_CACHE: Dict[Tuple[str, str, int, Optional[int]], 'TokenizedStream'] = {}
+
+
+def _vocab_id_to_bytes(tokenizer) -> List[bytes]:
+    """Build (or fetch from cache) the lookup [vocab_id -> utf-8 bytes].
+
+    This decodes each vocab token EXACTLY ONCE. For T5-base that's 32128
+    decode calls regardless of corpus size — vs the previous per-token
+    decode in the corpus loop which scales with the corpus (~150M calls
+    for full wikitext-103 = 25-125 minutes of pure decode overhead).
+
+    Cache key is the tokenizer's name_or_path so the second dataset
+    instantiation in the same process (e.g. test_ds in vocab_trigram_factory)
+    pays nothing.
+    """
+    key = getattr(tokenizer, 'name_or_path', repr(tokenizer))
+    cached = _VOCAB_BYTES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    vocab_size = tokenizer.vocab_size
+    table: List[bytes] = [b''] * vocab_size
+    for tid in range(vocab_size):
+        s = tokenizer.decode([tid], skip_special_tokens=False,
+                              clean_up_tokenization_spaces=False)
+        table[tid] = s.encode('utf-8')
+    _VOCAB_BYTES_CACHE[key] = table
+    return table
+
+
 def _build_tokenized_stream(text: str, tokenizer) -> TokenizedStream:
     """Tokenize text and emit a byte stream plus per-token boundaries.
 
-    Each token's byte representation is its decoded text in utf-8.
-    Whitespace handling matches the tokenizer's own `decode` — i.e. for
-    sentencepiece this includes the leading-space marker as a real space.
-    """
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=False)
-    ids: List[int] = enc['input_ids']
-    pieces: List[str] = []
-    for tid in ids:
-        piece = tokenizer.decode([tid], skip_special_tokens=False,
-                                  clean_up_tokenization_spaces=False)
-        pieces.append(piece)
+    Implementation:
+        1. Tokenize the corpus in one shot (single Rust call).
+        2. Look up each token's byte form via a precomputed
+           vocab_size-sized table (built once per tokenizer, cached).
+        3. Compute per-token byte_lengths via numpy fancy indexing.
+        4. Concatenate the byte stream via b''.join (C-implemented).
 
-    # Convert each piece to utf-8 bytes; record start offsets.
-    byte_chunks: List[bytes] = []
-    starts: List[int] = []
-    cursor = 0
-    for p in pieces:
-        b = p.encode('utf-8')
-        starts.append(cursor)
-        byte_chunks.append(b)
-        cursor += len(b)
-    starts.append(cursor)  # sentinel for trailing slice
-    bytes_arr = np.frombuffer(b''.join(byte_chunks), dtype=np.uint8).copy()
-    return TokenizedStream(
+    No per-token Python work scales with the corpus.
+    """
+    # Stream-level cache — same tokenizer + same text → reuse.
+    cache_key = (
+        getattr(tokenizer, 'name_or_path', repr(tokenizer)),
+        # Hash a prefix of the text (full hash on 500MB is also fine but
+        # this is sufficient given the corpus_id is part of the key path
+        # at the dataset level too).
+        text[:256],
+        len(text),
+        None,
+    )
+    cached_stream = _STREAM_CACHE.get(cache_key)
+    if cached_stream is not None:
+        return cached_stream
+
+    # 1. One-shot tokenization (single Rust call regardless of corpus size).
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=False)
+    ids_list: List[int] = enc['input_ids']
+    ids_arr = np.asarray(ids_list, dtype=np.int64)
+
+    # 2. Vocab → bytes lookup (built once per tokenizer, cached).
+    id_to_bytes = _vocab_id_to_bytes(tokenizer)
+
+    # 3. Per-token byte lengths via fancy indexing.
+    length_lookup = np.fromiter(
+        (len(b) for b in id_to_bytes),
+        dtype=np.int64, count=len(id_to_bytes),
+    )
+    byte_lengths = length_lookup[ids_arr]            # O(N) numpy op
+
+    # 4. Cumulative byte offsets — sentinel includes total length.
+    starts = np.empty(len(ids_arr) + 1, dtype=np.int64)
+    starts[0] = 0
+    np.cumsum(byte_lengths, out=starts[1:])
+
+    # 5. Concatenate the byte stream. b''.join is C-speed; the genexpr
+    #    indexes a precomputed list, no per-element Python computation.
+    bytes_blob = b''.join(id_to_bytes[i] for i in ids_list)
+    bytes_arr = np.frombuffer(bytes_blob, dtype=np.uint8).copy()
+
+    stream = TokenizedStream(
         bytes_arr=bytes_arr,
-        token_starts=np.asarray(starts, dtype=np.int64),
-        token_ids=np.asarray(ids, dtype=np.int64),
+        token_starts=starts,
+        token_ids=ids_arr,
         vocab_size=tokenizer.vocab_size,
     )
+    _STREAM_CACHE[cache_key] = stream
+    return stream
 
 
 # ── Dataset ─────────────────────────────────────────────────────────
