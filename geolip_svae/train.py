@@ -110,14 +110,30 @@ from tqdm import tqdm
 from geolip_svae.model import PatchSVAE, cv_of
 
 # ── HuggingFace auth ─────────────────────────────────────────────────
+#
+# Three sources, in priority order:
+#   1. HF_TOKEN already set in os.environ (e.g. by run.py --hf-token, or
+#      by the user setting it explicitly in the cell before invoking).
+#   2. google.colab.userdata.get('HF_TOKEN') — the Colab-secret path.
+#      Only fires when running in Colab AND the secret has been granted
+#      access to the current notebook.
+#   3. None — auth disabled, HF upload skipped, public reads still work.
 
-try:
-    from google.colab import userdata
-    os.environ["HF_TOKEN"] = userdata.get('HF_TOKEN')
-    from huggingface_hub import login
-    login(token=os.environ["HF_TOKEN"])
-except Exception:
-    pass
+if not os.environ.get('HF_TOKEN'):
+    try:
+        from google.colab import userdata
+        _tok = userdata.get('HF_TOKEN')
+        if _tok:                                 # None when not authorized
+            os.environ['HF_TOKEN'] = _tok
+    except Exception:
+        pass
+
+if os.environ.get('HF_TOKEN'):
+    try:
+        from huggingface_hub import login
+        login(token=os.environ['HF_TOKEN'], add_to_git_credential=False)
+    except Exception as _e:
+        print(f"  [hf-auth] login skipped: {type(_e).__name__}: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════════

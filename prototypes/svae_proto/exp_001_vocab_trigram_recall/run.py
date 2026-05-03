@@ -76,7 +76,19 @@ def main(argv=None):
                              'back to the latest epoch_*.pt if best is missing).')
     parser.add_argument('--eval-samples', type=int, default=512,
                         help='Number of test-split samples for the token-level eval.')
+    parser.add_argument('--hf-token', default=None,
+                        help='HuggingFace token. Sets HF_TOKEN env var before '
+                             'the trainer imports huggingface_hub. On Colab, '
+                             'pass `userdata.get("HF_TOKEN")` from a cell '
+                             'before `!python -m ...` (see README).')
     args = parser.parse_args(argv)
+
+    # Set HF_TOKEN BEFORE importing the trainer — its module-level auth
+    # block runs at first import, and HfApi() picks up HF_TOKEN from env.
+    if args.hf_token:
+        os.environ['HF_TOKEN'] = args.hf_token
+        print(f"  [proto001] HF_TOKEN set from --hf-token "
+              f"({len(args.hf_token)} chars)")
 
     # 1. Register the dataset (transient, in-process only)
     _register_dataset()
