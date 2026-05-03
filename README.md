@@ -478,10 +478,10 @@ geolip_svae/
 ├── experimental/         Preserved earlier variants — not the canonical path
 └── tests/                Diagnostic + Phase U lens-scope tests
 
-svae_proto/               SISTER PACKAGE — separate `pip install ./svae_proto`. Self-contained
+svae_proto/               SISTER PACKAGE — separate `pip install ./prototypes`. Self-contained
                           experiment scaffolds (one-way dependency: svae_proto imports
                           from geolip_svae, never the reverse). Per-experiment opt-in
-                          dependency groups via `pip install "./svae_proto[exp_NNN]"`.
+                          dependency groups via `pip install "./prototypes[exp_NNN]"`.
                           See svae_proto/README.md for the contract.
 ```
 
@@ -544,8 +544,8 @@ its experiment-specific deps. Production environments that just want to
 run trained models pay zero cost for experiment infrastructure.
 
 Neither package is on PyPI — both install from GitHub. svae-proto's
-`pyproject.toml` lives in the `svae_proto/` subdirectory, so the URL
-fragment `#subdirectory=svae_proto` is required. svae-proto declares
+`pyproject.toml` lives in the `prototypes/` subdirectory, so the URL
+fragment `#subdirectory=prototypes` is required. svae-proto declares
 `geolip-svae` as a runtime dep (also via git URL), so installing
 svae-proto pulls the core package along automatically — one URL is
 enough for both.
@@ -558,16 +558,16 @@ pip install "git+https://github.com/AbstractEyes/geolip-svae.git"
 
 # Main + experimental scaffolding in one command (single URL — svae-proto
 # pulls geolip-svae transitively):
-pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # With experiment 001's heavy deps (transformers / datasets / sentencepiece):
-pip install "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # Everything across every experiment:
-pip install "svae-proto[all] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "svae-proto[all] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # Pin to a specific tag / branch / commit:
-pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0.9.0#subdirectory=svae_proto"
+pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0.9.0#subdirectory=prototypes"
 ```
 
 ### Colab notebook — inline cell at top of notebook (or above an experiment call)
@@ -586,12 +586,12 @@ the dep tree:
 !pip uninstall -y geolip-svae svae-proto geolip-core \
                   geofractal geometricvocab wide_compiler
 !pip install --no-cache-dir \
-    "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+    "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 ```
 
 That single `pip install` does:
 1. Clones `geolip-svae` repo once.
-2. Reads `svae_proto/pyproject.toml` (because of `#subdirectory=svae_proto`).
+2. Reads `prototypes/pyproject.toml` (because of `#subdirectory=prototypes`).
 3. Sees the dep `geolip-svae @ git+...` and installs the core from the same clone.
 4. Sees the core's dep `geolip-core @ git+...` and installs that too.
 5. Resolves `[exp_001]` extras (transformers, datasets, sentencepiece) plus the rest of the dep tree (torch, etc.) in a single resolution pass.
@@ -620,9 +620,9 @@ git clone https://github.com/AbstractEyes/geolip-svae.git
 cd geolip-svae
 
 pip install .                          # main package
-pip install ./svae_proto               # add svae-proto
-pip install -e ./svae_proto            # editable for live source edits
-pip install "./svae_proto[exp_001]"    # with experiment 001 deps
+pip install ./prototypes               # add svae-proto
+pip install -e ./prototypes            # editable for live source edits
+pip install "./prototypes[exp_001]"    # with experiment 001 deps
 ```
 
 Editable install (`-e`) reads source files directly from the clone, so

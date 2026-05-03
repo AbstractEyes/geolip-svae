@@ -12,25 +12,27 @@ extras for that experiment's dependencies.
 ## Install
 
 `geolip-svae` and `svae-proto` are not on PyPI — both install directly
-from GitHub. The svae-proto distribution lives in the `svae_proto/`
-subdirectory of the geolip-svae repository, so pip needs the
-`#subdirectory=svae_proto` URL fragment to find its `pyproject.toml`.
+from GitHub. The svae-proto distribution lives in the `prototypes/`
+subdirectory of the geolip-svae repository (the importable package
+itself is `svae_proto`, nested one level down inside that). Pip needs
+the `#subdirectory=prototypes` URL fragment to find the
+`pyproject.toml`.
 
 ```bash
 # ─── From GitHub (recommended) ──────────────────────────────────────
 
 # Core only — every experiment can run, but per-experiment deps must be
 # installed separately if needed.
-pip install "git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # With one experiment's heavy deps:
-pip install "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "svae-proto[exp_001] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # Everything (every experiment's deps):
-pip install "svae-proto[all] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=svae_proto"
+pip install "svae-proto[all] @ git+https://github.com/AbstractEyes/geolip-svae.git#subdirectory=prototypes"
 
 # Pin to a specific tag / branch / commit:
-pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0.9.0#subdirectory=svae_proto"
+pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0.9.0#subdirectory=prototypes"
 
 # ─── From a local clone (active development) ────────────────────────
 
@@ -38,10 +40,10 @@ pip install "svae-proto @ git+https://github.com/AbstractEyes/geolip-svae.git@v0
 git clone https://github.com/AbstractEyes/geolip-svae.git
 cd geolip-svae
 
-pip install ./svae_proto                    # core
-pip install -e ./svae_proto                 # editable for live edits
-pip install "./svae_proto[exp_001]"         # one experiment's deps
-pip install "./svae_proto[all]"             # everything
+pip install ./prototypes                    # core
+pip install -e ./prototypes                 # editable for live edits
+pip install "./prototypes[exp_001]"         # one experiment's deps
+pip install "./prototypes[all]"             # everything
 ```
 
 In all cases the install pulls `geolip-svae` along automatically (also
@@ -77,18 +79,26 @@ module and the prototype becomes a historical record of how it got there.
 
 ## Directory naming
 
+The distribution and its importable package live one level apart by
+design — the outer `prototypes/` folder holds only the pip metadata, and
+the inner `svae_proto/` folder is the actual Python package. Without
+that nesting, `setuptools.packages.find` runs from the project root and
+returns an empty list (the project root itself isn't a discoverable
+package), which silently produces a wheel with no importable code.
+
 ```
-svae_proto/
-    pyproject.toml                  # this package
+prototypes/                         # PROJECT ROOT — pip --subdirectory=prototypes
+    pyproject.toml                  # distribution metadata (name = "svae-proto")
     README.md                       # this file
-    __init__.py
-    exp_NNN_short_slug/             # NNN = monotonic 3-digit experiment number
+    svae_proto/                     # IMPORTABLE PACKAGE — `import svae_proto`
         __init__.py
-        NOTES.md                    # hypothesis, success criteria, results
-        dataset.py                  # any new dataset class + factory
-        eval.py                     # any new metric / probe
-        cfg.py                      # the cfg dict(s) under test
-        run.py                      # `python -m svae_proto.exp_NNN_x.run` entry point
+        exp_NNN_short_slug/         # NNN = monotonic 3-digit experiment number
+            __init__.py
+            NOTES.md                # hypothesis, success criteria, results
+            dataset.py              # any new dataset class + factory
+            eval.py                 # any new metric / probe
+            cfg.py                  # the cfg dict(s) under test
+            run.py                  # `python -m svae_proto.exp_NNN_x.run` entry point
 ```
 
 The `exp_` prefix is required — Python module names cannot start with a

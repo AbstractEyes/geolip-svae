@@ -72,7 +72,8 @@ def main(argv=None):
                              '--cfg-override epochs=5 --cfg-override batch_size=32')
     parser.add_argument('--skip-train', action='store_true',
                         help='Skip training; only run the post-train eval '
-                             '(model loaded from save_dir/checkpoints/best.pt).')
+                             '(model loaded from save_dir/best.pt, falling '
+                             'back to the latest epoch_*.pt if best is missing).')
     parser.add_argument('--eval-samples', type=int, default=512,
                         help='Number of test-split samples for the token-level eval.')
     args = parser.parse_args(argv)
@@ -100,19 +101,22 @@ def main(argv=None):
     from .dataset import VocabTrigramDataset
     from .eval import run_vocab_eval
 
+    # Trainer writes checkpoints DIRECTLY into save_dir (not save_dir/checkpoints/).
+    # See geolip_svae/train.py:821 (best.pt) and :825 (epoch_NNNN.pt).
     save_dir = cfg.get('save_dir', '/content/checkpoints')
-    ckpt_path = os.path.join(save_dir, 'checkpoints', 'best.pt')
+    ckpt_path = os.path.join(save_dir, 'best.pt')
     if not os.path.exists(ckpt_path):
-        # Fallback: latest epoch_*.pt
-        ckpt_dir = os.path.join(save_dir, 'checkpoints')
+        # Fallback: latest epoch_*.pt in save_dir
         candidates = sorted(
-            (f for f in os.listdir(ckpt_dir) if f.startswith('epoch_') and f.endswith('.pt')),
+            (f for f in os.listdir(save_dir)
+             if f.startswith('epoch_') and f.endswith('.pt')),
             reverse=True,
-        ) if os.path.isdir(ckpt_dir) else []
+        ) if os.path.isdir(save_dir) else []
         if not candidates:
-            print(f"  [proto001] no checkpoint at {ckpt_path}, skipping eval.")
+            print(f"  [proto001] no checkpoint at {ckpt_path} or epoch_*.pt "
+                  f"under {save_dir}, skipping eval.")
             return
-        ckpt_path = os.path.join(ckpt_dir, candidates[0])
+        ckpt_path = os.path.join(save_dir, candidates[0])
     print(f"  [proto001] loading {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
