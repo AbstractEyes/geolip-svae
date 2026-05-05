@@ -624,7 +624,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     # If shorter wall-clock is needed, drop epochs to 20-30 (still hits or
     # exceeds the noise precedent's 10M total views in 10-30 hours).
     'byte_trigram_proto_64': dict(
-        V=32, D=4, patch_size=2, hidden=64, depth=1, n_cross=1, n_heads=4,
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
         dataset='byte_trigram', img_size=64, batch_size=1024,
