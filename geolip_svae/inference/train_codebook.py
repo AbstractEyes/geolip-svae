@@ -148,7 +148,24 @@ class TopologyReport:
     ripser_available: bool
 
     notes: str = ''
+
     extra: Dict[str, Any] = field(default_factory=dict)
+    # Multi-threshold persistent profile.
+    # θ_deg -> {'H0': {'n_finite': int, 'n_infinite': int}, ...}
+    persistence_profile_by_thresh: Dict[float, Dict[str, Dict[str, int]]] = field(default_factory=dict)
+
+    # θ_deg -> component-size summary from the angular graph at that threshold.
+    component_profile_by_thresh: Dict[float, Dict[str, Any]] = field(default_factory=dict)
+
+    # H0 finite death angles from the largest ripser threshold, in degrees.
+    h0_death_angles_deg: List[float] = field(default_factory=list)
+
+    # Compact omega/infinity diagnostics.
+    h0_finite_count: int = 0
+    h0_infinite_count: int = 0
+    h0_infinite_ratio: float = 0.0
+    h0_finite_ratio: float = 0.0
+    omega_phase: str = "unknown"
 
     def save(self, path: Union[str, Path]) -> Path:
         """Save as JSON. ``path`` is the stem; the file gets ``.json``."""
@@ -280,6 +297,46 @@ def _knn_graph_components_sweep(
     return comps, largest_pct, percolation
 
 
+def _component_profile_at_threshold(
+    ang_dist: np.ndarray,
+    theta_deg: float,
+) -> Dict[str, Any]:
+    """Component-size profile of the angular graph at one threshold.
+
+    This is the practical companion to H0 persistence. Ripser tells us how
+    many H0 classes remain infinite under a threshold; this tells us whether
+    the finite graph components are singleton residents, pairs, or clusters.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = int(ang_dist.shape[0])
+    theta_rad = np.radians(theta_deg)
+    adj = (ang_dist <= theta_rad) & (ang_dist > 0)
+    sparse_adj = csr_matrix(adj.astype(np.int8))
+    n_comp, labels = connected_components(sparse_adj, directed=False)
+
+    sizes = np.bincount(labels).astype(np.int64)
+    size_hist: Dict[int, int] = {}
+    for s in sizes.tolist():
+        size_hist[int(s)] = size_hist.get(int(s), 0) + 1
+
+    singleton_components = int(size_hist.get(1, 0))
+    pair_components = int(size_hist.get(2, 0))
+    cluster_components = int(sum(v for k, v in size_hist.items() if k >= 3))
+    largest = int(sizes.max()) if len(sizes) else 0
+
+    return {
+        "theta_deg": float(theta_deg),
+        "n_components": int(n_comp),
+        "largest_component_size": largest,
+        "largest_component_pct": float(100.0 * largest / max(1, n)),
+        "singleton_components": singleton_components,
+        "pair_components": pair_components,
+        "cluster_components": cluster_components,
+        "component_size_hist": {str(k): int(v) for k, v in sorted(size_hist.items())},
+    }
+
 def _local_intrinsic_dim(
     axes_unit: np.ndarray,
     ang_dist: np.ndarray,
@@ -350,8 +407,81 @@ def _persistent_homology(
             summary[f'H{h_dim}']['cocycles'] = [c.tolist() for c in cc]
     return summary, time.time() - t0
 
+def _persistent_homology_profile(
+    ang_dist: np.ndarray,
+    thresholds_deg: Sequence[float],
+    maxdim: int = 2,
+    do_cocycles: bool = False,
+) -> Tuple[Dict[float, Dict[str, Dict[str, int]]], float]:
+    """Run ripser at multiple thresholds and return finite/infinite counts.
+
+    This is intentionally count-focused. For tiny codebooks the runtime is
+    negligible, and this gives us a phase curve instead of one cutoff snapshot.
+    """
+    profile: Dict[float, Dict[str, Dict[str, int]]] = {}
+    total_seconds = 0.0
+
+    for theta in thresholds_deg:
+        persistence, dt = _persistent_homology(
+            ang_dist,
+            maxdim=maxdim,
+            thresh_deg=float(theta),
+            do_cocycles=do_cocycles,
+        )
+        total_seconds += float(dt)
+
+        if persistence is None:
+            profile[float(theta)] = {}
+            continue
+
+        profile[float(theta)] = {
+            h_key: {
+                "n_finite": int(info["n_finite"]),
+                "n_infinite": int(info["n_infinite"]),
+            }
+            for h_key, info in persistence.items()
+        }
+
+    return profile, total_seconds
 
 # ── Public topology entry points ────────────────────────────────────
+def _classify_omega_phase(
+    n_axes: int,
+    h0_finite: int,
+    h0_infinite: int,
+    component_profile: Dict[str, Any],
+    angular_p50_deg: float,
+) -> str:
+    """Classify the visible topology phase of a codebook axis cloud.
+
+    This is descriptive telemetry, not a loss and not a proof by itself.
+    """
+    if n_axes <= 0:
+        return "empty"
+
+    infinite_ratio = h0_infinite / max(1, n_axes)
+    finite_ratio = h0_finite / max(1, n_axes)
+
+    pair_components = int(component_profile.get("pair_components", 0))
+    cluster_components = int(component_profile.get("cluster_components", 0))
+    largest_pct = float(component_profile.get("largest_component_pct", 0.0))
+
+    if infinite_ratio >= 0.85 and h0_finite <= 1:
+        return "persistent_infinity_field"
+
+    if infinite_ratio >= 0.75 and pair_components >= 1 and cluster_components == 0:
+        return "infinity_pair_field"
+
+    if 0.60 <= infinite_ratio < 0.85 and h0_finite >= 3 and largest_pct < 20.0:
+        return "rupture_coalescence_field"
+
+    if largest_pct >= 50.0:
+        return "percolated_cluster_field"
+
+    if finite_ratio >= 0.25:
+        return "finite_carrier_field"
+
+    return "mixed_resident_field"
 
 def run_topology_analysis(
     codebook: Union[Codebook, torch.Tensor, np.ndarray],
@@ -361,22 +491,155 @@ def run_topology_analysis(
     ),
     local_pca_k: int = 10,
     ripser_thresh_deg: float = 20.0,
+    ripser_profile_thresholds_deg: Sequence[float] = (
+        20.0, 30.0, 45.0, 60.0,
+    ),
     ripser_maxdim: int = 2,
     do_cocycles: bool = False,
     notes: str = '',
 ) -> TopologyReport:
-    """Run all three probes (kNN-graph / local PCA / ripser PH) on a
-    single axis cloud and return a ``TopologyReport``.
+    """Run topology probes over a codebook axis cloud.
 
-    Accepts a ``Codebook`` (uses ``.axes``), a torch tensor, or a numpy
-    array of shape ``[n_axes, D]``. Axes are normalized to unit-norm
-    internally; sign canonicalization is the caller's responsibility
-    (codebooks emitted by ``extract_codebook`` are already canonicalized).
+    This version preserves the original public return type while adding
+    omega/infinity telemetry under ``TopologyReport.extra``:
+
+        extra["omega_phase"]
+        extra["h0_finite_count"]
+        extra["h0_infinite_count"]
+        extra["h0_infinite_ratio"]
+        extra["h0_death_angles_deg"]
+        extra["component_profile_by_thresh"]
+        extra["persistence_profile_by_thresh"]
+
+    The main ``persistence_*`` fields still represent the primary
+    ``ripser_thresh_deg`` cutoff, preserving backward compatibility.
     """
+
+    def _component_profile_at_threshold(
+        ang_dist_local: np.ndarray,
+        theta_deg: float,
+    ) -> Dict[str, Any]:
+        """Connected-component profile of angular graph at one threshold."""
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        n_local = int(ang_dist_local.shape[0])
+        theta_rad = np.radians(float(theta_deg))
+
+        adj = (ang_dist_local <= theta_rad) & (ang_dist_local > 0)
+        sparse_adj = csr_matrix(adj.astype(np.int8))
+
+        n_comp, labels = connected_components(sparse_adj, directed=False)
+        sizes = np.bincount(labels).astype(np.int64)
+
+        size_hist: Dict[int, int] = {}
+        for size in sizes.tolist():
+            size_hist[int(size)] = size_hist.get(int(size), 0) + 1
+
+        largest = int(sizes.max()) if len(sizes) else 0
+        singleton_components = int(size_hist.get(1, 0))
+        pair_components = int(size_hist.get(2, 0))
+        cluster_components = int(
+            sum(count for size, count in size_hist.items() if size >= 3)
+        )
+
+        return {
+            "theta_deg": float(theta_deg),
+            "n_components": int(n_comp),
+            "largest_component_size": largest,
+            "largest_component_pct": float(100.0 * largest / max(1, n_local)),
+            "singleton_components": singleton_components,
+            "pair_components": pair_components,
+            "cluster_components": cluster_components,
+            "component_size_hist": {
+                str(size): int(count)
+                for size, count in sorted(size_hist.items())
+            },
+        }
+
+    def _ripser_count_profile(
+        ang_dist_local: np.ndarray,
+        thresholds_deg: Sequence[float],
+        *,
+        maxdim: int,
+    ) -> Tuple[Dict[str, Dict[str, Dict[str, int]]], float]:
+        """Run ripser over several thresholds and keep finite/infinite counts."""
+        profile: Dict[str, Dict[str, Dict[str, int]]] = {}
+        total_seconds = 0.0
+
+        for theta in thresholds_deg:
+            persistence_at_theta, dt = _persistent_homology(
+                ang_dist_local,
+                maxdim=maxdim,
+                thresh_deg=float(theta),
+                do_cocycles=False,
+            )
+            total_seconds += float(dt)
+
+            theta_key = str(float(theta))
+            profile[theta_key] = {}
+
+            if persistence_at_theta is None:
+                continue
+
+            for h_key, info in persistence_at_theta.items():
+                profile[theta_key][h_key] = {
+                    "n_finite": int(info.get("n_finite", 0)),
+                    "n_infinite": int(info.get("n_infinite", 0)),
+                }
+
+        return profile, total_seconds
+
+    def _classify_omega_phase(
+        *,
+        n_axes_local: int,
+        h0_finite: int,
+        h0_infinite: int,
+        component_profile: Dict[str, Any],
+    ) -> str:
+        """Descriptive phase label for omega/infinity codebook behavior.
+
+        This is telemetry only. It is not a loss and not a proof by itself.
+        """
+        if n_axes_local <= 0:
+            return "empty"
+
+        finite_ratio = h0_finite / max(1, n_axes_local)
+        infinite_ratio = h0_infinite / max(1, n_axes_local)
+
+        pair_components = int(component_profile.get("pair_components", 0))
+        cluster_components = int(component_profile.get("cluster_components", 0))
+        largest_pct = float(component_profile.get("largest_component_pct", 0.0))
+
+        # High-infinity, almost no finite rupture.
+        if infinite_ratio >= 0.85 and h0_finite <= 1:
+            return "persistent_infinity_field"
+
+        # High-infinity but with several finite H0 ruptures.
+        if infinite_ratio >= 0.70 and h0_finite >= 3 and largest_pct < 25.0:
+            return "rupture_coalescence_field"
+
+        # Mostly infinite with visible pair components but no larger clusters.
+        if infinite_ratio >= 0.70 and pair_components >= 1 and cluster_components == 0:
+            return "infinity_pair_field"
+
+        # Graph has formed a dominant connected body.
+        if largest_pct >= 50.0:
+            return "percolated_cluster_field"
+
+        # Many finite deaths, but no giant component.
+        if finite_ratio >= 0.25:
+            return "finite_carrier_field"
+
+        return "mixed_resident_field"
+
+    # ── Resolve axes ────────────────────────────────────────────────
+
     if isinstance(codebook, Codebook):
         axes = codebook.axes
     else:
         axes = codebook
+
     axes_unit = _normalize_axes(axes)
     n, D = axes_unit.shape
 
@@ -384,57 +647,193 @@ def run_topology_analysis(
     triu = np.triu_indices(n, k=1)
     ang_off_diag = ang_dist[triu]
 
-    # Probe A
+    if len(ang_off_diag) == 0:
+        angular_p25 = angular_p50 = angular_p75 = angular_p95 = 0.0
+    else:
+        angular_p25 = float(np.degrees(np.percentile(ang_off_diag, 25)))
+        angular_p50 = float(np.degrees(np.percentile(ang_off_diag, 50)))
+        angular_p75 = float(np.degrees(np.percentile(ang_off_diag, 75)))
+        angular_p95 = float(np.degrees(np.percentile(ang_off_diag, 95)))
+
+    # ── Probe A: kNN/component sweep ────────────────────────────────
+
     comps, largest_pct, percolation = _knn_graph_components_sweep(
-        ang_dist, knn_threshold_grid_deg,
-    )
-    # Probe B
-    local_count, local_pr = _local_intrinsic_dim(
-        axes_unit, ang_dist, k=local_pca_k,
-    )
-    # Probe C
-    persistence, ripser_seconds = _persistent_homology(
-        ang_dist, maxdim=ripser_maxdim,
-        thresh_deg=ripser_thresh_deg, do_cocycles=do_cocycles,
+        ang_dist,
+        knn_threshold_grid_deg,
     )
 
-    # Top persistent features per H_k (degrees)
+    # Rich component profile at all requested ripser profile thresholds.
+    component_profile_by_thresh = {
+        str(float(theta)): _component_profile_at_threshold(ang_dist, float(theta))
+        for theta in ripser_profile_thresholds_deg
+    }
+
+    # Ensure the main ripser threshold also exists in component profile.
+    main_theta_key = str(float(ripser_thresh_deg))
+    if main_theta_key not in component_profile_by_thresh:
+        component_profile_by_thresh[main_theta_key] = _component_profile_at_threshold(
+            ang_dist,
+            float(ripser_thresh_deg),
+        )
+
+    main_component_profile = component_profile_by_thresh[main_theta_key]
+
+    # ── Probe B: local intrinsic dimension ──────────────────────────
+
+    local_count, local_pr = _local_intrinsic_dim(
+        axes_unit,
+        ang_dist,
+        k=min(local_pca_k, max(1, n - 1)),
+    )
+
+    if len(local_pr):
+        local_dim_pr_p25 = float(np.percentile(local_pr, 25))
+        local_dim_pr_p50 = float(np.percentile(local_pr, 50))
+        local_dim_pr_p75 = float(np.percentile(local_pr, 75))
+    else:
+        local_dim_pr_p25 = 0.0
+        local_dim_pr_p50 = 0.0
+        local_dim_pr_p75 = 0.0
+
+    local_dim_count_mode = (
+        int(np.bincount(local_count).argmax())
+        if len(local_count)
+        else 0
+    )
+
+    # ── Probe C: primary ripser persistent homology ─────────────────
+
+    persistence, ripser_seconds = _persistent_homology(
+        ang_dist,
+        maxdim=ripser_maxdim,
+        thresh_deg=ripser_thresh_deg,
+        do_cocycles=do_cocycles,
+    )
+
     top_features: Dict[str, List[List[float]]] = {}
     persistence_diagrams: Dict[str, List[List[float]]] = {}
     persistence_n_finite: Dict[str, int] = {}
     persistence_n_infinite: Dict[str, int] = {}
+
     if persistence is not None:
         for h_key, info in persistence.items():
-            finite = np.asarray(info['finite']) if info['finite'] else np.zeros((0, 2))
+            finite = (
+                np.asarray(info["finite"], dtype=np.float64)
+                if info["finite"]
+                else np.zeros((0, 2), dtype=np.float64)
+            )
+
             persistence_diagrams[h_key] = finite.tolist()
-            persistence_n_finite[h_key] = info['n_finite']
-            persistence_n_infinite[h_key] = info['n_infinite']
+            persistence_n_finite[h_key] = int(info["n_finite"])
+            persistence_n_infinite[h_key] = int(info["n_infinite"])
+
             if len(finite) > 0:
                 persistences = finite[:, 1] - finite[:, 0]
                 top_idx = np.argsort(persistences)[::-1][:10]
                 top_features[h_key] = [
-                    [float(np.degrees(finite[i, 0])),
-                     float(np.degrees(finite[i, 1])),
-                     float(np.degrees(persistences[i]))]
+                    [
+                        float(np.degrees(finite[i, 0])),
+                        float(np.degrees(finite[i, 1])),
+                        float(np.degrees(persistences[i])),
+                    ]
                     for i in top_idx
                 ]
             else:
                 top_features[h_key] = []
 
+    # Multi-threshold ripser count profile.
+    persistence_profile_by_thresh, profile_seconds = _ripser_count_profile(
+        ang_dist,
+        ripser_profile_thresholds_deg,
+        maxdim=ripser_maxdim,
+    )
+    ripser_seconds = float(ripser_seconds + profile_seconds)
+
+    # ── Omega / infinity telemetry ─────────────────────────────────
+
+    h0_finite_count = int(persistence_n_finite.get("H0", 0))
+    h0_infinite_count = int(persistence_n_infinite.get("H0", 0))
+
+    h0_finite_ratio = float(h0_finite_count / max(1, n))
+    h0_infinite_ratio = float(h0_infinite_count / max(1, n))
+
+    h0_death_angles_deg: List[float] = []
+    if "H0" in persistence_diagrams and persistence_diagrams["H0"]:
+        h0_arr = np.asarray(persistence_diagrams["H0"], dtype=np.float64)
+        if h0_arr.ndim == 2 and h0_arr.shape[1] >= 2:
+            h0_death_angles_deg = [
+                float(x) for x in np.degrees(h0_arr[:, 1]).tolist()
+            ]
+
+    if h0_death_angles_deg:
+        h0_death_stats_deg = {
+            "min": float(np.min(h0_death_angles_deg)),
+            "p25": float(np.percentile(h0_death_angles_deg, 25)),
+            "p50": float(np.percentile(h0_death_angles_deg, 50)),
+            "p75": float(np.percentile(h0_death_angles_deg, 75)),
+            "max": float(np.max(h0_death_angles_deg)),
+        }
+    else:
+        h0_death_stats_deg = {
+            "min": None,
+            "p25": None,
+            "p50": None,
+            "p75": None,
+            "max": None,
+        }
+
+    omega_phase = _classify_omega_phase(
+        n_axes_local=int(n),
+        h0_finite=h0_finite_count,
+        h0_infinite=h0_infinite_count,
+        component_profile=main_component_profile,
+    )
+
+    extra = {
+        "omega_phase": omega_phase,
+        "h0_finite_count": h0_finite_count,
+        "h0_infinite_count": h0_infinite_count,
+        "h0_finite_ratio": h0_finite_ratio,
+        "h0_infinite_ratio": h0_infinite_ratio,
+        "h0_death_angles_deg": h0_death_angles_deg,
+        "h0_death_stats_deg": h0_death_stats_deg,
+        "component_profile_by_thresh": component_profile_by_thresh,
+        "persistence_profile_by_thresh": persistence_profile_by_thresh,
+        "main_component_profile": main_component_profile,
+        "ripser_profile_thresholds_deg": [float(x) for x in ripser_profile_thresholds_deg],
+        "interpretation": {
+            "persistent_infinity_field": (
+                "Most H0 classes remain infinite under the threshold; "
+                "axis residents are mostly separated and persistent."
+            ),
+            "rupture_coalescence_field": (
+                "Many axes persist, but several finite H0 deaths indicate "
+                "controlled local coalescence/rupture."
+            ),
+            "infinity_pair_field": (
+                "Mostly persistent infinity axes with small pair components."
+            ),
+            "finite_carrier_field": (
+                "Finite merge activity is high enough to indicate a carrier "
+                "rather than pure infinity field."
+            ),
+        }.get(omega_phase, "Mixed or transitional topology phase."),
+    }
+
     return TopologyReport(
         n_axes=int(n),
         D=int(D),
-        angular_dist_p25_deg=float(np.degrees(np.percentile(ang_off_diag, 25))),
-        angular_dist_p50_deg=float(np.degrees(np.percentile(ang_off_diag, 50))),
-        angular_dist_p75_deg=float(np.degrees(np.percentile(ang_off_diag, 75))),
-        angular_dist_p95_deg=float(np.degrees(np.percentile(ang_off_diag, 95))),
+        angular_dist_p25_deg=angular_p25,
+        angular_dist_p50_deg=angular_p50,
+        angular_dist_p75_deg=angular_p75,
+        angular_dist_p95_deg=angular_p95,
         knn_components_at_thresh=comps,
         knn_largest_pct_at_thresh=largest_pct,
         percolation_thresh_deg=percolation,
-        local_dim_pr_p25=float(np.percentile(local_pr, 25)),
-        local_dim_pr_p50=float(np.percentile(local_pr, 50)),
-        local_dim_pr_p75=float(np.percentile(local_pr, 75)),
-        local_dim_count_mode=int(np.bincount(local_count).argmax()) if len(local_count) else 0,
+        local_dim_pr_p25=local_dim_pr_p25,
+        local_dim_pr_p50=local_dim_pr_p50,
+        local_dim_pr_p75=local_dim_pr_p75,
+        local_dim_count_mode=local_dim_count_mode,
         persistence_diagrams=persistence_diagrams,
         persistence_n_finite=persistence_n_finite,
         persistence_n_infinite=persistence_n_infinite,
@@ -443,8 +842,8 @@ def run_topology_analysis(
         ripser_compute_seconds=float(ripser_seconds),
         ripser_available=bool(HAVE_RIPSER),
         notes=notes,
+        extra=extra,
     )
-
 
 def run_array_topology_analysis(
     codebooks: Sequence[Codebook],
@@ -619,11 +1018,17 @@ def create_codebook(
         topology = run_topology_analysis(cb, **topo_kwargs)
         topology.save(cb_stem.with_name(cb_stem.name + '__topology'))
         h_summary = ', '.join(
-            f"{k}={v}" for k, v in topology.persistence_n_finite.items()
+            f"{k}_finite={v}/inf={topology.persistence_n_infinite.get(k, 0)}"
+            for k, v in topology.persistence_n_finite.items()
         )
-        print(f"  [create_codebook] topology: {h_summary} "
-              f"(ripser={'yes' if topology.ripser_available else 'NO'}, "
-              f"{topology.ripser_compute_seconds:.1f}s)")
+        print(
+            f"  [create_codebook] topology: {h_summary}; "
+            f"phase={topology.omega_phase}; "
+            f"H0∞={topology.h0_infinite_count}/{topology.n_axes} "
+            f"({100.0 * topology.h0_infinite_ratio:.1f}%) "
+            f"(ripser={'yes' if topology.ripser_available else 'NO'}, "
+            f"{topology.ripser_compute_seconds:.3f}s)"
+        )
     elif run_topology:
         print(f"  [create_codebook] topology skipped (n_axes={cb.n_axes} < 4)")
 
