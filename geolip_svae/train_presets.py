@@ -72,7 +72,7 @@ Per-site activations:
     The legacy ``activation='gelu'`` shortcut still works — it now means
     ``activations={'enc_in': activation}``.
 """
-
+import math
 from typing import Any, Dict
 
 
@@ -148,9 +148,9 @@ TEMPLATE: Dict[str, Any] = dict(
     cv_weight     = 0.3,               # Weight on the CV penalty term.
     boost         = 0.5,               # Multiplier applied when CV is below the band.
     sigma         = 0.15,              # CV softness scale.
-    cv_band_lo    = 0.13,              # Low edge of the in-band region. Default for V=256/D=16
+    cv_band_lo    = 0.25,              # Low edge of the in-band region. Default for V=256/D=16
                                        # noise. h2-class (V=32/D=4) lives ~0.85-1.05; override.
-    cv_band_hi    = 0.30,              # High edge of the in-band region.
+    cv_band_hi    = 1.25,              # High edge of the in-band region.
 
     # ── Schedule / data filtering ────────────────────────────────────
     pretrained    = None,              # HF path under hf_repo, e.g.
@@ -627,6 +627,44 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
         # report_every=500 gives ~8 reports per epoch including end.
         #pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
+        report_every=500,
+    ),
+
+    'byte_trigram_proto_64_radmag_1': dict(
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        readout_radial_power=math.pi,
+        dataset='byte_trigram', img_size=64, batch_size=1024,
+        lr=1e-3, epochs=50, target_cv=1.0, cv_weight=0.01,
+        cv_band_lo=0.80, cv_band_hi=1.3,
+        hf_version='byte_trigram_proto_64_radmag_1', save_every=5,
+        ds_size=1_000_000, val_size=10_000,
+        # ByteTrigram config — same corpus as the 256×256 run
+        # No max_corpus_bytes; load the full ~500MB wikitext-103.
+        bt_corpus='wikitext-103-raw-v1',
+        # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
+        # report_every=500 gives ~8 reports per epoch including end.
+        # pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
+        report_every=500,
+    ),
+
+    'byte_trigram_proto_64_pi_radmag_pi': dict(
+        V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
+        smooth_mid=16,
+        linear_readout=True, svd_mode='none', match_params=True,
+        readout_radial_power=math.pi,
+        dataset='byte_trigram', img_size=64, batch_size=1024,
+        lr=1e-3, epochs=50, target_cv=1.0, cv_weight=0.01,
+        cv_band_lo=0.80, cv_band_hi=1.3,
+        hf_version='byte_trigram_proto_64_pi_radmag_pi', save_every=5,
+        ds_size=1_000_000, val_size=10_000,
+        # ByteTrigram config — same corpus as the 256×256 run
+        # No max_corpus_bytes; load the full ~500MB wikitext-103.
+        bt_corpus='wikitext-103-raw-v1',
+        # Diagnostics cadence — at ds_size/batch ≈ 3906 batches/epoch,
+        # report_every=500 gives ~8 reports per epoch including end.
+        # pretrained='byte_trigram_proto_128_v1/checkpoints/best.pt',
         report_every=500,
     ),
 }
