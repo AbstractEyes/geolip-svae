@@ -634,7 +634,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         V=32, D=4, patch_size=4, hidden=64, depth=1, n_cross=1, n_heads=4,
         smooth_mid=16,
         linear_readout=True, svd_mode='none', match_params=True,
-        readout_radial_power=math.pi,
+        readout_radial_power=1.0,
         dataset='byte_trigram', img_size=64, batch_size=1024,
         lr=1e-3, epochs=50, target_cv=1.0, cv_weight=0.01,
         cv_band_lo=0.80, cv_band_hi=1.3,
