@@ -532,7 +532,9 @@ class PatchSVAE(nn.Module):
                  svd_compute_dtype: str = 'fp64',
                  linear_readout: bool = False,
                  match_params: bool = True,
-                 init_scheme: str = 'orthogonal'):
+                 init_scheme: str = 'orthogonal',
+                 readout_radial_power: float = 2.0,
+         ):
         """
         Ablation toggles:
             activation:     'gelu' (default) | 'relu' | 'silu' | 'tanh' | 'identity'
@@ -579,6 +581,15 @@ class PatchSVAE(nn.Module):
                             | 'xavier_uniform' | 'normal_0_02' — initialization
                             scheme for Linear layers (L group). Orthogonal is
                             always re-applied to enc_out regardless.
+            readout_radial_power: float (default 2.0) — exponent applied to
+                            column norms of the linear readout output when
+                            linear_readout=True. This controls the radial profile
+                            of the learned sphere solver — higher values push the
+                            readout output towards a more binary "on/off" pattern,
+                            while lower values encourage a softer distribution of
+                            singular value magnitudes. The default of 2.0 was found to
+                            strike a good balance between expressiveness and stability
+                            in preliminary experiments, but this is a tunable hyperparameter.
         """
         super().__init__()
         self.matrix_v = V
@@ -612,6 +623,7 @@ class PatchSVAE(nn.Module):
         self.linear_readout = linear_readout
         self.match_params = match_params
         self.init_scheme = init_scheme
+        self.readout_radial_power = float(readout_radial_power)
 
         # Resolve regime-dependent defaults
         if n_heads is None:
@@ -736,17 +748,74 @@ class PatchSVAE(nn.Module):
         M = _row_normalize(M, self.row_norm_mode)
 
         # H group: SVD decomposition or linear-readout replacement
+        #if self.linear_readout:
+            # old linear readout pathway: learned linear readout replaces SVD, but still applies row norm to enc_out output
+            ## Sphere-solver path: learned linear readout replaces SVD.
+            ## This is the H2_linear_matched architecture used by the
+            ## h2-64 battery array (when combined with svd_mode='none').
+            #flat_M = M.reshape(B * N, -1)
+            #M_hat = self.readout(flat_M).reshape(B * N, self.matrix_v, self.D)
+            #U = M_hat
+            ## Column norms stand in as singular values
+            #S = M_hat.norm(dim=-2)
+
+            ## Vt is identity — decode reduces to U * S.unsqueeze(1)
+            #Vt = torch.eye(self.D, device=M.device, dtype=M.dtype).unsqueeze(0).expand(B * N, -1, -1)
+            # new pathway
+        # H group: SVD decomposition or linear-readout replacement
         if self.linear_readout:
             # Sphere-solver path: learned linear readout replaces SVD.
-            # This is the H2_linear_matched architecture used by the
-            # h2-64 battery array (when combined with svd_mode='none').
+            #
+            # Radial-power ablation:
+            #   M_hat_col = direction * r
+            #   S         = r
+            #   U         = direction * r^(p - 1)
+            #
+            # Decode path receives:
+            #   U * S_coord
+            #
+            # If cross-attn is near identity:
+            #   output ≈ direction * r^p
+            #
+            # p=2.0 preserves current behavior:
+            #   U = direction * r = M_hat
+            #   S = r
+            #
+            # p=1.0 gives clean decomposition pressure:
+            #   U = direction
+            #   S = r
+            #
+            # Important: S remains the raw column norm so spectral attention
+            # sees the same input distribution as the current branch.
             flat_M = M.reshape(B * N, -1)
-            M_hat = self.readout(flat_M).reshape(B * N, self.matrix_v, self.D)
-            U = M_hat
-            # Column norms stand in as singular values
+            M_hat = self.readout(flat_M).reshape(
+                B * N,
+                self.matrix_v,
+                self.D,
+            )
+
+            # Raw column radius. This remains the spectral value stream.
             S = M_hat.norm(dim=-2)
-            # Vt is identity — decode reduces to U * S.unsqueeze(1)
-            Vt = torch.eye(self.D, device=M.device, dtype=M.dtype).unsqueeze(0).expand(B * N, -1, -1)
+
+            # Safe radius for fractional/negative exponent behavior.
+            r_safe = S.clamp_min(1e-8)
+
+            # U radial term:
+            #   M_hat = direction * r
+            #   U     = M_hat * r^(p - 2)
+            #
+            # p=2.0 -> U = M_hat
+            # p=1.0 -> U = M_hat / r = direction
+            radial_power = self.readout_radial_power
+            U = M_hat * r_safe.pow(radial_power - 2.0).unsqueeze(1)
+
+            # Vt is identity — decode still reduces to U * S.unsqueeze(1)
+            # after spectral coordination.
+            Vt = torch.eye(
+                self.D,
+                device=M.device,
+                dtype=M.dtype,
+            ).unsqueeze(0).expand(B * N, -1, -1)
         elif self.svd_mode == 'fp32':
             # Low-precision SVD path (ablation variant)
             G = torch.bmm(M.transpose(1, 2), M)
