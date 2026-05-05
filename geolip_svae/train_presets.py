@@ -630,7 +630,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         dataset='byte_trigram', img_size=64, batch_size=1024,
         lr=1e-3, epochs=50, target_cv=1.0, cv_weight=0.01,
         cv_band_lo=0.80, cv_band_hi=1.3,
-        hf_version='byte_trigram_proto_64_patch_2_v1', save_every=5,
+        hf_version='byte_trigram_proto_64_patch_4_v1', save_every=5,
         ds_size=1_000_000, val_size=10_000,
         # ByteTrigram config — same corpus as the 256×256 run
         # No max_corpus_bytes; load the full ~500MB wikitext-103.
