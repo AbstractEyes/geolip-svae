@@ -200,7 +200,7 @@ def train(cfg: Dict[str, Any]):
     n_heads        = cfg.get('n_heads', None)
     smooth_mid     = cfg.get('smooth_mid', None)
     linear_readout = cfg.get('linear_readout', False)
-    linear_readout_power = cfg.get('linear_readout_power', 2.0)
+    readout_radial_power = cfg.get('readout_radial_power', 2.0)
     svd_mode       = cfg.get('svd_mode', 'default')
     match_params   = cfg.get('match_params', True)
     channels       = cfg.get('channels', 3)
@@ -307,7 +307,7 @@ def train(cfg: Dict[str, Any]):
         linear_readout=linear_readout,
         match_params=match_params,
         init_scheme=init_scheme,
-        linear_readout_power=linear_readout_power,
+        readout_radial_power=readout_radial_power,
     )
     if n_heads is not None:
         model_kwargs['n_heads'] = n_heads
@@ -418,7 +418,7 @@ def train(cfg: Dict[str, Any]):
     if linear_readout:
         path = (f"linear-readout (sphere-solver) — SVD bypassed; "
                 f"learned nn.Linear(V*D, V*D) replaces U·S·Vt"
-                f" — power={linear_readout_power}")
+                f" — power={readout_radial_power}")
     elif svd_mode == 'fp32':
         path = "encode_patches fp32 ablation — torch.linalg.eigh @ fp32 (no autocast)"
     elif svd_mode == 'fp64':
@@ -494,7 +494,7 @@ def train(cfg: Dict[str, Any]):
                 'svd_method': svd_method,
                 'svd_compute_dtype': svd_compute_dtype,
                 'linear_readout': linear_readout,
-                'linear_readout_power': linear_readout_power,
+                'readout_radial_power': readout_radial_power,
                 'match_params': match_params,
                 'init_scheme': init_scheme,
                 'target_cv': target_cv, 'dataset': dataset,
