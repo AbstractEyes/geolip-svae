@@ -124,6 +124,7 @@ TEMPLATE: Dict[str, Any] = dict(
     match_params      = True,       # When linear_readout=True: True → nn.Linear(V*D, V*D),
                                     # False → nn.Identity. False is param-saving but
                                     # geometrically degenerate.
+    readout_radial_power = 2.0,     # When linear_readout=True: power for the radial component of the learned readout.
     init_scheme       = 'orthogonal',  # L-group: 'orthogonal' (default) | 'kaiming_normal' |
                                        # 'xavier_uniform' | 'normal_0_02'. enc_out always
                                        # gets re-orthogonalized regardless.
