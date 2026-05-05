@@ -1006,5 +1006,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main(['--preset', 't1_ps4_d4_v32_h128_svd'])
+    main()#['--preset', 't1_ps4_d4_v32_h128_svd'])
     #main(['--preset', 'h2_64_1channel'])
