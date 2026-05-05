@@ -173,6 +173,17 @@ TEMPLATE: Dict[str, Any] = dict(
     # ── Output paths / HF upload ─────────────────────────────────────
     save_dir      = '/content/checkpoints',         # Local checkpoint directory.
     hf_repo       = 'AbstractPhil/geolip-SVAE',     # HF model repo id.
+    hf_token      = None,              # HuggingFace API token. Normally LEFT
+                                       # NONE in committed cfg dicts (it's a
+                                       # secret). Set via:
+                                       #   - CLI:  --hf-token $TOKEN
+                                       #   - env:  HF_TOKEN env var (auto-picked)
+                                       #   - prog: cfg['hf_token'] = '...' before
+                                       #           calling train(cfg)
+                                       # When set in cfg, the trainer populates
+                                       # os.environ['HF_TOKEN'] and calls
+                                       # huggingface_hub.login() before any
+                                       # HfApi() calls fire.
     tb_dir        = '/content/runs',                # TensorBoard log directory.
     upload        = True,              # Upload checkpoints + logs + report to HF.
 

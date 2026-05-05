@@ -267,6 +267,21 @@ def train(cfg: Dict[str, Any]):
     print(f"  TensorBoard: {tb_path}")
 
     # ── HuggingFace ──
+    # Programmatic-use path: cfg can carry hf_token directly. CLI users
+    # set it via --hf-token (which also lands in os.environ['HF_TOKEN']
+    # before train() is called). We populate env + login here too so
+    # `from geolip_svae.train import train; train(my_cfg)` works without
+    # the caller having to pre-set HF_TOKEN themselves.
+    cfg_hf_token = cfg.get('hf_token', None)
+    if cfg_hf_token and not os.environ.get('HF_TOKEN'):
+        os.environ['HF_TOKEN'] = cfg_hf_token
+        try:
+            from huggingface_hub import login as _hf_login
+            _hf_login(token=cfg_hf_token, add_to_git_credential=False)
+        except Exception as _e:
+            print(f"  [hf-auth] login from cfg['hf_token'] failed: "
+                  f"{type(_e).__name__}: {_e}")
+
     hf_enabled = False
     api = None
     if upload:
@@ -966,8 +981,33 @@ def main(argv=None):
                         help='Override epochs from preset')
     parser.add_argument('--no-upload', action='store_true',
                         help='Disable HF upload')
+    parser.add_argument('--hf-token', default=None,
+                        help='HuggingFace token. Sets HF_TOKEN env var and '
+                             'logs in to huggingface_hub before training. '
+                             'On Colab, pass `userdata.get("HF_TOKEN")` from '
+                             'a cell before invoking, e.g. '
+                             '`!python -m geolip_svae.train --preset NAME '
+                             '--hf-token {HF}`.')
+    parser.add_argument('--hf-repo', default=None,
+                        help='Override hf_repo from preset (where checkpoints '
+                             'and reports upload to).')
+    parser.add_argument('--hf-version', default=None,
+                        help='Override hf_version from preset (per-run name '
+                             'used as both the HF prefix and the local run id).')
     # Tolerate unknown args (e.g. Jupyter's stray flags). We don't error on them.
     args, unknown = parser.parse_known_args(argv)
+
+    # --hf-token must be processed BEFORE train(cfg) imports/calls
+    # huggingface_hub.HfApi(), so HF_TOKEN is in env when whoami() fires.
+    if args.hf_token:
+        os.environ['HF_TOKEN'] = args.hf_token
+        print(f"  [main] HF_TOKEN set from --hf-token "
+              f"({len(args.hf_token)} chars)")
+        try:
+            from huggingface_hub import login as _hf_login
+            _hf_login(token=args.hf_token, add_to_git_credential=False)
+        except Exception as _e:
+            print(f"  [main] hf login failed: {type(_e).__name__}: {_e}")
     if unknown:
         # Quiet warning — not an error since we expect Jupyter pollution
         print(f"  [main] Ignoring unknown args: {unknown}")
@@ -1000,6 +1040,13 @@ def main(argv=None):
         cfg['epochs'] = args.epochs
     if args.no_upload:
         cfg['upload'] = False
+    if args.hf_repo is not None:
+        cfg['hf_repo'] = args.hf_repo
+    if args.hf_version is not None:
+        cfg['hf_version'] = args.hf_version
+    if args.hf_token is not None:
+        # Make the token visible to programmatic callers via cfg too.
+        cfg['hf_token'] = args.hf_token
 
     torch.set_float32_matmul_precision('high')
     train(cfg)
