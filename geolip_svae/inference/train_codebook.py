@@ -187,9 +187,18 @@ class TopologyReport:
             path = path.with_suffix('.json')
         with open(path) as f:
             d = json.load(f)
-        # JSON serialization stringifies dict keys; coerce θ keys back to float
-        for k in ('knn_components_at_thresh', 'knn_largest_pct_at_thresh'):
-            d[k] = {float(t): v for t, v in d[k].items()}
+        # JSON stringifies dict keys; coerce every θ-keyed dict back to float.
+        # Missing-key safe — reports saved before the topology-profile fields
+        # existed will simply not have those keys, and dataclass defaults
+        # fill them in.
+        for k in (
+            'knn_components_at_thresh',
+            'knn_largest_pct_at_thresh',
+            'persistence_profile_by_thresh',
+            'component_profile_by_thresh',
+        ):
+            if k in d and d[k] is not None:
+                d[k] = {float(t): v for t, v in d[k].items()}
         return cls(**d)
 
 
@@ -444,6 +453,48 @@ def _persistent_homology_profile(
 
     return profile, total_seconds
 
+# ── Omega phase classifier ─────────────────────────────────────────
+#
+# OMEGA_PHASES is the closed vocabulary of phase labels that
+# _classify_omega_phase can return. It's stored on TopologyReport.omega_phase.
+# Use this as the source-of-truth instead of grepping the classifier body
+# when matching against report.omega_phase downstream.
+
+OMEGA_PHASES: Tuple[str, ...] = (
+    'empty',                          # n_axes <= 0
+    'persistent_infinity_field',      # ≥85% infinite H0, ≤1 finite
+    'infinity_pair_field',            # ≥75% infinite, ≥1 pair-component, no clusters
+    'rupture_coalescence_field',      # 60-85% infinite, ≥3 finite, largest cluster <20%
+    'percolated_cluster_field',       # ≥50% of axes in a single connected component
+    'finite_carrier_field',           # ≥25% finite H0
+    'mixed_resident_field',           # fallback — none of the above patterns dominate
+)
+
+OMEGA_PHASE_DESCRIPTIONS: Dict[str, str] = {
+    'empty':
+        'Codebook has zero axes (n_axes ≤ 0).',
+    'persistent_infinity_field':
+        'Nearly every H0 component persists across all ripser thresholds. '
+        'Axes are well-separated antipodal pairs forming an isolated cloud.',
+    'infinity_pair_field':
+        'Strong persistent fraction with explicit pair-components in the '
+        'angular graph and no clusters of size ≥3. Antipodal-pair regime.',
+    'rupture_coalescence_field':
+        'Mid-band persistent ratio with multiple finite-death features and '
+        'no dominant cluster — boundary between pair and percolated regimes.',
+    'percolated_cluster_field':
+        'A single connected component holds ≥50% of all axes — the codebook '
+        'has merged into a giant component at the inspection threshold.',
+    'finite_carrier_field':
+        'Quarter or more of H0 dies at finite scale — the cloud has '
+        'measurable internal structure beyond pure pair geometry.',
+    'mixed_resident_field':
+        'No single criterion dominates. Often seen during early training or '
+        'on undertrained codebooks. Inspect component_profile_by_thresh + '
+        'persistence_profile_by_thresh manually.',
+}
+
+
 # ── Public topology entry points ────────────────────────────────────
 def _classify_omega_phase(
     n_axes: int,
@@ -454,7 +505,9 @@ def _classify_omega_phase(
 ) -> str:
     """Classify the visible topology phase of a codebook axis cloud.
 
-    This is descriptive telemetry, not a loss and not a proof by itself.
+    Returns one of the strings in ``OMEGA_PHASES``. This is descriptive
+    telemetry — not a loss and not a proof by itself. See
+    ``OMEGA_PHASE_DESCRIPTIONS`` for what each label means.
     """
     if n_axes <= 0:
         return "empty"

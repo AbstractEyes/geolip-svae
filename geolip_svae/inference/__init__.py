@@ -70,6 +70,7 @@ from geolip_svae.inference.train_codebook import (
     create_codebook,
     run_topology_analysis, run_array_topology_analysis,
     TopologyReport, ArrayTopologyReport,
+    OMEGA_PHASES, OMEGA_PHASE_DESCRIPTIONS,
     HAVE_RIPSER,
 )
 
@@ -102,6 +103,7 @@ __all__ = [
     'create_codebook',
     'run_topology_analysis', 'run_array_topology_analysis',
     'TopologyReport', 'ArrayTopologyReport',
+    'OMEGA_PHASES', 'OMEGA_PHASE_DESCRIPTIONS',
     'HAVE_RIPSER',
     'SentenceEncoder',
     'PAD_STRATEGIES', 'SIGNATURE_MODES', 'AGG_METHODS',
