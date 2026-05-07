@@ -120,7 +120,7 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     channels=3,
     linear_readout=False,
     svd_mode='default',
-    svd_method='auto',                 # fused Triton N=4 on CUDA
+    svd_method='fl',                 # fused Triton N=4 on CUDA
     svd_compute_dtype='fp32',          # bug with triton needs to be reset to fp32 for now
     cv_weight=0.0,  # informational only — natural CV on text unknown
     target_cv=0.125,  # historical, signal-only
@@ -156,7 +156,7 @@ CFG_FRESNEL_128: Dict[str, Any] = dict(
     channels=3,
     linear_readout=False,
     svd_mode='default',
-    svd_method='auto',                 # auto routes D=16 to gram_eigh fp64
+    svd_method='fl',                 # auto routes D=16 to gram_eigh fp64
     svd_compute_dtype='fp32',          # bug with triton needs to be reset to fp32 for now
 
     # Training — fresnel_small's lr=1e-4 batch=128 30 epochs is enough
