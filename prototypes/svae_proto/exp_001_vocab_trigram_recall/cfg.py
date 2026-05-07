@@ -120,8 +120,8 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     channels=3,
     linear_readout=False,
     svd_mode='none',
-    svd_method='cuda',                 # fused Triton N=4 on CUDA
-    svd_compute_dtype='fp32',          # bug with triton needs to be reset to fp32 for now
+    svd_method='gram_eigh',                 # fused Triton N=4 on CUDA
+    svd_compute_dtype='fp64',          # bug with triton needs to be reset to fp32 for now
     cv_weight=0.0,  # informational only — natural CV on text unknown
     target_cv=1.0,  # historical, signal-only
     cv_band_lo=0.10, cv_band_hi=0.30,  # historical band; only affects "in-band" boolean
@@ -156,7 +156,7 @@ CFG_FRESNEL_128: Dict[str, Any] = dict(
     channels=3,
     linear_readout=False,
     svd_mode='none',
-    svd_method='cuda',                 # auto routes D=16 to gram_eigh fp64
+    svd_method='gram_eigh',                 # auto routes D=16 to gram_eigh fp64
     svd_compute_dtype='fp32',          # bug with triton needs to be reset to fp32 for now
 
     # Training — fresnel_small's lr=1e-4 batch=128 30 epochs is enough
