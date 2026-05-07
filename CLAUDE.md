@@ -5,6 +5,27 @@ touches PatchSVAE or the arrays infrastructure. These are the things I (a
 previous Claude) wish I'd known at the start — they would have caught bugs
 faster than re-deriving the architecture by grep.
 
+## Where to read next, depending on what you're doing
+
+This file covers the **main package** (`geolip_svae/`). It does not cover
+prototype/experimental scaffolding.
+
+- **Modifying `geolip_svae/` core code** (PatchSVAE, inference, arrays,
+  trainer): keep reading here. Every load-bearing invariant is below.
+- **Authoring or running an experiment** under `prototypes/svae_proto/`
+  (anything that ships as a sister-package opt-in, e.g. text recall,
+  vocabulary codebooks, sequence-strict losses): switch to
+  [`prototypes/CLAUDE.md`](prototypes/CLAUDE.md) before writing code.
+  It documents the 6-step experiment-authoring procedure and the
+  prototype-specific traps observed during exp_001 (HF tokenizer silent
+  fallback, Python-list-of-ints memory bloat, chunked-tokenize patterns,
+  disk caching, mount-truncation gotcha). Rules from this file still
+  apply on top of those — but the prototype-side traps are the ones that
+  bite when iterating on data loading + preprocessing.
+- **About to edit `geolip_svae/` to make a prototype work**: don't.
+  Either the prototype should call core APIs as-is, or the change is a
+  graduation move that deserves its own PR with tests + docs.
+
 ## What this repo actually is
 
 `geolip-svae` is a Patch-SVD autoencoder package. The core trick is:
@@ -406,3 +427,8 @@ If you're asked to extend something and the extension requires touching
 load-bearing code, propose the change explicitly and wait for
 confirmation. The repo maintainer tracks long research threads, and an
 unexpected default change can invalidate months of training runs.
+
+If the task is experiment-side (anything under `prototypes/svae_proto/`),
+[`prototypes/CLAUDE.md`](prototypes/CLAUDE.md) is the operative
+companion file — read both, but its trap-list is the one that fires when
+iterating on data loading, preprocessing, and tokenizer integration.
