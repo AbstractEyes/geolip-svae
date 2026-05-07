@@ -581,20 +581,36 @@ def train(cfg: Dict[str, Any]):
                 model.cross_attn.parameters(), max_norm=0.5
             )
 
-            # Track total grad norm for stability
-            total_grad = sum(
-                p.grad.pow(2).sum().item()
-                for p in model.parameters() if p.grad is not None
-            ) ** 0.5
+            # Track total grad norm for stability.
+            # NOTE: this used to call .item() per parameter inside the
+            # sum(generator) which forced one CUDA→CPU sync per tensor.
+            # For multi-layer models that's 20-50 syncs per training
+            # step, each stalling the GPU pipeline by ~100us. Now we
+            # accumulate squared norms on-device (single tensor op
+            # graph) and sync ONCE via .item() at the end.
+            grads_sq = [
+                p.grad.pow(2).sum() for p in model.parameters()
+                if p.grad is not None
+            ]
+            if grads_sq:
+                total_grad_t = torch.stack(grads_sq).sum().sqrt()
+                total_grad = total_grad_t.item()      # single sync
+            else:
+                total_grad = 0.0
             epoch_max_grad = max(epoch_max_grad, total_grad)
 
             opt.step()
 
-            total_loss += loss.item() * len(images)
-            total_recon += recon_loss.item() * len(images)
+            # Cache .item() once per scalar — was previously called 3×
+            # per batch (once for total_loss, once for total_recon, once
+            # for the pbar postfix). Each .item() is its own sync.
+            recon_loss_val = recon_loss.item()
+            loss_val = loss.item()
+            total_loss += loss_val * len(images)
+            total_recon += recon_loss_val * len(images)
             n_seen += len(images)
             global_batch += 1
-            pbar.set_postfix_str(f"mse={recon_loss.item():.4f} cv={last_cv:.3f}")
+            pbar.set_postfix_str(f"mse={recon_loss_val:.4f} cv={last_cv:.3f}")
 
             # Mid-epoch report
             if global_batch % report_every == 0:

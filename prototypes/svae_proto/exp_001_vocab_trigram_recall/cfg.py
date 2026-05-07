@@ -116,7 +116,7 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     _BASE,
     # Architecture (matches freckles_64)
     V=48, D=4, patch_size=4,
-    hidden=384, depth=4, n_cross=0,
+    hidden=384, depth=4, n_cross=2,
     channels=3,
     linear_readout=False,
     svd_mode='default',
