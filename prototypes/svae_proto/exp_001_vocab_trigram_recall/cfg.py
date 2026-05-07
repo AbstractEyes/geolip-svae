@@ -122,13 +122,16 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     svd_mode='default',
     svd_method='auto',                 # fused Triton N=4 on CUDA
     svd_compute_dtype='fp64',
+    cv_weight=0.0,  # informational only — natural CV on text unknown
+    target_cv=0.125,  # historical, signal-only
+    cv_band_lo=0.10, cv_band_hi=0.30,  # historical band; only affects "in-band" boolean
 
     # Training — freckles_64's lr=1e-4. Smaller batch than CFG_PROTO_64
     # because the model is 40× bigger; ds_size halved to keep wall time
     # in the same band (~2× per-step cost × 0.5× steps ≈ same).
     img_size=64, batch_size=256,
-    lr=1e-4, epochs=50,
-    ds_size=500_000, val_size=10_000,
+    lr=1e-4, epochs=100,
+    ds_size=1_000_000, val_size=10_000,
     save_every=5,
     report_every=500,                  # ~4 reports/epoch at ~1953 batches/ep
 
@@ -160,8 +163,8 @@ CFG_FRESNEL_128: Dict[str, Any] = dict(
     # at full corpus given 17M params. ds_size scaled down because each
     # sample is 49152 bytes (4× h2-64) and each step is much heavier.
     img_size=128, batch_size=128,
-    lr=1e-4, epochs=30,
-    ds_size=200_000, val_size=5_000,
+    lr=1e-4, epochs=100,
+    ds_size=1_000_000, val_size=10_000,
     save_every=5,
     report_every=500,                  # ~3 reports/epoch at ~1562 batches/ep
 
