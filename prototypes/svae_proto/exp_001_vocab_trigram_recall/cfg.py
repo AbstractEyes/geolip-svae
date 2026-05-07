@@ -120,8 +120,8 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     channels=3,
     linear_readout=False,
     svd_mode='none',
-    svd_method='gram_eigh',                 # fused Triton N=4 on CUDA
-    svd_compute_dtype='fp32',          # bug with triton needs to be reset to fp32 for now
+    svd_method='gram_eigh',            # torch.linalg.eigh on Gram(M) — autograd-clean
+    svd_compute_dtype='fp64',          # canonical accuracy floor; A100 has cheap fp64
     cv_weight=0.0,  # informational only — natural CV on text unknown
     target_cv=1.0,  # historical, signal-only
     cv_band_lo=0.10, cv_band_hi=0.30,  # historical band; only affects "in-band" boolean
