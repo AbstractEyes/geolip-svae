@@ -124,7 +124,7 @@ CFG_FRECKLES_64: Dict[str, Any] = dict(
     svd_compute_dtype='fp64',          # canonical accuracy floor; A100 has cheap fp64
     cv_weight=0.0,  # informational only — natural CV on text unknown
     target_cv=1.0,  # historical, signal-only
-    cv_band_lo=0.10, cv_band_hi=0.30,  # historical band; only affects "in-band" boolean
+    cv_band_lo=0.85, cv_band_hi=1.25,  # historical band; only affects "in-band" boolean
 
     # Training — freckles_64's lr=1e-4. Smaller batch than CFG_PROTO_64
     # because the model is 40× bigger; ds_size halved to keep wall time
