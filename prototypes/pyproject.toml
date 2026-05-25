@@ -74,11 +74,23 @@ exp_001 = [
     "datasets>=2.16.0",
     "sentencepiece>=0.2.0",
 ]
+exp_002 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+]
+exp_003 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+]
 
 # Aggregate — everything across all experiments. Useful when iterating
 # across multiple in one workspace.
 all = [
     "svae-proto[exp_001]",
+    "svae-proto[exp_002]",
+    "svae-proto[exp_003]",
 ]
 
 [project.urls]
