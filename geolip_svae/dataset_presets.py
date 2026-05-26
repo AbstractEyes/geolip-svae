@@ -554,7 +554,8 @@ class SentencePieceBitDataset(torch.utils.data.Dataset):
             print(f"  [SentencePieceBitDataset] Loading corpus "
                   f"{corpus_id}...")
             if corpus_id.startswith('wikitext'):
-                ds = load_dataset('wikitext', corpus_id, split=split)
+                # hub deprecated the bare 'wikitext' name → namespaced repo
+                ds = load_dataset('Salesforce/wikitext', corpus_id, split=split)
             else:
                 ds = load_dataset(corpus_id, split=split)
             text_parts, total = [], 0
@@ -757,7 +758,8 @@ class ByteTrigramDataset(torch.utils.data.Dataset):
             print(f"  [ByteTrigramDataset] Loading corpus {corpus_id}...")
             from datasets import load_dataset
             if corpus_id.startswith('wikitext'):
-                ds = load_dataset('wikitext', corpus_id, split=split)
+                # hub deprecated the bare 'wikitext' name → namespaced repo
+                ds = load_dataset('Salesforce/wikitext', corpus_id, split=split)
             else:
                 ds = load_dataset(corpus_id, split=split)
             chunks = []
