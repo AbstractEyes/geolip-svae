@@ -89,11 +89,17 @@ class AlephModel(nn.Module):
         self.n_atoms = n_atoms
         self.code_tau = code_tau
         self.activation_name = activation
+        self.hidden = hidden
+        self.depth = depth
+        self.init_scheme = init_scheme
+        self.boundary_smooth_on = bool(boundary_smooth)
 
         if n_heads is None:
             n_heads = 2 if D <= 8 else min(4, D)
         if smooth_mid is None:
             smooth_mid = 16 if ps >= 16 else 8
+        self.n_heads = n_heads          # resolved — stored for exact round-trip
+        self.smooth_mid = smooth_mid
 
         inner_act = ACTIVATION_MODULES[activation]
 
@@ -200,13 +206,17 @@ class AlephModel(nn.Module):
 
     # ── provenance / checkpointing ──
     def get_config(self) -> dict:
+        """Full reconstruction config (sufficient for build_aleph round-trip)."""
         return {
             "model_type": self.MODEL_TYPE,
             "V": self.matrix_v, "D": self.D, "ps": self.patch_size,
-            "channels": self.channels, "decode_mode": self.decode_mode,
-            "n_atoms": self.n_atoms, "code_tau": self.code_tau,
-            "readout": self.readout, "row_norm": self.row_norm_mode,
-            "n_cross": len(self.cross_attn), "activation": self.activation_name,
+            "hidden": self.hidden, "depth": self.depth, "channels": self.channels,
+            "decode_mode": self.decode_mode, "n_atoms": self.n_atoms,
+            "code_tau": self.code_tau, "readout": self.readout,
+            "row_norm": self.row_norm_mode, "n_cross": len(self.cross_attn),
+            "n_heads": self.n_heads, "smooth_mid": self.smooth_mid,
+            "boundary_smooth": self.boundary_smooth_on,
+            "activation": self.activation_name, "init_scheme": self.init_scheme,
         }
 
     def num_params(self) -> int:
@@ -227,7 +237,7 @@ def build_aleph(config: dict) -> AlephModel:
         code_tau=config.get("code_tau", 1.0),
         readout=config.get("readout", "linear"),
         row_norm=config.get("row_norm", "sphere"),
-        n_cross=config.get("n_cross", 0),
+        n_cross=config.get("n_cross", config.get("n_cross_layers", 0)),
         n_heads=config.get("n_heads"),
         smooth_mid=config.get("smooth_mid"),
         boundary_smooth=config.get("boundary_smooth", True),
@@ -236,4 +246,22 @@ def build_aleph(config: dict) -> AlephModel:
     )
 
 
-__all__ = ["AlephModel", "build_aleph", "ALEPH_MODEL_TYPE", "DECODE_MODES"]
+def save_aleph_checkpoint(model: AlephModel, path: str, *,
+                          epoch: Optional[int] = None,
+                          test_mse: Optional[float] = None,
+                          extra: Optional[dict] = None) -> None:
+    """Write a checkpoint in the load_model-compatible format:
+    {'config': <get_config>, 'model_state_dict', 'epoch', 'test_mse'}.
+    geolip_svae.inference.load_model reconstructs it via build_aleph."""
+    ckpt = {
+        "config": model.get_config(),
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch, "test_mse": test_mse,
+    }
+    if extra:
+        ckpt.update(extra)
+    torch.save(ckpt, path)
+
+
+__all__ = ["AlephModel", "build_aleph", "save_aleph_checkpoint",
+           "ALEPH_MODEL_TYPE", "DECODE_MODES"]

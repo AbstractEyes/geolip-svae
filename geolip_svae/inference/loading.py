@@ -3,19 +3,21 @@ geolip_svae.inference.loading
 ==============================
 Checkpoint resolution and model loading.
 
-PatchSVAE-only as of the inference framework rebuild (scratchpad 000107).
-The earlier ``PatchSVAEv2`` variant has been removed entirely; legacy v2
-checkpoints raise a clear error rather than silently mis-loading.
+Loads PatchSVAE (model_type 'v1') and AlephModel (model_type 'aleph', the
+geolip-aleph-void variant) checkpoints through one entry point. The earlier
+``PatchSVAEv2`` variant has been removed; legacy v2 checkpoints raise a clear
+error rather than silently mis-loading.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union
 
 import torch
 
 from geolip_svae.model import PatchSVAE
+from geolip_svae.aleph_model import build_aleph, AlephModel, ALEPH_MODEL_TYPE
 
 
 # ── HuggingFace Repository ──────────────────────────────────────────
@@ -98,8 +100,8 @@ def load_model(
     hf_file: Optional[str] = None,
     device: Optional[str] = None,
     repo_id: str = HF_REPO,
-) -> Tuple[PatchSVAE, Dict[str, Any]]:
-    """Load a PatchSVAE checkpoint.
+) -> Tuple[Union[PatchSVAE, AlephModel], Dict[str, Any]]:
+    """Load a PatchSVAE ('v1') or AlephModel ('aleph') checkpoint.
 
     Args:
         hf_version: named version (e.g. 'v50_fresnel_64') — loads best.pt
@@ -114,7 +116,7 @@ def load_model(
             cfg['_epoch']      — checkpoint epoch (or None)
             cfg['_test_mse']   — checkpoint test/val MSE (or None)
             cfg['_path']       — resolved local checkpoint path
-            cfg['_model_type'] — always 'v1' as of the rebuild
+            cfg['_model_type'] — 'v1' or 'aleph'
 
     Raises:
         UnsupportedCheckpointError: if the checkpoint config declares
@@ -137,6 +139,21 @@ def load_model(
             f"re-train it as a v1 PatchSVAE configuration."
         )
 
+    # ── geolip-aleph-void: AlephModel checkpoints ──
+    # AlephModel saves a complete reconstruction config via get_config()
+    # (see geolip_svae.aleph_model.save_aleph_checkpoint), so build_aleph
+    # reconstructs it directly — no report.json backfill needed.
+    if model_type == ALEPH_MODEL_TYPE:
+        model = build_aleph(cfg)
+        model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        model = model.to(device).eval()
+        cfg['_epoch'] = ckpt.get('epoch')
+        cfg['_test_mse'] = ckpt.get('test_mse') or ckpt.get('val_mse')
+        cfg['_path'] = path
+        cfg['_model_type'] = ALEPH_MODEL_TYPE
+        return model, cfg
+
+    # ── PatchSVAE ('v1') ──
     # Backfill missing architecture kwargs from final_report.json. The
     # pre-2026-04-29 trainer's per-checkpoint config dict omitted
     # n_heads / smooth_mid / linear_readout / svd_mode / match_params,
