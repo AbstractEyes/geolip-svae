@@ -18,6 +18,8 @@ addresses MORE sharply than the faux-embedding SVAE batteries.
 Requires geolip_svae installed (dataset bundle + aleph_model + byte metrics).
 """
 from __future__ import annotations
+import os
+import json
 import math
 import torch
 import torch.nn.functional as F
@@ -109,15 +111,28 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
                 address: str = "soft", K: int = 64, address_tau: float = 0.1,
                 loss_mode: str | None = None, quick: bool = False,
                 device: str = "cuda", cfg_overrides: dict | None = None,
-                save_path: str | None = None, report_every: int = 100):
+                save_path: str | None = None, report_every: int = 100,
+                hf_version: str | None = None,
+                hf_repo: str = "AbstractPhil/geolip-aleph-void",
+                upload: bool = False, save_dir: str | None = None,
+                tb_dir: str | None = None, hf_token: str | None = None):
     """Train one AlephModel (geolip-aleph-void). address='soft'|'hard' uses the
     aleph-address bottleneck (learned codebook of K projective axes); 'none'
     trains the recon-real tied autoencoder (the gate). loss_mode defaults to
     'cosine' for tiny_imagenet, 'mse' for byte_trigram. Set cfg_overrides=
     dict(div_weight=0.01) to enable the anti-collapse usage-entropy term if
-    codebook perplexity drops. Logs codebook perplexity (effective oriented axes
-    used — collapse detector) and mean address margin. Checkpoints saved in the
-    load_model-compatible format. Returns (model, history) with rows
+    codebook perplexity drops.
+
+    HuggingFace + TensorBoard are wired by default. Uploads land in `hf_repo`
+    (default AbstractPhil/geolip-aleph-void) under the load_model-compatible
+    layout: `{hf_version}/checkpoints/best.pt` and `{hf_version}/final_report.json`,
+    with TB logs under `{hf_version}/tensorboard/{run_name}`. hf_version defaults
+    to a name derived from (dataset, decode_mode, address, K). Auth via hf_token
+    arg or the HF_TOKEN env var. upload is forced off for quick=True smoke runs.
+    Scalars logged: train/loss, test/{mse,cos,cv}, lr, and the aleph params
+    aleph/{perplexity,address_margin}.
+
+    Returns (model, history) with rows
     (step, train_loss, test_mse, test_cos, test_cv, perplexity, address_margin)."""
     from geolip_svae.dataset_presets import get_dataset_bundle
     from geolip_svae.aleph_model import build_aleph, save_aleph_checkpoint
@@ -157,8 +172,75 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
           f"params={model.num_params()} | {cfg['img_size']}x{cfg['img_size']} | "
           f"{cfg['epochs']}ep x ~{steps_per_epoch} steps | baseline MSE≈{base:.1e}")
 
+    # ── output paths / run identity ──
+    if quick:
+        upload = False                          # smoke runs never pollute the repo
+    if hf_version is None:
+        hf_version = f"aleph_{dataset}_{decode_mode}_{model.address}_K{model.n_axes}"
+    save_dir = save_dir or "/content/aleph_checkpoints"
+    tb_dir = tb_dir or "/content/aleph_runs"
+    os.makedirs(save_dir, exist_ok=True)
+    run_name = f"{hf_version}_tau{model.address_tau}_lr{cfg['lr']}"
+    best_ckpt_path = save_path or os.path.join(save_dir, "best.pt")
+
+    # ── TensorBoard ──
+    writer = None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_path = os.path.join(tb_dir, run_name)
+        writer = SummaryWriter(tb_path)
+        print(f"  TensorBoard: {tb_path}")
+    except Exception as e:
+        tb_path = None
+        print(f"  TensorBoard: disabled ({type(e).__name__}: {e})")
+
+    # ── HuggingFace (uploads to the new repo by default) ──
+    if hf_token and not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = hf_token
+        try:
+            from huggingface_hub import login as _hf_login
+            _hf_login(token=hf_token, add_to_git_credential=False)
+        except Exception as e:
+            print(f"  [hf-auth] login from hf_token failed: {type(e).__name__}: {e}")
+
+    hf_enabled, api = False, None
+    hf_prefix = f"{hf_version}/checkpoints"
+    if upload:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(); api.whoami()
+            hf_enabled = True
+            print(f"  HuggingFace: {hf_repo}/{hf_prefix}")
+        except Exception as e:
+            print(f"  HuggingFace: disabled ({e})")
+
+    def upload_to_hf(local_path, remote_name, prefix=None):
+        if not hf_enabled:
+            return
+        prefix = prefix if prefix is not None else hf_prefix
+        try:
+            api.upload_file(path_or_fileobj=local_path,
+                            path_in_repo=f"{prefix}/{remote_name}",
+                            repo_id=hf_repo, repo_type="model")
+            print(f"  ☁️  Uploaded: {hf_repo}/{prefix}/{remote_name}")
+        except Exception as e:
+            print(f"  ⚠️  HF upload: {e}")
+
+    def sync_tb():
+        if not (hf_enabled and tb_path):
+            return
+        try:
+            writer.flush()
+            api.upload_folder(folder_path=tb_path,
+                              path_in_repo=f"{hf_version}/tensorboard/{run_name}",
+                              repo_id=hf_repo, repo_type="model")
+        except Exception:
+            pass
+
     # track best by the training objective (cosine -> higher is better)
     div_weight = cfg.get("div_weight", 0.0)   # anti-collapse usage-entropy term (0=off)
+    if div_weight > 0:
+        model._emit_logits = True             # diversity term needs the address logits
     history, step = [], 0
     best_cos, best_mse = -1.0, float("inf")
     for epoch in range(1, cfg["epochs"] + 1):
@@ -183,17 +265,56 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
                 print(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
                       f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f}"
                       f"{addr_str} lr={sched.get_last_lr()[0]:.2e}")
+                if writer is not None:
+                    writer.add_scalar("train/loss", loss.item(), step)
+                    writer.add_scalar("test/mse", tmse, step)
+                    writer.add_scalar("test/cos", tcos, step)
+                    writer.add_scalar("test/cv", tcv, step)
+                    writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
+                    if model.address != "none":
+                        writer.add_scalar("aleph/perplexity", tppl, step)
+                        writer.add_scalar("aleph/address_margin", tamg, step)
                 improved = (tcos > best_cos) if loss_mode != "mse" else (tmse < best_mse)
                 best_cos, best_mse = max(best_cos, tcos), min(best_mse, tmse)
-                if improved and save_path:
-                    # load_model-compatible checkpoint (model_type='aleph')
+                if improved:
+                    # load_model-compatible checkpoint (model_type='aleph'),
+                    # saved locally; pushed to HF at the epoch boundary below.
                     save_aleph_checkpoint(
-                        model, save_path, epoch=epoch, test_mse=tmse,
+                        model, best_ckpt_path, epoch=epoch, test_mse=tmse,
                         extra={"step": step, "loss_mode": loss_mode,
                                "test_cos": tcos, "dataset": dataset})
+        # end of epoch: push current best + sync TB (coarse cadence, not per-step)
+        if os.path.exists(best_ckpt_path):
+            upload_to_hf(best_ckpt_path, "best.pt")
+        sync_tb()
     print(f"AlephModel[{decode_mode}] {dataset}: best test_cos={best_cos:.4f} "
           f"best test_mse={best_mse:.3e} (baseline MSE≈{base:.1e}, "
           f"ratio {best_mse/base:.1f}x)")
+
+    # ── final report (load_model backfill not needed; kept for parity + metrics) ──
+    if writer is not None:
+        writer.close()
+    final_report = {
+        "run_name": run_name,
+        "config": model.get_config(),
+        "n_params": model.num_params(),
+        "dataset": dataset, "loss_mode": loss_mode,
+        "baseline_mse": base,
+        "best_test_mse": best_mse, "best_test_cos": best_cos,
+        "history": history,
+        "history_columns": ["step", "train_loss", "test_mse", "test_cos",
+                             "test_cv", "perplexity", "address_margin"],
+    }
+    report_path = os.path.join(save_dir, "final_report.json")
+    try:
+        with open(report_path, "w") as f:
+            json.dump(final_report, f, indent=2)
+        upload_to_hf(report_path, "final_report.json", prefix=hf_version)
+    except Exception as e:
+        print(f"  ⚠️  final_report: {type(e).__name__}: {e}")
+    sync_tb()
+    if hf_enabled:
+        print(f"  saved to {hf_repo}/{hf_version}")
     return model, history
 
 
