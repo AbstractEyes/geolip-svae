@@ -26,7 +26,7 @@ Same forward contract as PatchSVAE, so all inference/codebook tooling applies.
     out = model(images)                       # out['recon'], out['svd']['M']
 """
 
-__version__ = "0.10.0"
+__version__ = "0.9.5"
 
 from geolip_svae.model import (
     PatchSVAE,
