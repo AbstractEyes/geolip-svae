@@ -1,8 +1,5 @@
 """aleph_model.py — the geolip-aleph-void model.
 
-# the current variation is wrong, requires the correct implementation.
-# this is the experimental tool used to test the decoder, not the final version.
-
 The natural evolution of PatchSVAE. The SVAE locks reconstruction into a deep
 residual-MLP decoder; that accumulator carries recon, so the spherical latent M
 is a "faux embedding" — recon flows through the MLP, not the geometry. AlephModel
@@ -54,14 +51,21 @@ from geolip_svae.model import (
 
 ALEPH_MODEL_TYPE = "aleph"            # checkpoint marker (distinct from 'v1'/'v2')
 DECODE_MODES = ("tied", "dict", "mlp")
+ADDRESS_MODES = ("soft", "hard", "none")   # aleph address bottleneck; 'none' = recon-real AE (gate)
 READOUTS = ("linear",)               # 'svd' reserved
 
 
 class AlephModel(nn.Module):
-    """geolip-aleph-void model: spherical encoder + pluggable decoder.
+    """geolip-aleph-void model: spherical encoder + learned projective codebook
+    + aleph-address bottleneck + pluggable decoder.
 
-    AlephModel(decode_mode='tied', ...) is the validated recon-real configuration
-    (the artifact previously prototyped as GeoSphereVAE), now a first-class model.
+    The aleph signed address is the core operation: each spherical M-row is
+    addressed to a LEARNED codebook of K projective axes (the aleph logit — a
+    softmax over 2K oriented axes), producing an addressed row M̂ that the decoder
+    reconstructs from. Recon flows through the address into the codebook, so the
+    logit is load-bearing. address='soft' (differentiable mixture) | 'hard'
+    (straight-through discrete) | 'none' (M̂=M — recovers the recon-real tied
+    autoencoder that gated this work). decode_mode controls how M̂ → patch.
     """
 
     MODEL_TYPE = ALEPH_MODEL_TYPE
@@ -69,6 +73,7 @@ class AlephModel(nn.Module):
     def __init__(self, V: int = 32, D: int = 4, ps: int = 4,
                  hidden: int = 64, depth: int = 1, channels: int = 3,
                  *,
+                 address: str = "soft", K: int = 64, address_tau: float = 0.1,
                  decode_mode: str = "tied", n_atoms: int = 64, code_tau: float = 1.0,
                  readout: str = "linear", row_norm: str = "sphere",
                  n_cross: int = 0, n_heads: Optional[int] = None,
@@ -77,6 +82,8 @@ class AlephModel(nn.Module):
         super().__init__()
         if decode_mode not in DECODE_MODES:
             raise ValueError(f"decode_mode must be in {DECODE_MODES}, got {decode_mode!r}")
+        if address not in ADDRESS_MODES:
+            raise ValueError(f"address must be in {ADDRESS_MODES}, got {address!r}")
         if readout not in READOUTS:
             raise ValueError(f"readout must be in {READOUTS} (got {readout!r}); "
                              "'svd' is reserved and wired separately")
@@ -96,6 +103,19 @@ class AlephModel(nn.Module):
         self.depth = depth
         self.init_scheme = init_scheme
         self.boundary_smooth_on = bool(boundary_smooth)
+        self.address = address
+        self.n_axes = K
+        self.address_tau = address_tau
+
+        # ── learned aleph codebook: K projective axes in D-space ──
+        # The address bottleneck snaps each M-row to this codebook (signed), so
+        # recon flows through the address into the codebook — the aleph logit is
+        # load-bearing, not a post-hoc read. address='none' disables it (M̂ = M),
+        # recovering the recon-real tied autoencoder (the gate).
+        if address != "none":
+            self.codebook = nn.Parameter(torch.randn(K, D))
+        else:
+            self.register_parameter("codebook", None)
 
         if n_heads is None:
             n_heads = 2 if D <= 8 else min(4, D)
@@ -148,7 +168,32 @@ class AlephModel(nn.Module):
             if boundary_smooth else nn.Identity()
         )
 
-    # ── encode: patches -> spherical M + omega token S (sphere-solver readout) ──
+    # ── aleph address: snap M-rows to the learned projective codebook ──
+    def oriented_codebook(self) -> torch.Tensor:
+        """The 2K oriented axes [+A; -A], A sign-canonicalized + unit. (2K, D)."""
+        A = F.normalize(self.codebook, dim=-1)             # projective rep, unit rows
+        return torch.cat([A, -A], dim=0)
+
+    def aleph_address(self, M_rows: torch.Tensor):
+        """Address each row (·, D) to the codebook. Returns (M_hat, logits):
+        M_hat = the codebook reconstruction of the rows (soft mixture, or hard
+        with straight-through); logits = signed alignments over 2K oriented axes
+        (the aleph logit). Differentiable; gradient trains the codebook via recon."""
+        A = F.normalize(self.codebook, dim=-1)             # (K, D)
+        cos = M_rows @ A.t()                               # (·, K) signed
+        logits = torch.cat([cos, -cos], dim=-1)            # (·, 2K) oriented
+        oriented = torch.cat([A, -A], dim=0)               # (2K, D)
+        a = F.softmax(logits / self.address_tau, dim=-1)   # address distribution
+        M_soft = a @ oriented                              # (·, D) soft codebook recon
+        if self.address == "hard":
+            idx = logits.argmax(dim=-1)
+            M_hard = oriented[idx]                          # (·, D) addressed axis
+            M_hat = M_hard + (M_soft - M_soft.detach())     # straight-through
+        else:
+            M_hat = M_soft
+        return M_hat, logits
+
+    # ── encode: patches -> spherical M, then aleph-address to the codebook ──
     def encode_patches(self, patches: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, N, _ = patches.shape
         act_fn = ACTIVATIONS[self.activation_name]
@@ -158,41 +203,56 @@ class AlephModel(nn.Module):
         M = self.enc_out(h).reshape(B * N, self.matrix_v, self.D)
         M = _row_normalize(M, self.row_norm_mode)          # rows on S^(D-1)
 
-        # 'linear' readout convention (svd_mode='none'): U=M, S=col norms, Vt=I
-        U = M
-        S = M.norm(dim=-2)                                 # (B*N, D)
+        # aleph address bottleneck: M̂ = codebook reconstruction of M (load-bearing).
+        # address='none' -> M̂ = M (the recon-real tied autoencoder / gate).
+        aleph_logits = None
+        if self.address != "none":
+            flat = M.reshape(B * N * self.matrix_v, self.D)
+            M_hat_flat, logit_flat = self.aleph_address(flat)
+            M_hat = M_hat_flat.reshape(B * N, self.matrix_v, self.D)
+            aleph_logits = logit_flat.reshape(B, N, self.matrix_v, 2 * self.n_axes)
+        else:
+            M_hat = M
+
+        # 'linear' readout on the addressed rows: U=M̂, S=col norms, Vt=I
+        S = M_hat.norm(dim=-2)                             # (B*N, D)
         Vt = torch.eye(self.D, device=M.device, dtype=M.dtype).expand(
             B * N, self.D, self.D)
 
-        U = U.reshape(B, N, self.matrix_v, self.D)
-        S = S.reshape(B, N, self.D)
-        Vt = Vt.reshape(B, N, self.D, self.D)
-        M = M.reshape(B, N, self.matrix_v, self.D)
+        out = {
+            "U": M_hat.reshape(B, N, self.matrix_v, self.D),
+            "S_orig": S.reshape(B, N, self.D),
+            "Vt": Vt.reshape(B, N, self.D, self.D),
+            "M": M.reshape(B, N, self.matrix_v, self.D),          # raw spherical rows
+            "M_hat": M_hat.reshape(B, N, self.matrix_v, self.D),  # addressed rows (decode source)
+        }
+        if aleph_logits is not None:
+            out["aleph_logits"] = aleph_logits                    # (B,N,V,2K) the address
 
-        S_coord = S
+        S_coord = out["S_orig"]
         for layer in self.cross_attn:
             S_coord = layer(S_coord)
+        out["S"] = S_coord
+        return out
 
-        return {"U": U, "S_orig": S, "S": S_coord, "Vt": Vt, "M": M}
-
-    # ── decode: route recon through the geometry per the chosen strategy ──
+    # ── decode: route recon through the ADDRESSED rows per the chosen strategy ──
     def decode_patches(self, svd: Dict[str, torch.Tensor]) -> torch.Tensor:
-        M = svd["M"]
-        B, N, V, D = M.shape
+        Mh = svd["M_hat"]                                  # codebook-addressed rows
+        B, N, V, D = Mh.shape
         if self.decode_mode == "mlp":
             U = svd["U"].reshape(B * N, V, D)
             S = svd["S"].reshape(B * N, D)
             Vt = svd["Vt"].reshape(B * N, D, D)
-            M_hat = torch.bmm(U * S.unsqueeze(1), Vt)      # SVAE reconstruction
+            M_hat = torch.bmm(U * S.unsqueeze(1), Vt)      # SVAE reconstruction (of M̂)
             act_fn = ACTIVATIONS[self.activation_name]
             h = act_fn(self.dec_in(M_hat.reshape(B * N, -1)))
             for block in self.dec_blocks:
                 h = h + block(h)
             patch = self.dec_out(h)
         elif self.decode_mode == "tied":
-            patch = self.dec(M.reshape(B * N, V * D))      # single linear of M
+            patch = self.dec(Mh.reshape(B * N, V * D))     # single linear of M̂
         else:  # 'dict'
-            code = F.softmax(self.code_proj(M.reshape(B * N, V * D)) / self.code_tau, dim=-1)
+            code = F.softmax(self.code_proj(Mh.reshape(B * N, V * D)) / self.code_tau, dim=-1)
             patch = code @ self.atoms
         return patch.reshape(B, N, -1)
 
@@ -214,6 +274,7 @@ class AlephModel(nn.Module):
             "model_type": self.MODEL_TYPE,
             "V": self.matrix_v, "D": self.D, "ps": self.patch_size,
             "hidden": self.hidden, "depth": self.depth, "channels": self.channels,
+            "address": self.address, "K": self.n_axes, "address_tau": self.address_tau,
             "decode_mode": self.decode_mode, "n_atoms": self.n_atoms,
             "code_tau": self.code_tau, "readout": self.readout,
             "row_norm": self.row_norm_mode, "n_cross": len(self.cross_attn),
@@ -235,6 +296,9 @@ def build_aleph(config: dict) -> AlephModel:
         hidden=config.get("hidden", 64),
         depth=config.get("depth", 1),
         channels=config.get("channels", 3),
+        address=config.get("address", "soft"),
+        K=config.get("K", config.get("n_axes", 64)),
+        address_tau=config.get("address_tau", 0.1),
         decode_mode=config.get("decode_mode", "tied"),
         n_atoms=config.get("n_atoms", 64),
         code_tau=config.get("code_tau", 1.0),
@@ -267,4 +331,4 @@ def save_aleph_checkpoint(model: AlephModel, path: str, *,
 
 
 __all__ = ["AlephModel", "build_aleph", "save_aleph_checkpoint",
-           "ALEPH_MODEL_TYPE", "DECODE_MODES"]
+           "ALEPH_MODEL_TYPE", "DECODE_MODES", "ADDRESS_MODES"]

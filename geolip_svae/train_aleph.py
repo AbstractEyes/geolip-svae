@@ -86,13 +86,16 @@ def evaluate(model, loader, device, max_batches: int = 20):
 
 
 def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
+                address: str = "soft", K: int = 64, address_tau: float = 0.1,
                 loss_mode: str | None = None, quick: bool = False,
                 device: str = "cuda", cfg_overrides: dict | None = None,
                 save_path: str | None = None, report_every: int = 100):
-    """Train one AlephModel (geolip-aleph-void). loss_mode defaults to 'cosine'
-    for tiny_imagenet, 'mse' for byte_trigram. Checkpoints are saved in the
-    load_model-compatible format (save_aleph_checkpoint), so every run produces
-    a loadable, hostable AlephModel. Returns (model, history) with history rows
+    """Train one AlephModel (geolip-aleph-void). address='soft'|'hard' uses the
+    aleph-address bottleneck (learned codebook of K projective axes); 'none'
+    trains the recon-real tied autoencoder (the gate). loss_mode defaults to
+    'cosine' for tiny_imagenet, 'mse' for byte_trigram. Checkpoints are saved in
+    the load_model-compatible format (save_aleph_checkpoint), so every run
+    produces a loadable AlephModel. Returns (model, history) with history rows
     (step, train_loss, test_mse, test_cos, test_cv)."""
     from geolip_svae.dataset_presets import get_dataset_bundle
     from geolip_svae.aleph_model import build_aleph, save_aleph_checkpoint
@@ -114,6 +117,8 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         "patch_size": cfg["patch_size"], "channels": cfg["channels"],
         "V": cfg["V"], "D": cfg["D"], "hidden": cfg["hidden"],
         "depth": cfg.get("depth", 1), "decode_mode": decode_mode,
+        "address": cfg.get("address", address), "K": cfg.get("K", K),
+        "address_tau": cfg.get("address_tau", address_tau),
         "n_atoms": cfg.get("n_atoms", 64), "code_tau": cfg.get("code_tau", 1.0),
     }).to(device)
 
@@ -126,7 +131,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     base = BASELINE_MSE.get(dataset, float("nan"))
-    print(f"AlephModel[{decode_mode}] {dataset} loss={loss_mode} "
+    print(f"AlephModel[{decode_mode}/addr={model.address}] {dataset} loss={loss_mode} "
           f"params={model.num_params()} | {cfg['img_size']}x{cfg['img_size']} | "
           f"{cfg['epochs']}ep x ~{steps_per_epoch} steps | baseline MSE≈{base:.1e}")
 
