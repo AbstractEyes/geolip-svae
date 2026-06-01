@@ -70,22 +70,31 @@ def _col_norm_cv(M: torch.Tensor) -> float:
 
 
 def _address_stats(aleph_logits: torch.Tensor, tau: float):
-    """From aleph_logits (B,N,V,2K): codebook PERPLEXITY (effective # oriented
-    axes used — collapse detector, low = collapsed toward few axes) and mean
-    top-1 address probability (how decisively each row addresses). Returns
-    (perplexity, mean_margin, usage_vec)."""
+    """From aleph_logits (B,N,V,2K): SOFT-field perplexity (effective oriented
+    axes by the softmax mixture), mean top-1 address probability, and HARD
+    perplexity (effective oriented axes actually selected by argmax — the real
+    discrete-code usage; this is the one that matters for address='hard').
+    Returns (soft_ppl, mean_margin, hard_ppl, usage_vec)."""
     a = torch.softmax(aleph_logits / tau, dim=-1)        # (B,N,V,2K)
-    usage = a.reshape(-1, a.shape[-1]).mean(0)           # (2K,) batch-mean usage
+    flat = a.reshape(-1, a.shape[-1])                    # (rows, 2K)
+    usage = flat.mean(0)                                 # (2K,) soft batch-mean usage
     ent = -(usage * usage.clamp_min(1e-12).log()).sum()
-    ppl = float(ent.exp().item())                        # effective axes used
-    margin = float(a.max(dim=-1).values.mean().item())   # mean top-1 prob
-    return ppl, margin, usage
+    soft_ppl = float(ent.exp().item())                  # soft-field effective axes
+    margin = float(a.max(dim=-1).values.mean().item())  # mean top-1 prob
+    # discrete code usage: which oriented axis wins the argmax per row
+    K2 = flat.shape[-1]
+    idx = flat.argmax(dim=-1)
+    hu = torch.bincount(idx, minlength=K2).float()
+    hu = hu / hu.sum().clamp_min(1.0)
+    h_ent = -(hu * hu.clamp_min(1e-12).log()).sum()
+    hard_ppl = float(h_ent.exp().item())                # argmax effective axes
+    return soft_ppl, margin, hard_ppl, usage
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, max_batches: int = 20):
     model.eval()
-    tot_mse, tot_cos, tot_cv, tot_ppl, tot_amg, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    tot_mse, tot_cos, tot_cv, tot_ppl, tot_amg, tot_hppl, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
     has_addr = getattr(model, "address", "none") != "none"
     for i, batch in enumerate(loader):
         if i >= max_batches:
@@ -97,14 +106,15 @@ def evaluate(model, loader, device, max_batches: int = 20):
                                        images.flatten(1), dim=1).mean().item()
         tot_cv += _col_norm_cv(out["svd"]["M"])
         if has_addr and "aleph_logits" in out["svd"]:
-            ppl, amg, _ = _address_stats(out["svd"]["aleph_logits"], model.address_tau)
-            tot_ppl += ppl; tot_amg += amg
+            ppl, amg, hppl, _ = _address_stats(out["svd"]["aleph_logits"], model.address_tau)
+            tot_ppl += ppl; tot_amg += amg; tot_hppl += hppl
         n += 1
     model.train()
     n = max(n, 1)
     return (tot_mse / n, tot_cos / n, tot_cv / n,
             tot_ppl / n if has_addr else float("nan"),
-            tot_amg / n if has_addr else float("nan"))
+            tot_amg / n if has_addr else float("nan"),
+            tot_hppl / n if has_addr else float("nan"))
 
 
 def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
@@ -114,7 +124,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
                 save_path: str | None = None, report_every: int = 100,
                 hf_version: str | None = None,
                 hf_repo: str = "AbstractPhil/geolip-aleph-void",
-                upload: bool = False, save_dir: str | None = None,
+                upload: bool = True, save_dir: str | None = None,
                 tb_dir: str | None = None, hf_token: str | None = None):
     """Train one AlephModel (geolip-aleph-void). address='soft'|'hard' uses the
     aleph-address bottleneck (learned codebook of K projective axes); 'none'
@@ -156,6 +166,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         "depth": cfg.get("depth", 1), "decode_mode": decode_mode,
         "address": cfg.get("address", address), "K": cfg.get("K", K),
         "address_tau": cfg.get("address_tau", address_tau),
+        "dec_hidden": cfg.get("dec_hidden"), "dec_depth": cfg.get("dec_depth"),
         "n_atoms": cfg.get("n_atoms", 64), "code_tau": cfg.get("code_tau", 1.0),
     }).to(device)
 
@@ -258,10 +269,10 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
             step += 1
 
             if step % report_every == 0:
-                tmse, tcos, tcv, tppl, tamg = evaluate(model, test_loader, device)
-                history.append((step, loss.item(), tmse, tcos, tcv, tppl, tamg))
-                addr_str = (f" ppl={tppl:.1f}/{2*model.n_axes} amargin={tamg:.3f}"
-                            if model.address != "none" else "")
+                tmse, tcos, tcv, tppl, tamg, thppl = evaluate(model, test_loader, device)
+                history.append((step, loss.item(), tmse, tcos, tcv, tppl, tamg, thppl))
+                addr_str = (f" ppl={tppl:.1f}/{2*model.n_axes} hppl={thppl:.1f} "
+                            f"amargin={tamg:.3f}" if model.address != "none" else "")
                 print(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
                       f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f}"
                       f"{addr_str} lr={sched.get_last_lr()[0]:.2e}")
@@ -273,6 +284,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
                     writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
                     if model.address != "none":
                         writer.add_scalar("aleph/perplexity", tppl, step)
+                        writer.add_scalar("aleph/hard_perplexity", thppl, step)
                         writer.add_scalar("aleph/address_margin", tamg, step)
                 improved = (tcos > best_cos) if loss_mode != "mse" else (tmse < best_mse)
                 best_cos, best_mse = max(best_cos, tcos), min(best_mse, tmse)
@@ -303,7 +315,8 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         "best_test_mse": best_mse, "best_test_cos": best_cos,
         "history": history,
         "history_columns": ["step", "train_loss", "test_mse", "test_cos",
-                             "test_cv", "perplexity", "address_margin"],
+                             "test_cv", "perplexity", "address_margin",
+                             "hard_perplexity"],
     }
     report_path = os.path.join(save_dir, "final_report.json")
     try:

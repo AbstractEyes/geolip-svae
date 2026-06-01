@@ -75,6 +75,7 @@ class AlephModel(nn.Module):
                  *,
                  address: str = "soft", K: int = 64, address_tau: float = 0.1,
                  decode_mode: str = "tied", n_atoms: int = 64, code_tau: float = 1.0,
+                 dec_hidden: Optional[int] = None, dec_depth: Optional[int] = None,
                  readout: str = "linear", row_norm: str = "sphere",
                  n_cross: int = 0, n_heads: Optional[int] = None,
                  smooth_mid: Optional[int] = None, boundary_smooth: bool = True,
@@ -130,6 +131,14 @@ class AlephModel(nn.Module):
 
         inner_act = ACTIVATION_MODULES[activation]
 
+        # decoder capacity — decoupled from the encoder so the 'mlp' decoder can
+        # be scaled up to reconstruct from the discrete (hard-addressed) code
+        # without growing the encoder. Default to encoder size (back-compat).
+        dec_hidden = dec_hidden if dec_hidden is not None else hidden
+        dec_depth = dec_depth if dec_depth is not None else depth
+        self.dec_hidden = dec_hidden
+        self.dec_depth = dec_depth
+
         # ── encoder (byte-identical to PatchSVAE) ──
         self.enc_in = nn.Linear(self.patch_dim, hidden)
         self.enc_blocks = nn.ModuleList([
@@ -145,17 +154,19 @@ class AlephModel(nn.Module):
 
         # ── decoder (the pluggable axis) ──
         if decode_mode == "mlp":
-            # original SVAE deep residual accumulator (faux-embedding regime)
-            self.dec_in = nn.Linear(self.mat_dim, hidden)
+            # residual MLP decoder. With a hard/discrete address this is the VQ
+            # decoder reconstructing from codes (principled); with a continuous
+            # M̂ a large one drifts back toward the faux-embedding regime.
+            self.dec_in = nn.Linear(self.mat_dim, dec_hidden)
             self.dec_blocks = nn.ModuleList([
                 nn.Sequential(
-                    nn.LayerNorm(hidden),
-                    nn.Linear(hidden, hidden),
+                    nn.LayerNorm(dec_hidden),
+                    nn.Linear(dec_hidden, dec_hidden),
                     inner_act(),
-                    nn.Linear(hidden, hidden),
-                ) for _ in range(depth)
+                    nn.Linear(dec_hidden, dec_hidden),
+                ) for _ in range(dec_depth)
             ])
-            self.dec_out = nn.Linear(hidden, self.patch_dim)
+            self.dec_out = nn.Linear(dec_hidden, self.patch_dim)
         elif decode_mode == "tied":
             self.dec = nn.Linear(self.mat_dim, self.patch_dim)
         else:  # 'dict'
@@ -304,6 +315,7 @@ class AlephModel(nn.Module):
             "address": self.address, "K": self.n_axes, "address_tau": self.address_tau,
             "decode_mode": self.decode_mode, "n_atoms": self.n_atoms,
             "code_tau": self.code_tau, "readout": self.readout,
+            "dec_hidden": self.dec_hidden, "dec_depth": self.dec_depth,
             "row_norm": self.row_norm_mode, "n_cross": len(self.cross_attn),
             "n_heads": self.n_heads, "smooth_mid": self.smooth_mid,
             "boundary_smooth": self.boundary_smooth_on,
@@ -329,6 +341,8 @@ def build_aleph(config: dict) -> AlephModel:
         decode_mode=config.get("decode_mode", "tied"),
         n_atoms=config.get("n_atoms", 64),
         code_tau=config.get("code_tau", 1.0),
+        dec_hidden=config.get("dec_hidden"),
+        dec_depth=config.get("dec_depth"),
         readout=config.get("readout", "linear"),
         row_norm=config.get("row_norm", "sphere"),
         n_cross=config.get("n_cross", config.get("n_cross_layers", 0)),
