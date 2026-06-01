@@ -106,6 +106,10 @@ class AlephModel(nn.Module):
         self.address = address
         self.n_axes = K
         self.address_tau = address_tau
+        # emit (·,2K) aleph logits from forward only when needed. evaluate() runs
+        # in eval mode (training=False) so logits/perplexity are available there;
+        # set True to also emit during training (e.g. for the diversity term).
+        self._emit_logits = False
 
         # ── learned aleph codebook: K projective axes in D-space ──
         # The address bottleneck snaps each M-row to this codebook (signed), so
@@ -174,23 +178,42 @@ class AlephModel(nn.Module):
         A = F.normalize(self.codebook, dim=-1)             # projective rep, unit rows
         return torch.cat([A, -A], dim=0)
 
-    def aleph_address(self, M_rows: torch.Tensor):
-        """Address each row (·, D) to the codebook. Returns (M_hat, logits):
-        M_hat = the codebook reconstruction of the rows (soft mixture, or hard
-        with straight-through); logits = signed alignments over 2K oriented axes
-        (the aleph logit). Differentiable; gradient trains the codebook via recon."""
+    def aleph_address(self, M_rows: torch.Tensor, want_logits: bool = False):
+        """Address each row (·, D) to the learned codebook. Returns (M_hat, logits).
+
+        M_hat is the soft codebook reconstruction. The address is a softmax over
+        the 2K oriented axes [+A; -A]; because the axes are antipodal, that mixture
+        has a closed form that never materializes the 2K-wide tensor:
+
+            M_hat = Σ_k 2·sinh(u_k)·A_k / Σ_k 2·cosh(u_k),   u = cos/τ
+
+        computed stably by factoring out max|u| (so it holds for any τ). This is
+        the hot path — only K-wide intermediates, no 2K softmax, no [+A;-A] concat.
+        want_logits=True additionally returns the (·, 2K) oriented logits for
+        diagnostics (perplexity/usage); skipped during training to avoid the large
+        allocation. Differentiable; gradient trains the codebook via recon.
+        """
         A = F.normalize(self.codebook, dim=-1)             # (K, D)
         cos = M_rows @ A.t()                               # (·, K) signed
-        logits = torch.cat([cos, -cos], dim=-1)            # (·, 2K) oriented
-        oriented = torch.cat([A, -A], dim=0)               # (2K, D)
-        a = F.softmax(logits / self.address_tau, dim=-1)   # address distribution
-        M_soft = a @ oriented                              # (·, D) soft codebook recon
+        u = cos * (1.0 / self.address_tau)
+
+        # stable antipodal soft mixture (exact softmax-over-[+A;-A], K-wide)
+        m = u.abs().amax(dim=-1, keepdim=True)             # (·, 1) max oriented logit
+        ep = torch.exp(u - m)                              # ∝ e^{+u}
+        en = torch.exp(-u - m)                             # ∝ e^{-u}
+        num = ep - en                                      # (·, K)  ∝ 2 sinh(u)
+        den = (ep + en).sum(dim=-1, keepdim=True).clamp_min(1e-12)   # ∝ Σ 2 cosh(u)
+        M_soft = (num @ A) / den                           # (·, D)
+
         if self.address == "hard":
-            idx = logits.argmax(dim=-1)
-            M_hard = oriented[idx]                          # (·, D) addressed axis
-            M_hat = M_hard + (M_soft - M_soft.detach())     # straight-through
+            idx = cos.abs().argmax(dim=-1, keepdim=True)   # winner by |cos|
+            win = cos.gather(-1, idx)                      # (·, 1) signed top
+            M_hard = torch.sign(win) * A[idx.squeeze(-1)]  # (·, D) addressed axis
+            M_hat = M_hard + (M_soft - M_soft.detach())    # straight-through
         else:
             M_hat = M_soft
+
+        logits = torch.cat([cos, -cos], dim=-1) if want_logits else None
         return M_hat, logits
 
     # ── encode: patches -> spherical M, then aleph-address to the codebook ──
@@ -205,12 +228,16 @@ class AlephModel(nn.Module):
 
         # aleph address bottleneck: M̂ = codebook reconstruction of M (load-bearing).
         # address='none' -> M̂ = M (the recon-real tied autoencoder / gate).
+        # Logits (·,2K) are only built when needed (eval, or self._emit_logits for
+        # the diversity term) — the training hot path skips that large allocation.
         aleph_logits = None
         if self.address != "none":
+            want_logits = self._emit_logits or (not self.training)
             flat = M.reshape(B * N * self.matrix_v, self.D)
-            M_hat_flat, logit_flat = self.aleph_address(flat)
+            M_hat_flat, logit_flat = self.aleph_address(flat, want_logits=want_logits)
             M_hat = M_hat_flat.reshape(B * N, self.matrix_v, self.D)
-            aleph_logits = logit_flat.reshape(B, N, self.matrix_v, 2 * self.n_axes)
+            if logit_flat is not None:
+                aleph_logits = logit_flat.reshape(B, N, self.matrix_v, 2 * self.n_axes)
         else:
             M_hat = M
 
