@@ -41,6 +41,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # Reuse the SVAE's exact primitives — keeps the encoder identical and the patch
 # grid / stitching consistent with every existing battery and dataset.
@@ -74,6 +75,7 @@ class AlephModel(nn.Module):
                  hidden: int = 64, depth: int = 1, channels: int = 3,
                  *,
                  address: str = "soft", K: int = 64, address_tau: float = 0.1,
+                 address_chunk: Optional[int] = None,
                  decode_mode: str = "tied", n_atoms: int = 64, code_tau: float = 1.0,
                  dec_hidden: Optional[int] = None, dec_depth: Optional[int] = None,
                  readout: str = "linear", row_norm: str = "sphere",
@@ -107,6 +109,10 @@ class AlephModel(nn.Module):
         self.address = address
         self.n_axes = K
         self.address_tau = address_tau
+        # row-chunk size for the address (rows of the B*N*V flattened M). None ->
+        # closed-form auto (target ~2GB working set, scales with K/dtype). Chunking
+        # + per-chunk gradient checkpointing bounds address VRAM to ~one chunk.
+        self.address_chunk = address_chunk
         # emit (·,2K) aleph logits from forward only when needed. evaluate() runs
         # in eval mode (training=False) so logits/perplexity are available there;
         # set True to also emit during training (e.g. for the diversity term).
@@ -227,6 +233,48 @@ class AlephModel(nn.Module):
         logits = torch.cat([cos, -cos], dim=-1) if want_logits else None
         return M_hat, logits
 
+    # ── chunked + checkpointed address over all R = B*N*V rows ──
+    def _resolve_chunk(self, R: int, elem_bytes: int) -> int:
+        """Closed-form row-chunk for the address. Rows are independent, so the
+        only cost that scales with chunk size is the live (c,K) buffers; target a
+        fixed working set so they stay negligible vs the rest of the model. This
+        is a wide plateau, not an optimum — no sweep needed. Scales with K and
+        dtype. Explicit self.address_chunk overrides. Degrades only at K >> 64
+        with a tight budget (chunk count explodes -> loop/launch overhead)."""
+        if self.address_chunk is not None:
+            return max(1, min(R, int(self.address_chunk)))
+        LIVE = 6                               # live (c,K): cos/u, ep, en, num + slack
+        TARGET = 2 * 1024 ** 3                  # ~2 GB working set per chunk
+        c = TARGET // (LIVE * self.n_axes * max(1, elem_bytes))
+        return max(1, min(R, int(c)))
+
+    def _address_all(self, flat: torch.Tensor, want_logits: bool):
+        """aleph_address over all rows, chunked. In the training hot path each
+        chunk is gradient-checkpointed: forward saves only the (c,D) input and
+        backward recomputes one chunk's (c,K) tensors at a time, so peak address
+        memory is ~one chunk both ways (exact — rows are independent). Eval and
+        the want_logits path loop without checkpoint (no_grad already frees the
+        transients; checkpoint can't wrap the logits output cleanly)."""
+        R = flat.shape[0]
+        c = self._resolve_chunk(R, flat.element_size())
+        if c >= R:                              # fits already (small batch / sanity)
+            return self.aleph_address(flat, want_logits=want_logits)
+        ckpt = self.training and flat.requires_grad and not want_logits
+        mh_pieces, lg_pieces = [], []
+        for blk in flat.split(c, dim=0):
+            if ckpt:
+                mh = checkpoint(lambda b: self.aleph_address(b, want_logits=False)[0],
+                                blk, use_reentrant=False)
+                lg = None
+            else:
+                mh, lg = self.aleph_address(blk, want_logits=want_logits)
+            mh_pieces.append(mh)
+            if lg is not None:
+                lg_pieces.append(lg)
+        M_hat = torch.cat(mh_pieces, dim=0)
+        logits = torch.cat(lg_pieces, dim=0) if lg_pieces else None
+        return M_hat, logits
+
     # ── encode: patches -> spherical M, then aleph-address to the codebook ──
     def encode_patches(self, patches: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, N, _ = patches.shape
@@ -245,7 +293,7 @@ class AlephModel(nn.Module):
         if self.address != "none":
             want_logits = self._emit_logits or (not self.training)
             flat = M.reshape(B * N * self.matrix_v, self.D)
-            M_hat_flat, logit_flat = self.aleph_address(flat, want_logits=want_logits)
+            M_hat_flat, logit_flat = self._address_all(flat, want_logits=want_logits)
             M_hat = M_hat_flat.reshape(B * N, self.matrix_v, self.D)
             if logit_flat is not None:
                 aleph_logits = logit_flat.reshape(B, N, self.matrix_v, 2 * self.n_axes)
@@ -313,6 +361,7 @@ class AlephModel(nn.Module):
             "V": self.matrix_v, "D": self.D, "ps": self.patch_size,
             "hidden": self.hidden, "depth": self.depth, "channels": self.channels,
             "address": self.address, "K": self.n_axes, "address_tau": self.address_tau,
+            "address_chunk": self.address_chunk,
             "decode_mode": self.decode_mode, "n_atoms": self.n_atoms,
             "code_tau": self.code_tau, "readout": self.readout,
             "dec_hidden": self.dec_hidden, "dec_depth": self.dec_depth,
@@ -338,6 +387,7 @@ def build_aleph(config: dict) -> AlephModel:
         address=config.get("address", "soft"),
         K=config.get("K", config.get("n_axes", 64)),
         address_tau=config.get("address_tau", 0.1),
+        address_chunk=config.get("address_chunk"),
         decode_mode=config.get("decode_mode", "tied"),
         n_atoms=config.get("n_atoms", 64),
         code_tau=config.get("code_tau", 1.0),
