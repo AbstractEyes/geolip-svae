@@ -1,8 +1,8 @@
 """
-geolip-svae — Spectral Variational Autoencoder
-=================================================
-Omega Tokens on S^15. Patch-based SVD autoencoder with
-spectral cross-attention and sphere-normalized encoding.
+geolip-svae — Spectral Variational Autoencoder + geolip-aleph-void
+====================================================================
+Omega Tokens on S^15. Patch-based SVD autoencoder with spectral
+cross-attention and sphere-normalized encoding.
 
     from geolip_svae import PatchSVAE, load_model
     model, cfg = load_model(hf_version='v13_imagenet256')
@@ -15,9 +15,18 @@ spectral cross-attention and sphere-normalized encoding.
     codebook = build_codebook(save_path='codebook.json')
     tokenizer = SpectralTokenizer(codebook)
     image, ids, strings = tokenizer.text_to_image("Hello, world!")
+
+geolip-aleph-void — the evolution of the SVAE. Same spherical encoder, but the
+decoder is a pluggable strategy ('tied' | 'dict' | 'mlp') instead of the SVAE's
+MLP-only accumulator, so the codebook matrix M can be forced to carry recon.
+Same forward contract as PatchSVAE, so all inference/codebook tooling applies.
+
+    from geolip_svae import AlephModel, build_aleph
+    model = AlephModel(decode_mode='tied')   # recon-real spherical codebook
+    out = model(images)                       # out['recon'], out['svd']['M']
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from geolip_svae.model import (
     PatchSVAE,
@@ -28,6 +37,12 @@ from geolip_svae.model import (
     cv_of,
     extract_patches,
     stitch_patches,
+)
+from geolip_svae.aleph_model import (
+    AlephModel,
+    build_aleph,
+    ALEPH_MODEL_TYPE,
+    DECODE_MODES,
 )
 from geolip_svae.inference import load_model, encode, decode, reconstruct
 from geolip_svae.experimental.experimental_codebook import (
@@ -51,6 +66,11 @@ __all__ = [
     "cv_of",
     "extract_patches",
     "stitch_patches",
+    # geolip-aleph-void
+    "AlephModel",
+    "build_aleph",
+    "ALEPH_MODEL_TYPE",
+    "DECODE_MODES",
     # Inference
     "load_model",
     "encode",
