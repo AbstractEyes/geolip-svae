@@ -67,10 +67,24 @@ def _col_norm_cv(M: torch.Tensor) -> float:
     return float((s.std() / (s.mean() + 1e-8)).item())
 
 
+def _address_stats(aleph_logits: torch.Tensor, tau: float):
+    """From aleph_logits (B,N,V,2K): codebook PERPLEXITY (effective # oriented
+    axes used — collapse detector, low = collapsed toward few axes) and mean
+    top-1 address probability (how decisively each row addresses). Returns
+    (perplexity, mean_margin, usage_vec)."""
+    a = torch.softmax(aleph_logits / tau, dim=-1)        # (B,N,V,2K)
+    usage = a.reshape(-1, a.shape[-1]).mean(0)           # (2K,) batch-mean usage
+    ent = -(usage * usage.clamp_min(1e-12).log()).sum()
+    ppl = float(ent.exp().item())                        # effective axes used
+    margin = float(a.max(dim=-1).values.mean().item())   # mean top-1 prob
+    return ppl, margin, usage
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, max_batches: int = 20):
     model.eval()
-    tot_mse, tot_cos, tot_cv, n = 0.0, 0.0, 0.0, 0
+    tot_mse, tot_cos, tot_cv, tot_ppl, tot_amg, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    has_addr = getattr(model, "address", "none") != "none"
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
@@ -80,9 +94,15 @@ def evaluate(model, loader, device, max_batches: int = 20):
         tot_cos += F.cosine_similarity(out["recon"].flatten(1),
                                        images.flatten(1), dim=1).mean().item()
         tot_cv += _col_norm_cv(out["svd"]["M"])
+        if has_addr and "aleph_logits" in out["svd"]:
+            ppl, amg, _ = _address_stats(out["svd"]["aleph_logits"], model.address_tau)
+            tot_ppl += ppl; tot_amg += amg
         n += 1
     model.train()
-    return (tot_mse / max(n, 1), tot_cos / max(n, 1), tot_cv / max(n, 1))
+    n = max(n, 1)
+    return (tot_mse / n, tot_cos / n, tot_cv / n,
+            tot_ppl / n if has_addr else float("nan"),
+            tot_amg / n if has_addr else float("nan"))
 
 
 def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
@@ -93,10 +113,12 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
     """Train one AlephModel (geolip-aleph-void). address='soft'|'hard' uses the
     aleph-address bottleneck (learned codebook of K projective axes); 'none'
     trains the recon-real tied autoencoder (the gate). loss_mode defaults to
-    'cosine' for tiny_imagenet, 'mse' for byte_trigram. Checkpoints are saved in
-    the load_model-compatible format (save_aleph_checkpoint), so every run
-    produces a loadable AlephModel. Returns (model, history) with history rows
-    (step, train_loss, test_mse, test_cos, test_cv)."""
+    'cosine' for tiny_imagenet, 'mse' for byte_trigram. Set cfg_overrides=
+    dict(div_weight=0.01) to enable the anti-collapse usage-entropy term if
+    codebook perplexity drops. Logs codebook perplexity (effective oriented axes
+    used — collapse detector) and mean address margin. Checkpoints saved in the
+    load_model-compatible format. Returns (model, history) with rows
+    (step, train_loss, test_mse, test_cos, test_cv, perplexity, address_margin)."""
     from geolip_svae.dataset_presets import get_dataset_bundle
     from geolip_svae.aleph_model import build_aleph, save_aleph_checkpoint
 
@@ -136,6 +158,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
           f"{cfg['epochs']}ep x ~{steps_per_epoch} steps | baseline MSE≈{base:.1e}")
 
     # track best by the training objective (cosine -> higher is better)
+    div_weight = cfg.get("div_weight", 0.0)   # anti-collapse usage-entropy term (0=off)
     history, step = [], 0
     best_cos, best_mse = -1.0, float("inf")
     for epoch in range(1, cfg["epochs"] + 1):
@@ -143,15 +166,23 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
             images = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
             out = model(images)
             loss = _recon_loss(out["recon"], images, loss_mode)
+            # anti-collapse: push batch-mean codebook usage toward uniform
+            # (minimizing negative entropy of usage raises perplexity).
+            if div_weight > 0 and "aleph_logits" in out["svd"]:
+                a = torch.softmax(out["svd"]["aleph_logits"] / model.address_tau, dim=-1)
+                usage = a.reshape(-1, a.shape[-1]).mean(0)
+                loss = loss + div_weight * (usage * usage.clamp_min(1e-12).log()).sum()
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
             step += 1
 
             if step % report_every == 0:
-                tmse, tcos, tcv = evaluate(model, test_loader, device)
-                history.append((step, loss.item(), tmse, tcos, tcv))
+                tmse, tcos, tcv, tppl, tamg = evaluate(model, test_loader, device)
+                history.append((step, loss.item(), tmse, tcos, tcv, tppl, tamg))
+                addr_str = (f" ppl={tppl:.1f}/{2*model.n_axes} amargin={tamg:.3f}"
+                            if model.address != "none" else "")
                 print(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
-                      f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f} "
-                      f"lr={sched.get_last_lr()[0]:.2e}")
+                      f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f}"
+                      f"{addr_str} lr={sched.get_last_lr()[0]:.2e}")
                 improved = (tcos > best_cos) if loss_mode != "mse" else (tmse < best_mse)
                 best_cos, best_mse = max(best_cos, tcos), min(best_mse, tmse)
                 if improved and save_path:
