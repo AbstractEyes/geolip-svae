@@ -1,5 +1,8 @@
 """aleph_model.py — the geolip-aleph-void model.
 
+# the current variation is wrong, requires the correct implementation.
+# this is the experimental tool used to test the decoder, not the final version.
+
 The natural evolution of PatchSVAE. The SVAE locks reconstruction into a deep
 residual-MLP decoder; that accumulator carries recon, so the spherical latent M
 is a "faux embedding" — recon flows through the MLP, not the geometry. AlephModel
