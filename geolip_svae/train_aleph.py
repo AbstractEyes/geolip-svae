@@ -24,6 +24,17 @@ import math
 import torch
 import torch.nn.functional as F
 
+try:                                          # progress bar (Colab + console)
+    from tqdm.auto import tqdm as _tqdm
+except Exception:                             # minimal no-op shim if tqdm absent
+    class _tqdm:
+        def __init__(self, *a, **k): pass
+        def update(self, *a, **k): pass
+        def set_postfix(self, *a, **k): pass
+        def close(self): pass
+        @staticmethod
+        def write(msg): print(msg)
+
 # byte_trigram_proto_64 preset — the config the baseline battery used.
 BASE_CFG = dict(
     V=32, D=4, patch_size=4, hidden=64, depth=1, channels=3,
@@ -233,9 +244,9 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
             api.upload_file(path_or_fileobj=local_path,
                             path_in_repo=f"{prefix}/{remote_name}",
                             repo_id=hf_repo, repo_type="model")
-            print(f"  ☁️  Uploaded: {hf_repo}/{prefix}/{remote_name}")
+            _tqdm.write(f"  ☁️  Uploaded: {hf_repo}/{prefix}/{remote_name}")
         except Exception as e:
-            print(f"  ⚠️  HF upload: {e}")
+            _tqdm.write(f"  ⚠️  HF upload: {e}")
 
     def sync_tb():
         if not (hf_enabled and tb_path):
@@ -254,6 +265,8 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         model._emit_logits = True             # diversity term needs the address logits
     history, step = [], 0
     best_cos, best_mse = -1.0, float("inf")
+    pbar = _tqdm(total=total_steps, desc=f"{decode_mode}/{model.address}",
+                 dynamic_ncols=True)
     for epoch in range(1, cfg["epochs"] + 1):
         for batch in train_loader:
             images = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
@@ -267,15 +280,21 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
                 loss = loss + div_weight * (usage * usage.clamp_min(1e-12).log()).sum()
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
             step += 1
+            pbar.update(1)
+            pbar.set_postfix(ep=epoch, loss=f"{loss.item():.2e}", refresh=False)
 
             if step % report_every == 0:
                 tmse, tcos, tcv, tppl, tamg, thppl = evaluate(model, test_loader, device)
                 history.append((step, loss.item(), tmse, tcos, tcv, tppl, tamg, thppl))
                 addr_str = (f" ppl={tppl:.1f}/{2*model.n_axes} hppl={thppl:.1f} "
                             f"amargin={tamg:.3f}" if model.address != "none" else "")
-                print(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
-                      f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f}"
-                      f"{addr_str} lr={sched.get_last_lr()[0]:.2e}")
+                _tqdm.write(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
+                            f"test_mse={tmse:.3e} test_cos={tcos:.4f} test_cv={tcv:.3f}"
+                            f"{addr_str} lr={sched.get_last_lr()[0]:.2e}")
+                pbar.set_postfix(ep=epoch, loss=f"{loss.item():.2e}",
+                                 cos=f"{tcos:.4f}",
+                                 hppl=(f"{thppl:.0f}" if model.address != "none" else "—"),
+                                 refresh=True)
                 if writer is not None:
                     writer.add_scalar("train/loss", loss.item(), step)
                     writer.add_scalar("test/mse", tmse, step)
@@ -299,6 +318,7 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         if os.path.exists(best_ckpt_path):
             upload_to_hf(best_ckpt_path, "best.pt")
         sync_tb()
+    pbar.close()
     print(f"AlephModel[{decode_mode}] {dataset}: best test_cos={best_cos:.4f} "
           f"best test_mse={best_mse:.3e} (baseline MSE≈{base:.1e}, "
           f"ratio {best_mse/base:.1f}x)")
