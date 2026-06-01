@@ -178,6 +178,8 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
         "address": cfg.get("address", address), "K": cfg.get("K", K),
         "address_tau": cfg.get("address_tau", address_tau),
         "dec_hidden": cfg.get("dec_hidden"), "dec_depth": cfg.get("dec_depth"),
+        "codebook_init": cfg.get("codebook_init", "random"),
+        "freeze_codebook": cfg.get("freeze_codebook", False),
         "n_atoms": cfg.get("n_atoms", 64), "code_tau": cfg.get("code_tau", 1.0),
     }).to(device)
 

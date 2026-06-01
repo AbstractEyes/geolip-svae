@@ -38,6 +38,7 @@ Reuses geolip_svae.model components so the encoder is byte-identical to the SVAE
 """
 from __future__ import annotations
 from typing import Dict, Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +55,50 @@ ALEPH_MODEL_TYPE = "aleph"            # checkpoint marker (distinct from 'v1'/'v
 DECODE_MODES = ("tied", "dict", "mlp")
 ADDRESS_MODES = ("soft", "hard", "none")   # aleph address bottleneck; 'none' = recon-real AE (gate)
 READOUTS = ("linear",)               # 'svd' reserved
+CODEBOOK_INITS = ("random", "fibonacci", "custom")   # 'custom' = caller-supplied (K,D) array
+
+
+def _super_fibonacci_s3(n: int, dtype=torch.float32) -> torch.Tensor:
+    """n near-uniform unit quaternions on S^3 via super-Fibonacci spirals
+    (Alexa, CVPR 2022). Deterministic, low-discrepancy. Returns (n, 4). The
+    measure on S^3 is uniform in (s, alpha, beta); the two irrationals PHI, PSI
+    wind the two angle circles. PSI is the published discrepancy-minimizing
+    constant — the spread is robust to small deviations in it."""
+    PHI = math.sqrt(2.0)
+    PSI = 1.533751168755204288118041
+    i = torch.arange(n, dtype=torch.float64) + 0.5
+    s = i / n
+    r = torch.sqrt(s)
+    R = torch.sqrt(1.0 - s)
+    alpha = 2.0 * math.pi * i / PHI
+    beta = 2.0 * math.pi * i / PSI
+    q = torch.stack([r * torch.sin(alpha), r * torch.cos(alpha),
+                     R * torch.sin(beta),  R * torch.cos(beta)], dim=-1)
+    return q.to(dtype)
+
+
+def _init_codebook(K: int, D: int, init, dtype=torch.float32) -> torch.Tensor:
+    """Build the initial (K, D) codebook.
+      'random'   : Gaussian (the historical default; left un-normalized).
+      'fibonacci': super-Fibonacci near-uniform spread (D==4; deterministic
+                   Gaussian-normalized fallback for D!=4). Starts the codebook
+                   in the RP^3 attractor basin so it need not be learned there.
+      (K,D) array: caller-supplied axes (e.g. geovocab pentachoron vertices),
+                   row-normalized.
+    'custom' as a string is a reload placeholder (state_dict overwrites it)."""
+    if isinstance(init, str):
+        if init in ("random", "custom"):
+            return torch.randn(K, D, dtype=dtype)
+        if init == "fibonacci":
+            if D == 4:
+                return F.normalize(_super_fibonacci_s3(K, dtype=dtype), dim=-1)
+            g = torch.Generator().manual_seed(0)         # deterministic fallback
+            return F.normalize(torch.randn(K, D, generator=g, dtype=dtype), dim=-1)
+        raise ValueError(f"unknown codebook_init '{init}' (use {CODEBOOK_INITS} or a (K,D) array)")
+    A = torch.as_tensor(init, dtype=dtype)
+    if tuple(A.shape) != (K, D):
+        raise ValueError(f"codebook_init array shape {tuple(A.shape)} != ({K}, {D})")
+    return F.normalize(A, dim=-1)
 
 
 class AlephModel(nn.Module):
@@ -76,6 +121,7 @@ class AlephModel(nn.Module):
                  *,
                  address: str = "soft", K: int = 64, address_tau: float = 0.1,
                  address_chunk: Optional[int] = None,
+                 codebook_init="random", freeze_codebook: bool = False,
                  decode_mode: str = "tied", n_atoms: int = 64, code_tau: float = 1.0,
                  dec_hidden: Optional[int] = None, dec_depth: Optional[int] = None,
                  readout: str = "linear", row_norm: str = "sphere",
@@ -118,15 +164,26 @@ class AlephModel(nn.Module):
         # set True to also emit during training (e.g. for the diversity term).
         self._emit_logits = False
 
-        # ── learned aleph codebook: K projective axes in D-space ──
+        # ── aleph codebook: K projective axes in D-space ──
         # The address bottleneck snaps each M-row to this codebook (signed), so
         # recon flows through the address into the codebook — the aleph logit is
         # load-bearing, not a post-hoc read. address='none' disables it (M̂ = M),
-        # recovering the recon-real tied autoencoder (the gate).
+        # recovering the recon-real tied autoencoder (the gate). codebook_init
+        # seeds the axes ('fibonacci' = start in the near-uniform RP^3 attractor
+        # basin rather than learning into it); freeze_codebook makes them a fixed
+        # buffer (no moving pressure) — only safe once a drift check confirms the
+        # init IS the attractor, else the rest of the model converges to a wrong
+        # codebook.
         if address != "none":
-            self.codebook = nn.Parameter(torch.randn(K, D))
+            A0 = _init_codebook(K, D, codebook_init)
+            if freeze_codebook:
+                self.register_buffer("codebook", A0)
+            else:
+                self.codebook = nn.Parameter(A0)
         else:
             self.register_parameter("codebook", None)
+        self.codebook_init = codebook_init if isinstance(codebook_init, str) else "custom"
+        self.freeze_codebook = bool(freeze_codebook)
 
         if n_heads is None:
             n_heads = 2 if D <= 8 else min(4, D)
@@ -362,6 +419,7 @@ class AlephModel(nn.Module):
             "hidden": self.hidden, "depth": self.depth, "channels": self.channels,
             "address": self.address, "K": self.n_axes, "address_tau": self.address_tau,
             "address_chunk": self.address_chunk,
+            "codebook_init": self.codebook_init, "freeze_codebook": self.freeze_codebook,
             "decode_mode": self.decode_mode, "n_atoms": self.n_atoms,
             "code_tau": self.code_tau, "readout": self.readout,
             "dec_hidden": self.dec_hidden, "dec_depth": self.dec_depth,
@@ -388,6 +446,8 @@ def build_aleph(config: dict) -> AlephModel:
         K=config.get("K", config.get("n_axes", 64)),
         address_tau=config.get("address_tau", 0.1),
         address_chunk=config.get("address_chunk"),
+        codebook_init=config.get("codebook_init", "random"),
+        freeze_codebook=config.get("freeze_codebook", False),
         decode_mode=config.get("decode_mode", "tied"),
         n_atoms=config.get("n_atoms", 64),
         code_tau=config.get("code_tau", 1.0),
