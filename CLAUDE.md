@@ -41,6 +41,14 @@ HuggingFace `AutoModel` that emits a per-bank MSE signature. This is newer
 than the core SVAE work and has different conventions — see "Arrays
 infrastructure" below.
 
+Newest is **`AlephModel`** (`geolip_svae/aleph_model.py`, the geolip-aleph-void
+element): the same spherical encoder, but the latent is addressed to a *learned
+projective codebook* and the decoder reconstructs from the addressed rows. The
+aleph signed-projective address is the load-bearing operation. It shares
+PatchSVAE's `forward()` contract, so inference/scaling/codebook tooling apply —
+but it has its own invariants and its own failure mode (codebook collapse). See
+"The aleph-address model" below before touching it.
+
 ## Load-bearing things you must not casually change
 
 If you find yourself wanting to "clean up" any of these, stop and ask.
@@ -97,6 +105,10 @@ the override, which is the desired behavior.
 `PatchSVAEv2` was removed entirely during the inference framework
 rebuild. Loading a v2 checkpoint raises `UnsupportedCheckpointError`
 with a clear "re-train as v1" message. Don't try to revive it.
+
+`load_model` now dispatches on `model_type`: `'v1'` builds a `PatchSVAE`,
+`'aleph'` builds an `AlephModel` (via `build_aleph` — see "The aleph-address
+model"), `'v2'` raises. Both supported types return `(model, cfg)` the same way.
 
 Module ownership inside `inference/`:
 
@@ -170,6 +182,87 @@ Things to know before writing codebook code:
   ~88% of the spatial signal in downstream classifiers). Kept as
   opt-in for reproducing those original verifications, NOT for
   production use.
+
+## The aleph-address model (`AlephModel`, geolip-aleph-void)
+
+`AlephModel` (in `geolip_svae/aleph_model.py`) is the evolution of the
+sphere-solver: same encoder, but the latent is addressed to a **learned
+projective codebook** and the decoder reconstructs from the *addressed* rows.
+The aleph signed-projective address is the load-bearing operation, not a
+diagnostic read. It keeps PatchSVAE's `forward()` contract (`out['recon']`,
+`out['svd']`), so inference / scaling / `Codebook` tooling all apply. The shared
+encoder invariants above (orthogonal `enc_out` init, sphere-normalized rows of
+M, no GAP, pure Adam) apply unchanged — `AlephModel` reuses the PatchSVAE
+encoder primitives directly.
+
+### Load-bearing, do not casually change
+
+- **Decode reads `svd['M_hat']`, not `svd['M']`.** `M_hat` is M *after* the
+  codebook address; `M` is the raw spherical rows, kept only for reference and
+  the column-norm CV probe. If you "simplify" the decoder to read `M`, you
+  silently cut the codebook out of the gradient path and the address stops being
+  load-bearing — the model still trains, but it is no longer the aleph model.
+- **The address is the antipodal closed form, on purpose.**
+  `M_hat = Σ_k sinh(u_k)·A_k / Σ_k cosh(u_k)`, `u = cos/τ`, computed by factoring
+  out `max|u|`. This is the *exact* softmax over the `2K` oriented half-axes
+  `[+A; −A]` — verified equal to the explicit softmax to ~1e-15 across τ. Do not
+  "restore" the explicit `2K` softmax + `[+A; −A]` concat: at `B·N·V` rows
+  (≈16.7M at batch 2048) that `2K` tensor is the dominant allocation and was the
+  memory wall. The `max|u|` subtraction is load-bearing for numerical stability
+  at small τ (raw `sinh/cosh` overflow fp32 below τ≈0.02).
+- **Logits are emitted lazily.** `encode_patches` builds the `(B, N, V, 2K)`
+  aleph-logit tensor only when `self._emit_logits or (not self.training)`.
+  `evaluate()` runs in eval mode, so perplexity/margin are available there;
+  training does not pay the ~8.6 GB/step allocation. Do not set
+  `_emit_logits=True` globally to "expose" the logits — the diversity term turns
+  it on only when `div_weight > 0`.
+- **The codebook is a learned `nn.Parameter` (`model.codebook`, `K×D`)** — NOT
+  the extracted projective-axis `Codebook` artifact. It is trained by
+  reconstruction through the address. You can still extract a post-hoc `Codebook`
+  from an AlephModel (the forward contract matches) for ℝP^(D-1) analysis, but
+  don't conflate the two. `address='none'` registers `codebook` as `None` — no
+  parameter at all (see the loader trap below).
+
+### `address` modes and the gate
+
+- `address='soft'` — differentiable mixture (default; the real aleph model).
+- `address='hard'` — straight-through discrete address (winner half-axis).
+- `address='none'` — `M_hat = M`: the recon-real tied autoencoder that **gated**
+  this line of work. It is the proof that a single linear map off M reconstructs
+  (cosine ≈ 0.9997 on byte-trigram) and the no-address baseline. It is *not* the
+  aleph model — don't describe it as such. Backward-compatible.
+
+`decode_mode` (`tied`/`dict`/`mlp`) chooses how `M_hat` → patch and is orthogonal
+to `address`. `readout='linear'` only; `'svd'` is reserved.
+
+### Checkpoints and loading
+
+`AlephModel` checkpoints declare `model_type='aleph'`. Save with
+`save_aleph_checkpoint(model, path, epoch=, test_mse=)` (it writes the
+`load_model`-compatible `{config, model_state_dict, epoch, test_mse}`); load with
+`load_model(checkpoint_path=...)`. `loading.py` dispatches on `model_type`:
+`'v1'` → `PatchSVAE`, `'aleph'` → `build_aleph`, `'v2'` →
+`UnsupportedCheckpointError`. Unlike v1, the aleph config is self-complete
+(`get_config` round-trips every constructor argument), so there is **no**
+`final_report.json` backfill step.
+
+Loader trap: an `address='none'` build has no `codebook` in its state_dict, so
+loading a `soft`/`hard` checkpoint into a `none` build shows `codebook` missing —
+that's a config mismatch (pass the right `address`/`K`), caught by the same debug
+move below. The codebook adds only `K·D` params, so a param-count check won't
+flag it; check `address` explicitly.
+
+### Training and the one failure mode
+
+`train_aleph(...)` produces loadable checkpoints and logs, besides recon
+MSE/cosine, two address-health metrics: **codebook perplexity** (effective
+oriented axes in use) and **mean address margin** (decisiveness). Codebook
+collapse — a few axes absorbing all rows — is the failure mode to watch. If
+perplexity craters, enable the anti-collapse term with
+`cfg_overrides=dict(div_weight=0.01)`; run `div_weight=0` first so you can see
+whether collapse actually happens before regularizing it away. bf16/AMP is the
+deferred speed lever — mind the bf16 reconstruction-floor note below (the M
+tensor lives on the sphere, so bf16 quantizes angular differences coarsely).
 
 ## Architecture-identity invariants (for battery arrays)
 
@@ -415,6 +508,19 @@ add it to `_extract_model_state`.
   error compounds through SVD → decoder. fp16 (10-bit mantissa) sits
   ~5% above fp32 and is fine for most uses; bf16 is for when memory
   pressure matters more than reconstruction floor.
+- **`AlephModel` decode reading `svd['M_hat']` while `svd['M']` also
+  exists in the same dict** — intentional. `M` is the raw spherical rows
+  (kept for the column-norm CV probe and post-hoc codebook extraction);
+  `M_hat` is the codebook-addressed rows the decoder reconstructs from.
+  Reconstructing from `M` would cut the codebook out of the gradient.
+- **An `address='none'` `AlephModel` has no `codebook` key in its
+  state_dict** — correct; the gate has no codebook. Only `soft`/`hard`
+  builds carry the learned `codebook` parameter. A `codebook` "missing"
+  on load is a config mismatch (`address`), not a corrupt checkpoint.
+- **The aleph address uses `sinh`/`cosh`, not an explicit softmax** —
+  correct, and it is the exact antipodal-softmax closed form (the `2K`
+  oriented-axis softmax collapses to a `K`-wide `sinh/cosh` ratio). The
+  explicit `2K` softmax it replaced was the memory wall; don't reinstate it.
 
 ## When you're uncertain
 

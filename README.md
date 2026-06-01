@@ -8,6 +8,14 @@ sentencepiece bits, byte trigrams) as **omega tokens** — singular value
 vectors on unit hyperspheres. Pluggable SVD backend with fused Triton
 kernels at D ∈ {2..6}.
 
+The package also ships **geolip-aleph-void** (`AlephModel`) — the evolution of the
+sphere-solver. Same spherical encoder, but a **learned projective codebook** sits
+in the latent path and the *aleph signed-projective address* becomes the
+load-bearing bottleneck: each omega row is addressed to the codebook and the
+decoder reconstructs from the addressed rows. It shares PatchSVAE's `forward()`
+contract, so the inference, scaling, and codebook tooling all apply. See
+[geolip-aleph-void](#geolip-aleph-void--the-aleph-address-model).
+
 ## Quick Start
 
 ```bash
@@ -144,7 +152,7 @@ python -m geolip_svae.train --preset NAME --epochs 5 --no-upload
 | `h2_64_1channel`         | 1 | Single-channel sphere-solver |
 | `h2_64_5channel`         | 5 | Multi-channel sphere-solver |
 | `h2_64_5channel_v40_d4_ps4_h80` | 5 | h=80 variant for capacity sweep |
-| `h2_h64_v64_d16_ps16_single_full_noise_image64x64` | 3 | D=16 hybrid |
+| `h2_h64_v64_d16_ps16_single_full_noise_image64x64` | 5 | D=16 hybrid |
 | `h2_64_dodecahedron_v1` / `_v2` | 3 | Polytope-class architecture studies |
 | `h2_64_tesseract_v1`     | 3 | 4D polytope architecture |
 
@@ -427,6 +435,108 @@ Reproduce:
 python -m geolip_svae.tests.u5_codebook_capacity --n-calib 64
 ```
 
+## geolip-aleph-void — the aleph-address model
+
+`AlephModel` is the evolution of the sphere-solver. It keeps the PatchSVAE
+encoder byte-for-byte (patches → MLP → row-normalized matrix `M` on `S^(D-1)`)
+but replaces the *post-hoc* codebook story with a **learned projective codebook in
+the latent path**, and makes the *aleph signed-projective address* the
+load-bearing bottleneck. It shares PatchSVAE's `forward()` contract
+(`out['recon']`, `out['svd']`), so the inference framework, scaling, and codebook
+tooling all apply.
+
+Where PatchSVAE reconstructs through a deep residual decoder (the spherical latent
+is a *faux* embedding), `AlephModel` addresses each omega row to the codebook and
+decodes from the **addressed** rows — so the codebook carries reconstruction.
+
+### The address
+
+Given the spherical matrix `M` and a learned codebook `A` of `K` projective axes:
+
+- signed alignments `cos = M @ Aᵀ`, oriented over the `2K` half-axes `[+A; −A]`;
+- the address is `softmax(logits / τ)` over those `2K` oriented axes — the **aleph
+  logit**, a distribution over signed codebook directions;
+- the addressed row is the codebook reconstruction
+  `M̂ = Σ_k sinh(u_k)·A_k / Σ_k cosh(u_k)`, `u = cos/τ`.
+
+That last expression is the **exact closed form** of the antipodal softmax: because
+the oriented axes are `±A`, the `2K`-way mixture collapses to a `K`-wide
+`sinh/cosh` ratio (computed stably by factoring out `max|u|`), so the `2K` logit
+tensor is never materialized in the training path — at `B·N·V` rows it would be
+the dominant allocation. The full `(B, N, V, 2K)` logits are emitted only in eval
+(for diagnostics) or when the anti-collapse term is active.
+
+The decoder reconstructs the patch from `M̂`, so the reconstruction gradient trains
+the codebook through the address.
+
+### Modes
+
+`address`:
+
+- `soft` — differentiable mixture (default).
+- `hard` — straight-through discrete address (winner half-axis, soft gradient).
+- `none` — `M̂ = M`; recovers the recon-real tied autoencoder that *gated* this
+  work — the proof that a single linear map off `M` reconstructs (cosine ≈ 0.9997
+  on byte-trigram). The no-address baseline.
+
+`decode_mode` controls how `M̂` becomes a patch: `tied` (one `nn.Linear(V·D, patch)`),
+`dict` (softmax over learned atoms), or `mlp` (the SVAE residual decoder, on `M̂`).
+
+### Learned codebook vs. extracted Codebook
+
+This codebook is a trained `nn.Parameter` (`model.codebook`, `K × D`) that the
+forward pass *uses* — distinct from the [Projective-Axis Codebook](#projective-axis-codebooks)
+artifact above, which is extracted from a frozen model's `M` by antipodal collapse.
+Because `AlephModel` keeps the PatchSVAE forward contract, you can still extract a
+post-hoc `Codebook` artifact from it for the same ℝP^(D-1) analysis; the difference
+is that the aleph codebook is load-bearing during reconstruction, not a read-out.
+`model.oriented_codebook()` returns the `(2K, D)` oriented half-axes the address
+runs over.
+
+### Usage
+
+```python
+from geolip_svae import AlephModel, build_aleph, load_model
+from geolip_svae.aleph_model import save_aleph_checkpoint
+from geolip_svae.train_aleph import train_aleph
+
+# build + train (checkpoints are load_model-compatible)
+model, history = train_aleph(
+    decode_mode='tied', dataset='byte_trigram', address='soft',
+    cfg_overrides=dict(epochs=30, ds_size=500_000, batch_size=2048),
+    save_path='aleph_soft_bt.pt',
+)
+
+# reload — load_model dispatches model_type='aleph' to build_aleph
+model, cfg = load_model(checkpoint_path='aleph_soft_bt.pt')
+out = model(images)
+recon       = out['recon']
+addressed_M = out['svd']['M_hat']     # rows snapped to the codebook
+codebook    = model.codebook          # learned (K, D)
+```
+
+`train_aleph` logs reconstruction MSE/cosine plus two address-health metrics —
+**codebook perplexity** (effective oriented axes in use; the collapse detector)
+and **mean address margin** (how decisively rows address). If perplexity craters,
+enable the anti-collapse term with `cfg_overrides=dict(div_weight=0.01)`.
+
+Datasets reuse the registry: `byte_trigram` (WikiText-103 byte-trigram images,
+baseline MSE ≈ 3.8e-7) and `tiny_imagenet` (cosine loss by default;
+`loss_mode='cosine_mse'` when amplitude matters).
+
+### Reference config & status
+
+Byte-trigram reference: `V=32, D=4, patch_size=4, hidden=64, channels=3, K=64,
+address_tau=0.1, decode_mode='tied'` — the codebook adds only `K·D` params over
+the autoencoder.
+
+Established: `M` is reconstruction-real (the `address='none'` gate), and codebooks
+extracted from this regime address real tokens markedly more sharply than the
+faux-embedding batteries and carry richer 2D topology. The open question
+`AlephModel` exists to answer — whether reconstruction **survives** the address
+bottleneck (`soft` vs the `none` gate) — is the active experiment; per-run recon
+and codebook-health metrics are logged by `train_aleph`.
+
 ## Battery Arrays
 
 Bundle multiple independently-trained PatchSVAE batteries as a single
@@ -461,12 +571,20 @@ geolip_svae/
 │                         gram_eigh_svd dispatcher (geolip-core 0.3.0 batched_svd),
 │                         ACTIVATIONS / ACTIVATION_MODULES / ACTIVATION_SITES,
 │                         SVD_METHODS / SVD_COMPUTE_DTYPES
+├── aleph_model.py        AlephModel (aleph-address bottleneck) + build_aleph +
+│                         save_aleph_checkpoint. Learned projective codebook;
+│                         antipodal closed-form address; decode from addressed M̂.
+│                         address ∈ {soft, hard, none}; decode_mode ∈ {tied, dict, mlp}
 ├── train.py              Unified trainer (CLI + train(cfg)) with codebook auto-build
+├── train_aleph.py        AlephModel trainer — load_model-compatible checkpoints,
+│                         codebook-perplexity / address-margin logging, optional
+│                         anti-collapse (div_weight) term
 ├── train_presets.py      PRESETS registry (23 entries) + TEMPLATE (51 cfg keys)
 ├── dataset_presets.py    DATASET_FACTORIES (10 entries) + dataset classes,
 │                         recovery metrics, eval_per_type, get_dataset_bundle
 ├── inference/            Production inference framework
-│   ├── loading.py        load_model, VERSIONS, list_versions
+│   ├── loading.py        load_model (dispatches PatchSVAE / AlephModel by
+│   │                     model_type), VERSIONS, list_versions
 │   ├── scaling.py        encode_at_scale / reconstruct_at_scale (direct/tile/auto)
 │   ├── calibration.py    Calibration data generators (registry pattern)
 │   ├── codebook.py       Codebook artifact, extract_codebook, antipodal-collapse
