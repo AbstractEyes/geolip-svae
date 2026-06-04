@@ -38,6 +38,7 @@ Reuses geolip_svae.model components so the encoder is byte-identical to the SVAE
 """
 from __future__ import annotations
 from typing import Dict, Optional
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
@@ -481,5 +482,170 @@ def save_aleph_checkpoint(model: AlephModel, path: str, *,
     torch.save(ckpt, path)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  AlephTransformer — multiscale lens over a FROZEN aleph battery.
+#
+#  Mirrors GeoSVAETransformer (model_transformer.py), but the battery is a frozen
+#  AlephModel and the stem is the ADDRESSED rows M̂ (the address DIRECTION) by
+#  default — so the macro shell STRENGTHENS THE ALEPH ADDRESS, re-scaled to D_lens
+#  NATIVELY (no manual linear up-projection). The aleph (encoder + learned codebook
+#  + address) is frozen and detached at the stem boundary, so the external recon's
+#  gradient never reaches it; only the shell (transformer + decoder) trains. The
+#  lens is a fixed isometric buffer — zero params, the same wall the SVAE-
+#  transformer rests on. Shell pieces are imported from model_transformer.py lazily
+#  inside __init__ (it imports model.py, never aleph_model.py — no cycle).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class AlephTransformerConfig:
+    # ── macro shell (snap the frozen micro-address into a large projection) ──
+    D_lens: int = 256                # isometric lift D_base -> D_lens (the multiscale knob)
+    shell_hidden: int = 512          # shell decoder hidden
+    shell_depth: int = 1             # shell decoder residual blocks
+    n_heads: int = 8                 # spectral heads (MUST divide D_lens)
+    n_layers: int = 6                # spectral depth
+    max_alpha: float = 0.2
+    alpha_init: float = -2.0
+    use_spectral: bool = True        # toggle the transformer (False = pass omega straight through)
+    # ── lens sign channel (same semantics as the SVAE-transformer) ──
+    #   'signed' : keep S^(D-1), per-row sign preserved to the decoder (the address channel).
+    #   'canon'  : project to RP^(D-1), sign dropped (the ablation).
+    lens_sign: str = "signed"
+    # ── Fork-A toggle: what the frozen aleph exposes as the stem ──
+    #   'm_hat' : the ADDRESSED rows (codebook reconstruction), normalized to the
+    #             address DIRECTION — the macro shell strengthens the address. DEFAULT.
+    #   'm'     : the RAW pre-address spherical rows — ignores the codebook
+    #             (the SVAE-transformer-equivalent control).
+    stem: str = "m_hat"
+    # ── read-only address monitor (never trains anything) ──
+    assess: bool = True              # attach an AlephAssessor over the D_base stem
+    cc_temp: float = 0.10
+    seed: int = 0
+
+
+class AlephTransformer(nn.Module):
+    """Frozen AlephModel battery + fixed isometric lens + spectral transformer +
+    external-recon decoder. A multiscale lens that re-scales the aleph address to
+    D_lens NATIVELY (no manual linear up-projection).
+
+    Geometry (V, D_base, ps, channels, patch_dim) is READ from the frozen aleph,
+    so the lens / decoder / patch grid can never drift from the battery they sit on.
+
+    Trainable surface = transformer + decoder only. The lens is a buffer (no params);
+    the aleph is frozen and read under no_grad at the detached stem boundary.
+    """
+
+    MODEL_TYPE = "aleph_transformer"
+
+    def __init__(self, aleph: "AlephModel", cfg: AlephTransformerConfig,
+                 device: str = "cpu"):
+        super().__init__()
+        assert cfg.stem in ("m_hat", "m"), f"stem must be 'm_hat'|'m', got {cfg.stem!r}"
+        assert cfg.D_lens % cfg.n_heads == 0, \
+            f"D_lens={cfg.D_lens} must be divisible by n_heads={cfg.n_heads}"
+        self.cfg = cfg
+
+        # frozen battery — geometry read straight off it
+        self.aleph = aleph.eval()
+        for p in self.aleph.parameters():
+            p.requires_grad_(False)
+        self.V = aleph.matrix_v
+        self.D_base = aleph.D
+        self.ps = aleph.patch_size
+        self.channels = aleph.channels
+        self.patch_dim = aleph.patch_dim
+
+        # reusable shell from the SVAE-transformer (no cycle: it imports model.py only)
+        from geolip_svae.model_transformer import (
+            SingleLens, SpectralAlphaStack, GeoDecoder, AlephAssessor, canon,
+        )
+        self._canon = canon
+        self.lens = SingleLens(self.D_base, cfg.D_lens, seed=cfg.seed,
+                               sign_mode=cfg.lens_sign)                 # fixed isometric lift
+        self.transformer = SpectralAlphaStack(cfg.D_lens, cfg.n_heads, cfg.n_layers,
+                                              cfg.max_alpha, cfg.alpha_init)
+        self.decoder = GeoDecoder(self.V, cfg.D_lens, self.patch_dim,
+                                  cfg.shell_hidden, depth=cfg.shell_depth)
+
+        # read-only address monitor over the D_base stem, against the aleph's OWN
+        # learned codebook when available (so it measures address consistency, not a
+        # generic random reference). Falls back to a random codebook otherwise.
+        self.assessor = None
+        if cfg.assess:
+            cb = None
+            ac = getattr(self.aleph, "codebook", None)
+            if ac is not None:
+                cb = canon(F.normalize(ac.detach().float(), dim=-1))
+            K = cb.shape[0] if cb is not None else aleph.n_axes
+            self.assessor = AlephAssessor(self.D_base, K, codebook=cb,
+                                          temp=cfg.cc_temp, seed=cfg.seed + 7)
+
+        self.to(device)
+
+    # ── frozen aleph -> the (B,N,V,D_base) stem rows, on the sphere ──────────
+    @torch.no_grad()
+    def _stem(self, images: torch.Tensor):
+        """Run the frozen aleph encoder and return the stem rows + patch grid.
+        stem='m_hat': the ADDRESSED rows M̂ (NOT unit — its row norm is the address
+        confidence), normalized to the address DIRECTION for the isometric lens.
+        stem='m': the raw spherical rows (already unit). NOTE: we do NOT canon here —
+        the lens applies the sign rule per cfg.lens_sign, so the signed channel is
+        preserved exactly as in the SVAE-transformer."""
+        patches, gh, gw = extract_patches(images, self.ps)
+        svd = self.aleph.encode_patches(patches)
+        rows = svd["M_hat"] if self.cfg.stem == "m_hat" else svd["M"]   # (B,N,V,D_base)
+        stem = F.normalize(rows, dim=-1)                                # sphere; sign intact
+        return stem, gh, gw
+
+    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        stem, gh, gw = self._stem(images)                   # detached (no_grad) — the wall
+        M_lens = self.lens(stem)                            # (B,N,V,D_lens) isometric lift
+        omega = M_lens.norm(dim=-2)                         # (B,N,D_lens) spectral
+        S_att = self.transformer(omega) if self.cfg.use_spectral else omega
+        dec = self.decoder(M_lens, S_att)                   # (B,N,patch_dim)
+        external_recon = stitch_patches(dec, gh, gw, self.ps, channels=self.channels)
+        out = {
+            "external_recon": external_recon,
+            "M_stem": stem, "M_lens": M_lens, "omega": omega, "S_att": S_att,
+            "mean_alpha": (self.transformer.mean_alpha() if self.cfg.use_spectral else 0.0),
+        }
+        if self.assessor is not None:
+            out["aleph"] = self.assessor(stem)              # READ-ONLY
+        return out
+
+    # ── losses / params ─────────────────────────────────────────────────────
+    def external_recon_loss(self, out: Dict[str, torch.Tensor],
+                            images: torch.Tensor) -> torch.Tensor:
+        """Shell recon from the detached aleph stem — pure MSE; trains the shell only."""
+        return F.mse_loss(out["external_recon"], images)
+
+    def shell_parameters(self):
+        """Trainable params: transformer + decoder. (Lens is a fixed buffer; the
+        aleph battery is frozen.)"""
+        return list(self.transformer.parameters()) + list(self.decoder.parameters())
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_config(self) -> dict:
+        """Round-trip config: the shell toggles + the frozen aleph's own config
+        (so a loader can rebuild the aleph via build_aleph, then this shell)."""
+        cfg = {k: getattr(self.cfg, k) for k in self.cfg.__dataclass_fields__}
+        return {"model_type": self.MODEL_TYPE,
+                "aleph_config": self.aleph.get_config(),
+                **cfg}
+
+
+def build_aleph_transformer(aleph: "AlephModel", config: dict,
+                            device: str = "cpu") -> AlephTransformer:
+    """Construct an AlephTransformer from a frozen aleph + a config dict (the
+    AlephTransformerConfig fields; unknown keys ignored)."""
+    fields = AlephTransformerConfig.__dataclass_fields__
+    tcfg = AlephTransformerConfig(**{k: v for k, v in config.items() if k in fields})
+    return AlephTransformer(aleph, tcfg, device=device)
+
+
 __all__ = ["AlephModel", "build_aleph", "save_aleph_checkpoint",
-           "ALEPH_MODEL_TYPE", "DECODE_MODES", "ADDRESS_MODES"]
+           "ALEPH_MODEL_TYPE", "DECODE_MODES", "ADDRESS_MODES",
+           "AlephTransformer", "AlephTransformerConfig", "build_aleph_transformer"]

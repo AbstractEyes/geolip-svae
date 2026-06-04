@@ -353,9 +353,247 @@ def train_aleph(decode_mode: str = "tied", *, dataset: str = "byte_trigram",
     return model, history
 
 
+# ============================================================================
+#  AlephTransformer training — a macro shell over a FROZEN aleph battery.
+#  The aleph is frozen + detached at the stem; only the shell (spectral
+#  transformer + decoder) trains, on the EXTERNAL recon of the same data format
+#  the aleph was trained on. D_lens is the multiscale knob — sweep it for a
+#  series of multiscale processing capacities over one frozen address.
+# ============================================================================
+
+
+@torch.no_grad()
+def evaluate_transformer(model, loader, device, max_batches: int = 20):
+    """External-recon eval for AlephTransformer: MSE, cosine, omega-CV (column-norm
+    spread of the lensed rows), mean spectral alpha (how engaged the transformer is),
+    and the READ-ONLY aleph address margin of the stem against the frozen codebook."""
+    model.eval()
+    tot_mse = tot_cos = tot_cv = tot_amg = tot_alpha = 0.0
+    n = 0
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        images = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
+        out = model(images)
+        tot_mse += F.mse_loss(out["external_recon"], images).item()
+        tot_cos += F.cosine_similarity(out["external_recon"].flatten(1),
+                                       images.flatten(1), dim=1).mean().item()
+        tot_cv += _col_norm_cv(out["M_lens"])
+        tot_alpha += float(out.get("mean_alpha", 0.0))
+        if "aleph" in out:
+            tot_amg += float(out["aleph"]["margin"].max(dim=-1).values.mean().item())
+        n += 1
+    model.train()
+    n = max(n, 1)
+    return (tot_mse / n, tot_cos / n, tot_cv / n, tot_amg / n, tot_alpha / n)
+
+
+def train_aleph_transformer(
+    aleph_hf_version: str, *,
+    D_lens: int = 256, dataset: str = "byte_trigram",
+    stem: str = "m_hat", lens_sign: str = "signed",
+    n_heads: int = 8, n_layers: int = 6, shell_hidden: int = 512,
+    loss_mode: str | None = None, quick: bool = False, device: str = "cuda",
+    cfg_overrides: dict | None = None, transformer_cfg: dict | None = None,
+    aleph_repo: str = "AbstractPhil/geolip-aleph-void",
+    hf_version: str | None = None, hf_repo: str = "AbstractPhil/geolip-aleph-void",
+    upload: bool = True, save_dir: str | None = None, tb_dir: str | None = None,
+    hf_token: str | None = None, report_every: int = 100):
+    """Train one AlephTransformer macro shell over a FROZEN aleph battery.
+
+    The aleph (aleph_hf_version, loaded from aleph_repo via load_model) is frozen
+    and detached at the stem boundary; only the shell (spectral transformer +
+    decoder) trains, on the EXTERNAL recon of the same dataset the aleph was
+    trained on (default byte_trigram, the matched format). D_lens is the multiscale
+    knob — sweep it for the series. stem='m_hat' lenses the addressed direction
+    (strengthen the address); stem='m' lenses the raw rows (control).
+
+    Saves a shell checkpoint to {hf_version}/checkpoints/best.pt under hf_repo
+    (shell weights only; the frozen aleph is referenced by aleph_hf_version).
+    Returns (model, history); rows
+    (step, train_loss, ext_mse, ext_cos, omega_cv, address_margin, mean_alpha)."""
+    from geolip_svae.dataset_presets import get_dataset_bundle
+    from geolip_svae.aleph_model import AlephTransformer, AlephTransformerConfig
+    from geolip_svae.inference.loading import load_model
+
+    cfg = dict(PRESETS[dataset])
+    if loss_mode is None:
+        loss_mode = "cosine" if dataset == "tiny_imagenet" else "mse"
+    if quick:
+        cfg.update(epochs=3)
+        if dataset == "byte_trigram":
+            cfg.update(ds_size=50_000, val_size=2_000)
+        upload = False
+    if cfg_overrides:
+        cfg.update(cfg_overrides)
+
+    # ── frozen aleph battery ──
+    if hf_token and not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = hf_token
+    aleph, _ = load_model(hf_version=aleph_hf_version, repo_id=aleph_repo, device=device)
+    for p in aleph.parameters():
+        p.requires_grad_(False)
+    # the dataset must lay bytes out with the SAME patch size the aleph was trained on,
+    # else the frozen encoder sees a scrambled byte grid.
+    cfg["patch_size"] = aleph.patch_size
+    cfg["channels"] = aleph.channels
+    print(f"frozen aleph: {aleph_repo}/{aleph_hf_version}  "
+          f"(V={aleph.matrix_v} D={aleph.D} ps={aleph.patch_size} addr={aleph.address})")
+
+    # ── shell ──
+    tcfg = dict(D_lens=D_lens, stem=stem, lens_sign=lens_sign,
+                n_heads=n_heads, n_layers=n_layers, shell_hidden=shell_hidden)
+    if transformer_cfg:
+        tcfg.update(transformer_cfg)
+    model = AlephTransformer(aleph, AlephTransformerConfig(**tcfg), device=device)
+    print(f"AlephTransformer D_lens={D_lens} stem={stem} lens_sign={lens_sign} "
+          f"n_heads={n_heads}x{n_layers} | shell_params={model.num_params()}")
+
+    bundle = get_dataset_bundle(cfg, channels=cfg["channels"])
+    train_loader, test_loader = bundle.train_loader, bundle.test_loader
+
+    opt = torch.optim.Adam(model.shell_parameters(), lr=cfg["lr"])   # shell only; Adam (house rule)
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:
+        steps_per_epoch = max(1, cfg.get("ds_size", 50_000) // cfg["batch_size"])
+    total_steps = steps_per_epoch * cfg["epochs"]
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
+
+    # ── output paths / run identity ──
+    if hf_version is None:
+        hf_version = f"aleph_transformer_{dataset}_d{D_lens}_{lens_sign}_{stem}"
+    save_dir = save_dir or "/content/aleph_transformer_checkpoints"
+    tb_dir = tb_dir or "/content/aleph_transformer_runs"
+    os.makedirs(save_dir, exist_ok=True)
+    run_name = f"{hf_version}_h{n_heads}x{n_layers}_lr{cfg['lr']}"
+    best_ckpt_path = os.path.join(save_dir, "best.pt")
+
+    # ── TensorBoard ──
+    writer = None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_path = os.path.join(tb_dir, run_name)
+        writer = SummaryWriter(tb_path)
+        print(f"  TensorBoard: {tb_path}")
+    except Exception as e:
+        tb_path = None
+        print(f"  TensorBoard: disabled ({type(e).__name__}: {e})")
+
+    # ── HuggingFace ──
+    hf_enabled, api = False, None
+    hf_prefix = f"{hf_version}/checkpoints"
+    if upload:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(); api.whoami()
+            hf_enabled = True
+            print(f"  HuggingFace: {hf_repo}/{hf_prefix}")
+        except Exception as e:
+            print(f"  HuggingFace: disabled ({e})")
+
+    def upload_to_hf(local_path, remote_name, prefix=None):
+        if not hf_enabled:
+            return
+        prefix = prefix if prefix is not None else hf_prefix
+        try:
+            api.upload_file(path_or_fileobj=local_path,
+                            path_in_repo=f"{prefix}/{remote_name}",
+                            repo_id=hf_repo, repo_type="model")
+            _tqdm.write(f"  ☁️  Uploaded: {hf_repo}/{prefix}/{remote_name}")
+        except Exception as e:
+            _tqdm.write(f"  ⚠️  HF upload: {e}")
+
+    def save_shell(epoch, ext_mse, ext_cos):
+        # shell weights only (lens buffer + transformer + decoder + assessor buffer);
+        # the frozen aleph is referenced by aleph_hf_version and reloaded on load.
+        shell_state = {k: v for k, v in model.state_dict().items()
+                       if not k.startswith("aleph.")}
+        torch.save({
+            "model_type": "aleph_transformer",
+            "config": model.get_config(),
+            "aleph_hf_version": aleph_hf_version, "aleph_repo": aleph_repo,
+            "shell_state_dict": shell_state,
+            "epoch": epoch, "ext_mse": ext_mse, "ext_cos": ext_cos,
+        }, best_ckpt_path)
+
+    history, step = [], 0
+    best_cos, best_mse = -1.0, float("inf")
+    pbar = _tqdm(total=total_steps, desc=f"aleph-T d{D_lens}/{stem}", dynamic_ncols=True)
+    for epoch in range(1, cfg["epochs"] + 1):
+        for batch in train_loader:
+            images = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
+            out = model(images)
+            loss = _recon_loss(out["external_recon"], images, loss_mode)
+            opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+            step += 1
+            pbar.update(1)
+            pbar.set_postfix(ep=epoch, loss=f"{loss.item():.2e}", refresh=False)
+
+            if step % report_every == 0:
+                emse, ecos, ecv, eamg, ealpha = evaluate_transformer(model, test_loader, device)
+                history.append((step, loss.item(), emse, ecos, ecv, eamg, ealpha))
+                _tqdm.write(f"  ep{epoch} step{step:6d} train_loss={loss.item():.3e} "
+                            f"ext_mse={emse:.3e} ext_cos={ecos:.4f} omega_cv={ecv:.3f} "
+                            f"amargin={eamg:.3f} alpha={ealpha:.3f} lr={sched.get_last_lr()[0]:.2e}")
+                pbar.set_postfix(ep=epoch, loss=f"{loss.item():.2e}",
+                                 cos=f"{ecos:.4f}", a=f"{ealpha:.2f}", refresh=True)
+                if writer is not None:
+                    writer.add_scalar("train/loss", loss.item(), step)
+                    writer.add_scalar("ext/mse", emse, step)
+                    writer.add_scalar("ext/cos", ecos, step)
+                    writer.add_scalar("ext/omega_cv", ecv, step)
+                    writer.add_scalar("shell/mean_alpha", ealpha, step)
+                    writer.add_scalar("shell/address_margin", eamg, step)
+                    writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
+                improved = (ecos > best_cos) if loss_mode != "mse" else (emse < best_mse)
+                best_cos, best_mse = max(best_cos, ecos), min(best_mse, emse)
+                if improved:
+                    save_shell(epoch, emse, ecos)
+        if os.path.exists(best_ckpt_path):
+            upload_to_hf(best_ckpt_path, "best.pt")
+    pbar.close()
+    print(f"AlephTransformer d{D_lens}/{stem}: best ext_cos={best_cos:.4f} "
+          f"best ext_mse={best_mse:.3e}")
+
+    final_report = {
+        "run_name": run_name, "config": model.get_config(),
+        "n_params": model.num_params(), "dataset": dataset, "loss_mode": loss_mode,
+        "aleph_hf_version": aleph_hf_version,
+        "best_ext_mse": best_mse, "best_ext_cos": best_cos, "history": history,
+        "history_columns": ["step", "train_loss", "ext_mse", "ext_cos",
+                            "omega_cv", "address_margin", "mean_alpha"],
+    }
+    report_path = os.path.join(save_dir, "final_report.json")
+    try:
+        with open(report_path, "w") as f:
+            json.dump(final_report, f, indent=2)
+        upload_to_hf(report_path, "final_report.json", prefix=hf_version)
+    except Exception as e:
+        print(f"  ⚠️  final_report: {type(e).__name__}: {e}")
+    if writer is not None:
+        writer.close()
+    return model, history
+
+
+def train_aleph_transformer_series(aleph_hf_version: str,
+                                   D_lens_series=(64, 128, 256, 512), **kw):
+    """Finetune the multiscale SERIES: one AlephTransformer shell per D_lens over
+    the SAME frozen aleph + same data format — a series of multiscale processing
+    capacities. n_heads (default 8) must divide every D_lens in the series.
+    Returns {D_lens: (model, history)}."""
+    results = {}
+    for d in D_lens_series:
+        print("\n" + "=" * 70 + f"\n  ALEPH-TRANSFORMER  D_lens={d}\n" + "=" * 70)
+        results[d] = train_aleph_transformer(aleph_hf_version, D_lens=d, **kw)
+    return results
+
+
 # back-compat alias: earlier session calls used train_geosphere
 train_geosphere = train_aleph
 
 
 __all__ = ["train_aleph", "train_geosphere", "evaluate", "BASE_CFG",
-           "TINY_IMAGENET_CFG", "PRESETS", "BASELINE_MSE"]
+           "TINY_IMAGENET_CFG", "PRESETS", "BASELINE_MSE",
+           "train_aleph_transformer", "train_aleph_transformer_series",
+           "evaluate_transformer"]
