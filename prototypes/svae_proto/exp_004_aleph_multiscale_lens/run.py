@@ -276,8 +276,14 @@ def sweep(cfg: SweepConfig, upload_only: bool = False) -> Dict:
         # upload THIS rung's checkpoint immediately (crash-resilient, correct layout)
         if cfg.upload:
             try:
-                _upload_rung_ckpt(_hf_api(cfg.hf_token), out_dir,
-                                  f"d{d_lens}_ckpt", cfg.aleph_repo, EXP_NAME)
+                api = _hf_api(cfg.hf_token)
+                _upload_rung_ckpt(api, out_dir, f"d{d_lens}_ckpt",
+                                  cfg.aleph_repo, EXP_NAME)
+                tb = out_dir / "tb"
+                if cfg.include_tb and tb.is_dir():   # per-rung TB → survives a mid-sweep crash
+                    api.upload_folder(folder_path=str(tb), repo_id=cfg.aleph_repo,
+                                      repo_type="model",
+                                      path_in_repo=f"experiments/{EXP_NAME}/tb")
             except Exception as e:
                 print(f"  ⚠️  rung upload ({d_lens}): {type(e).__name__}: {e}")
 
