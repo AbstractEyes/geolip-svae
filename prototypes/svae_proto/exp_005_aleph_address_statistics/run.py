@@ -60,9 +60,9 @@ class SweepConfig:
     epochs: int = 4
     ds_size: int = 200_000
     val_size: int = 4_000
-    batch_size: int = 256
+    batch_size: int = 2048
     text: str = DEFAULT_TEXT
-    out_dir: str = "./exp_005_results"
+    out_dir: str = "./experiments/exp_005_results"
     upload: bool = False
     seed: int = 0
     device: Optional[str] = None

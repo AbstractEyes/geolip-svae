@@ -53,11 +53,11 @@ class SweepConfig:
     epochs: int = 4
     ds_size: int = 200_000
     val_size: int = 4_000
-    batch_size: int = 256
+    batch_size: int = 2048
     topo_batches: int = 4              # batches of M_lens aggregated per rung
     ripser_thresh_deg: float = 20.0
     collapse_threshold: float = -0.9
-    out_dir: str = "./exp_006_results"
+    out_dir: str = "./experiments/exp_006_results"
     upload: bool = False
     seed: int = 0
     device: Optional[str] = None

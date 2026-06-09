@@ -65,12 +65,12 @@ class SweepConfig:
     epochs: int = 4
     ds_size: int = 200_000
     val_size: int = 4_000
-    batch_size: int = 256
+    batch_size: int = 2048
     # eval set used for the internal-recon floor (shared across rungs)
     eval_batches: int = 10
     # io
-    out_dir: str = "./exp_004_results"
-    upload: bool = False
+    out_dir: str = "./experiments/exp_004_results"
+    upload: bool = True
     seed: int = 0
     device: Optional[str] = None
 
