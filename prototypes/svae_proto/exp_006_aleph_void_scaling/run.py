@@ -39,6 +39,9 @@ import torch
 DEFAULT_LADDER: List[int] = [16, 64, 256]
 DEFAULT_ALEPH_VERSION = "aleph_byte_trigram_tied_hard_K64"
 
+# HF target: experiments/<EXP_NAME>/{checkpoints,tb} in aleph_repo (NOT repo root).
+EXP_NAME = "exp_006_aleph_void_scaling"
+
 
 @dataclass
 class SweepConfig:
@@ -59,6 +62,8 @@ class SweepConfig:
     collapse_threshold: float = -0.9
     out_dir: str = "./experiments/exp_006_results"
     upload: bool = False
+    hf_token: Optional[str] = None
+    include_tb: bool = True
     seed: int = 0
     device: Optional[str] = None
 
@@ -159,16 +164,77 @@ def _topology_of_axes(cb: torch.Tensor, cfg: SweepConfig) -> Dict:
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  HuggingFace upload — to experiments/<EXP_NAME>/{checkpoints,tb}
+# ════════════════════════════════════════════════════════════════════════
+
+def _hf_api(token: Optional[str] = None):
+    from huggingface_hub import HfApi
+    import os
+    return HfApi(token=token or os.environ.get("HF_TOKEN"))
+
+
+def _upload_rung_ckpt(api, out_dir: Path, rung_dirname: str, repo: str,
+                      exp_name: str = EXP_NAME) -> None:
+    src = Path(out_dir) / rung_dirname
+    if not src.is_dir():
+        return
+    rung = rung_dirname[:-5] if rung_dirname.endswith("_ckpt") else rung_dirname
+    dst = f"experiments/{exp_name}/checkpoints/{rung}"
+    api.upload_folder(folder_path=str(src), repo_id=repo, repo_type="model",
+                      path_in_repo=dst)
+    print(f"  ☁️  {repo}/{dst}")
+
+
+def upload_results(out_dir, repo: str = "AbstractPhil/geolip-aleph-void",
+                   exp_name: str = EXP_NAME, token: Optional[str] = None,
+                   include_tb: bool = True) -> Dict:
+    """Push an EXISTING local results tree to experiments/<exp_name>/ in `repo`:
+        checkpoints/<rung>/best.pt + final_report.json   (one per *_ckpt dir)
+        tb/<run>/...                                      (if include_tb)
+        <sweep_report>.json
+    """
+    out = Path(out_dir)
+    api = _hf_api(token)
+    base = f"experiments/{exp_name}"
+    pushed = {"checkpoints": [], "tb": False, "reports": []}
+    for ck in sorted(out.glob("*_ckpt")):
+        _upload_rung_ckpt(api, out, ck.name, repo, exp_name)
+        pushed["checkpoints"].append(ck.name)
+    tb = out / "tb"
+    if include_tb and tb.is_dir():
+        api.upload_folder(folder_path=str(tb), repo_id=repo, repo_type="model",
+                          path_in_repo=f"{base}/tb")
+        print(f"  ☁️  {repo}/{base}/tb")
+        pushed["tb"] = True
+    for j in sorted(out.glob("*.json")):
+        api.upload_file(path_or_fileobj=str(j), repo_id=repo, repo_type="model",
+                        path_in_repo=f"{base}/{j.name}")
+        print(f"  ☁️  {repo}/{base}/{j.name}")
+        pushed["reports"].append(j.name)
+    print(f"  ✓ uploaded {len(pushed['checkpoints'])} rung(s), "
+          f"tb={pushed['tb']}, {len(pushed['reports'])} report(s) → {repo}/{base}")
+    return pushed
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Sweep
 # ════════════════════════════════════════════════════════════════════════
 
-def sweep(cfg: SweepConfig) -> Dict:
+def sweep(cfg: SweepConfig, upload_only: bool = False) -> Dict:
     from geolip_svae.inference.loading import load_model
     from geolip_svae.train_aleph import train_aleph_transformer
 
     device = _resolve_device(cfg.device)
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if upload_only:
+        print(f"[upload-only] pushing {out_dir} → "
+              f"{cfg.aleph_repo}/experiments/{EXP_NAME}")
+        return {"upload_only": True,
+                "pushed": upload_results(out_dir, repo=cfg.aleph_repo,
+                                         exp_name=EXP_NAME, token=cfg.hf_token,
+                                         include_tb=cfg.include_tb)}
 
     print("=" * 72)
     print(f"exp_006 void scaling — {cfg.aleph_repo}/{cfg.aleph_hf_version}")
@@ -195,7 +261,7 @@ def sweep(cfg: SweepConfig) -> Dict:
             cfg.aleph_hf_version,
             D_lens=d_lens, dataset=cfg.dataset, stem=cfg.stem, lens_sign=cfg.lens_sign,
             n_heads=n_heads, n_layers=cfg.n_layers, shell_hidden=cfg.shell_hidden,
-            device=device, upload=cfg.upload, aleph_repo=cfg.aleph_repo,
+            device=device, upload=False, aleph_repo=cfg.aleph_repo,
             hf_version=f"exp_006_d{d_lens}_{cfg.stem}_{cfg.lens_sign}",
             save_dir=str(out_dir / f"d{d_lens}_ckpt"), tb_dir=str(out_dir / "tb"),
             cfg_overrides=dict(epochs=cfg.epochs, ds_size=cfg.ds_size,
@@ -210,6 +276,12 @@ def sweep(cfg: SweepConfig) -> Dict:
         del model, cb
         if device == "cuda":
             torch.cuda.empty_cache()
+        if cfg.upload:
+            try:
+                _upload_rung_ckpt(_hf_api(cfg.hf_token), out_dir,
+                                  f"d{d_lens}_ckpt", cfg.aleph_repo, EXP_NAME)
+            except Exception as e:
+                print(f"  ⚠️  rung upload ({d_lens}): {type(e).__name__}: {e}")
 
     dt = time.time() - t0
     b2 = [(r["D_lens"], r["beta2_per_axis"]) for r in rungs
@@ -226,6 +298,21 @@ def sweep(cfg: SweepConfig) -> Dict:
     fname = out_dir / f"void_scaling_{cfg.aleph_hf_version}_{cfg.stem}_{cfg.lens_sign}.json"
     with open(fname, "w") as f:
         json.dump(report, f, indent=2)
+
+    if cfg.upload:
+        try:
+            api = _hf_api(cfg.hf_token)
+            base = f"experiments/{EXP_NAME}"
+            tb = out_dir / "tb"
+            if cfg.include_tb and tb.is_dir():
+                api.upload_folder(folder_path=str(tb), repo_id=cfg.aleph_repo,
+                                  repo_type="model", path_in_repo=f"{base}/tb")
+                print(f"  ☁️  {cfg.aleph_repo}/{base}/tb")
+            api.upload_file(path_or_fileobj=str(fname), repo_id=cfg.aleph_repo,
+                            repo_type="model", path_in_repo=f"{base}/{fname.name}")
+            print(f"  ☁️  {cfg.aleph_repo}/{base}/{fname.name}")
+        except Exception as e:
+            print(f"  ⚠️  final upload: {type(e).__name__}: {e}")
 
     print("\n" + "=" * 72)
     print("VOID-SCALING VERDICT")
@@ -278,13 +365,17 @@ def _filter_jupyter_args(argv):
 
 
 def run(**kwargs):
-    """Notebook entry — no CLI parsing."""
+    """Notebook entry — no CLI parsing.
+        run(ladder=[16, 64, 256], epochs=4)
+        run(out_dir="./experiments/exp_006_results", upload_only=True, hf_token="hf_...")
+    """
     ladder = kwargs.pop("ladder", None)
+    upload_only = kwargs.pop("upload_only", False)
     cfg = SweepConfig(**{k: v for k, v in kwargs.items()
                          if k in SweepConfig.__dataclass_fields__})
     if ladder is not None:
         cfg.ladder = list(ladder)
-    return sweep(cfg)
+    return sweep(cfg, upload_only=upload_only)
 
 
 def main(argv=None):
@@ -307,8 +398,14 @@ def main(argv=None):
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--topo-batches", type=int, default=4)
     p.add_argument("--ripser-thresh-deg", type=float, default=20.0)
-    p.add_argument("--out-dir", default="./exp_006_results")
+    p.add_argument("--out-dir", default="./experiments/exp_006_results")
     p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--no-tb", action="store_true",
+                   help="skip uploading the (large) tensorboard tree")
+    p.add_argument("--hf-token", default=None)
+    p.add_argument("--upload-only", action="store_true",
+                   help="skip training; push an existing --out-dir tree to "
+                        "experiments/<exp>/ in --aleph-repo")
     p.add_argument("--device", default=None)
     args, _unknown = p.parse_known_args(argv)
 
@@ -318,11 +415,12 @@ def main(argv=None):
         epochs=args.epochs, ds_size=args.ds_size, val_size=args.val_size,
         batch_size=args.batch_size, topo_batches=args.topo_batches,
         ripser_thresh_deg=args.ripser_thresh_deg, out_dir=args.out_dir,
-        upload=not args.no_upload, device=args.device,
+        upload=not args.no_upload, hf_token=args.hf_token,
+        include_tb=not args.no_tb, device=args.device,
     )
     if args.ladder is not None:
         cfg.ladder = args.ladder
-    return sweep(cfg)
+    return sweep(cfg, upload_only=args.upload_only)
 
 
 if __name__ == "__main__":
