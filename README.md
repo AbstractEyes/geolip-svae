@@ -763,11 +763,20 @@ Current experiments:
 | ID  | Slug                       | What it tests | Extras key | Status |
 |-----|----------------------------|----------------|------------|--------|
 | 001 | `vocab_trigram_recall`     | multi-byte token recall (sentencepiece-aware) | `exp_001` | scaffolded |
+| 002 | `rigid_codebook_implementation` | RigidPatchSVAE convergence + rigidity-formula adherence | `exp_002` | scaffolded |
+| 003 | `occupancy_scaling`        | does formula-adherence survive (D,V) enlargement | `exp_003` | scaffolded |
+| 004 | `aleph_multiscale_lens`    | reconstruction fidelity of the AlephTransformer lift vs `D_lens` | `exp_004` | scaffolded |
+| 005 | `aleph_address_statistics` | shell-aware byte-recovery + perplexity vs `D_lens` (ablations) | `exp_005` | scaffolded |
+| 006 | `aleph_void_scaling`       | β₂/axis topology of the lifted `M_lens` cloud vs `D_lens` | `exp_006` | scaffolded |
 
 ```bash
 python -m svae_proto.exp_001_vocab_trigram_recall.run --variant proto_64
-python -m svae_proto.exp_001_vocab_trigram_recall.run --variant freckles_64
-python -m svae_proto.exp_001_vocab_trigram_recall.run --variant fresnel_128
+
+# Multiscale aleph-void series — sweep a FROZEN hosted aleph battery:
+python -m svae_proto.exp_004_aleph_multiscale_lens.run --list-versions
+python -m svae_proto.exp_004_aleph_multiscale_lens.run --ladder 4 16 64 256 --epochs 4
+python -m svae_proto.exp_005_aleph_address_statistics.run --ladder 16 64 256
+python -m svae_proto.exp_006_aleph_void_scaling.run --ladder 16 64 256
 ```
 
 See `svae_proto/README.md` for the full contract, the directory naming

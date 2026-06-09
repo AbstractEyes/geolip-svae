@@ -85,12 +85,41 @@ exp_003 = [
     "sentencepiece>=0.2.0",
 ]
 
+# ── Multiscale aleph-void series (exp_004/005/006) ─────────────────────────
+# All three sweep a FROZEN hosted aleph battery on the byte_trigram substrate
+# (datasets pulls WikiText-103), so they share the same dataset/HF dep set.
+# exp_004 — aleph_multiscale_lens (reconstruction fidelity vs D_lens)
+exp_004 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+]
+# exp_005 — aleph_address_statistics (shell-aware byte-recovery + ablations)
+exp_005 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+]
+# exp_006 — aleph_void_scaling (lifted-cloud topology). scipy is REQUIRED by the
+# core kNN-connectivity probe (run_topology_analysis); ripser is OPTIONAL and
+# only adds the H2/beta2 void metric (kNN/PCA still run without it).
+exp_006 = [
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "sentencepiece>=0.2.0",
+    "scipy>=1.10.0",
+    "ripser>=0.6.0",
+]
+
 # Aggregate — everything across all experiments. Useful when iterating
 # across multiple in one workspace.
 all = [
     "svae-proto[exp_001]",
     "svae-proto[exp_002]",
     "svae-proto[exp_003]",
+    "svae-proto[exp_004]",
+    "svae-proto[exp_005]",
+    "svae-proto[exp_006]",
 ]
 
 [project.urls]

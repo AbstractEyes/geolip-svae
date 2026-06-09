@@ -133,15 +133,35 @@ they need.
 
 ## Current experiments
 
-| ID  | Slug                       | Status     | Extras key |
-|-----|----------------------------|------------|------------|
-| 001 | `vocab_trigram_recall`     | scaffolded | `exp_001` |
+| ID  | Slug                          | What it tests                                         | Status     | Extras key |
+|-----|-------------------------------|-------------------------------------------------------|------------|------------|
+| 001 | `vocab_trigram_recall`        | multi-byte token recall (sentencepiece-aware)         | scaffolded | `exp_001` |
+| 002 | `rigid_codebook_implementation` | RigidPatchSVAE convergence + rigidity-formula adherence | scaffolded | `exp_002` |
+| 003 | `occupancy_scaling`           | does formula-adherence survive (D,V) enlargement      | scaffolded | `exp_003` |
+| 004 | `aleph_multiscale_lens`       | reconstruction fidelity of the AlephTransformer lift vs `D_lens` | scaffolded | `exp_004` |
+| 005 | `aleph_address_statistics`    | shell-aware byte-recovery + perplexity vs `D_lens` (stem/lens_sign ablations) | scaffolded | `exp_005` |
+| 006 | `aleph_void_scaling`          | β₂/axis topology of the lifted `M_lens` cloud vs `D_lens` | scaffolded | `exp_006` |
 
 ```bash
+# exp_001 — dataset-factory shape (train + token-recall eval)
 python -m svae_proto.exp_001_vocab_trigram_recall.run --variant proto_64
-python -m svae_proto.exp_001_vocab_trigram_recall.run --variant freckles_64
-python -m svae_proto.exp_001_vocab_trigram_recall.run --variant fresnel_128
+
+# exp_002/003 — standalone rigidity-line sweeps
+python -m svae_proto.exp_003_occupancy_scaling.run --dataset omega_noise --epochs 8
+
+# exp_004/005/006 — multiscale aleph-void series (sweep a FROZEN hosted aleph).
+# Discover available aleph versions first:
+python -m svae_proto.exp_004_aleph_multiscale_lens.run --list-versions
+python -m svae_proto.exp_004_aleph_multiscale_lens.run --ladder 4 16 64 256 --epochs 4
+python -m svae_proto.exp_005_aleph_address_statistics.run --ladder 16 64 256 --ablate-d-lens 64
+python -m svae_proto.exp_006_aleph_void_scaling.run --ladder 16 64 256
 ```
+
+The exp_004/005/006 series follows the **standalone `run.py`** shape (a
+`run(**kwargs)` notebook entry + `main()` CLI, like exp_002/003) rather than the
+dataset-factory shape of exp_001 — they add no dataset, they sweep a frozen
+battery. All three reuse `geolip_svae.train_aleph.train_aleph_transformer`; none
+edit core.
 
 ## Importing across experiments
 
