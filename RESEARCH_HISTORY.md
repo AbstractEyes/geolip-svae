@@ -2,6 +2,8 @@
 
 *A spherical autoencoder whose latent bottleneck **is** a learned projective address. Every formula in this article was read directly from the shipping code in [`geolip-svae`](https://github.com/AbstractEyes/geolip-svae); every number was read from a `final_report.json`, a model card, or a logged experiment.*
 
+*Revision 2026-06-09 22:30 UTC: §3.13 added (aleph-routed attention — the address as a feature map); discovery catalog extended #25–#31; dated updates in §2, §8, §10, §12 and catalog rows #15/#20. All new numbers are from logged 2026-06-09 session runs (RTX PRO 6000 Blackwell / A100-80GB); session artifacts: `aleph_routed_attention.py`, `aleph_trigram_lm.py`, `aleph_probe_battery.py`.*
+
 **Model:** [AbstractPhil/geolip-aleph-void](https://huggingface.co/AbstractPhil/geolip-aleph-void) · **Code:** [AbstractEyes/geolip-svae](https://github.com/AbstractEyes/geolip-svae) · **Battery lineage:** [AbstractPhil/geolip-SVAE](https://huggingface.co/AbstractPhil/geolip-SVAE)
 
 ---
@@ -80,6 +82,23 @@ The model was not designed; it was cornered. Twenty research articles, ~191 mode
 
 - The SVAE's reconstruction lives in a deep residual decoder; its spherical latent is therefore a "faux embedding" — the codebooks extracted from it are real, but the geometry was never *proven* to carry reconstruction. The gate experiment removed the accumulator: tied single-linear decode straight off `M`. Result: **cosine ≈ 0.9997** on byte-trigram. `M` is recon-real.
 - With the gate passed, the address was made load-bearing: `AlephModel`, first committed May 31, 2026 (`added aleph model`, hours after the voids article) and iterated daily through June 4 (`added aleph transformer mirroring the tested svae transformer structure`), hosted at `AbstractPhil/geolip-aleph-void` (created June 1, updated June 4). The active experiment — whether reconstruction survives the *soft* address bottleneck versus the `none` gate — is exactly what the hosted `final_report.json` files track, and the published checkpoints already answer the harder discrete question: with `address='hard'` (straight-through, fully discrete codes), byte-trigram reconstruction holds at cosine 0.9967 (MLP decode, 4.32M params) and 0.9920 (tied decode, 26,795 params), with 125–126 of 128 oriented axes in active use and zero collapse.
+
+### Phase 5 — The address leaves the autoencoder (2026-06-09)
+
+- **[2026-06-09 update]** The aleph signed-projective address was lifted out of the
+  reconstruction bottleneck and installed as the routing medium of an attention
+  mechanism (`AlephRoutedAttention`, session artifact). The address distribution over
+  the `2K` oriented axes IS the feature map of a linear attention: tokens communicate
+  *through* the codebook rather than reconstructing from it. Same closed form, same
+  `max|u|` stabilization, same K-wide intermediates — a new jar for the same lightning.
+- Lineage closure: the Cantor fractal router (O(n) by position-geometry, killed by
+  gather-bound hardware hostility) is formally authenticated as a breadcrumb — the
+  aleph router keeps its premise (geometric routing replaces the O(n²) score matrix)
+  and pays in pure GEMM. Measured on the trigram substrate: softmax-parity quality,
+  linear wall-clock to 65,536 tokens where softmax attention OOMs at 16,384.
+- The probe battery (statutes, projective margins, Procrustes, CM band, persistence,
+  state erank) was pointed at the new system; the verdict is the **two-hemisphere
+  law** (#27) and the **codebook-as-medium** synthesis of §3.13.
 
 ---
 
@@ -317,6 +336,161 @@ frozen aleph → stem rows (M̂ direction by default, or raw M as control)
 - `stem='m_hat'` feeds the *addressed* direction, so the macro shell **strengthens the aleph address** natively at D_lens — no learned up-projection. `stem='m'` is the SVAE-equivalent control that ignores the codebook.
 - The aleph is frozen and read under `no_grad` at a detached boundary; only the transformer + decoder train (`shell_parameters()`), with plain MSE on the external recon and the same Adam house rule. The assessor rides along read-only, scored against the aleph's *own* learned codebook.
 
+### 3.13 Aleph-routed attention (added 2026-06-09): the address as a feature map
+
+Session artifacts `aleph_routed_attention.py` (hub + bucket variants, streaming),
+`aleph_trigram_lm.py` (causal trigram LM + statute trajectory), `aleph_probe_battery.py`
+(the eight-probe battery). Every formula below shipped and every number was logged on
+2026-06-09. Structure first, purpose second, and — because this system is structurally
+different from the autoencoder — each entry states its **differentiation**: the role the
+same machinery plays in routing versus reconstruction.
+
+**The routing identity (hub mode).** Per head, queries and keys are projected to
+`D_addr` and sphere-normalized (`q̂, k̂ ∈ S^(D_addr−1)`, orthogonal-init projections —
+the encoder invariants apply unchanged). The aleph address `p(x) = softmax([u; −u])`,
+`u = (x̂Aᵀ)/τ`, is computed in the antipodal-factored form:
+
+```
+m  = max|u|;  ep = e^(u−m);  en = e^(−u−m);  Z = Σ(ep+en)        # Z ≥ 1
+p₊ = ep/Z;    p₋ = en/Z                                            # (·, K) each
+```
+
+and the attention is the kernel attention whose feature map IS the address:
+
+```
+score(i,j) = ⟨p(q̂ᵢ), p(k̂ⱼ)⟩ = p₊(q̂ᵢ)·p₊(k̂ⱼ) + p₋(q̂ᵢ)·p₋(k̂ⱼ)
+M± = Σⱼ p±(k̂ⱼ) vⱼᵀ          (K, d_head)        z± = Σⱼ p±(k̂ⱼ)    (K,)
+outᵢ = (p₊(q̂ᵢ)M₊ + p₋(q̂ᵢ)M₋) / (p₊(q̂ᵢ)z₊ + p₋(q̂ᵢ)z₋)
+```
+
+**Purpose of each piece:**
+
+- *K-wide factorization* — the same antipodal closed-form trick as §3.4: the `2K`
+  tensor is never materialized; only `(·, K)` intermediates exist.
+- *Strictly positive denominator* — the address distributions are positive, so the
+  normalizer can neither vanish nor flip sign: the instability of elu+1-style linear
+  attention is structurally absent.
+- *O(n·K·d), pure GEMM* — no gathers, no S×S matrix, no route tables. This is the
+  hardware-sympathy answer to the Cantor router: the geometry and the silicon vote
+  the same way. Measured: 1.4× vs softmax at S=1024, 4.1× at 4096, softmax OOMs at
+  16,384, hub runs 65,536 tokens in 67 ms (A100-80GB, dim 512).
+- *Rank bound 2K* — the attention matrix factors through the address, so its rank
+  is at most `2K`: **K is the bandwidth knob, τ is the hardness knob** (τ→0 recovers
+  discrete bucket routing; τ→∞ collapses to mean-pooling).
+- *Quality* — softmax parity on associative recall and on the byte-trigram causal LM
+  (bpb 2.835 vs 2.836 at 10k steps, 6.7M params, the only-delta control of #26).
+
+**Differentiation:** in the autoencoder the address produces `M̂`, the decode source
+(gradient: recon → M̂ → codebook). In routing the address produces a *communication
+kernel* (gradient: task loss → score → codebook). Same formula, opposite residence
+for the content — see the two-hemisphere law below.
+
+**Bucket mode (the discrete sibling).** `bucket = argmax_k |u_k|` with sign — each
+token's winner oriented half-axis is its clique; exact softmax attention inside
+sorted equal-width windows, masked to same-bucket pairs; the codebook's gradient path
+is a differentiable address-agreement bias added to the scores. Status: trains but is
+gradient-starved relative to hub (hard assignment gives the address projections almost
+no alignment signal from cold start); the principled rescue is a hub→bucket curriculum
+with transplanted codebook + projections. Open (§12).
+
+**The streaming recurrence (the codebook as memory).** The hub's causal form is a
+recurrence with constant-size state:
+
+```
+state = (M₊, M₋, z₊, z₋)        # (B,H,K,d_head)×2 + (B,H,K)×2 — size independent of past
+out_seg, state′ = recurrence(segment, state)
+```
+
+Verified **bit-exact** against the full causal pass (same chunk boundaries ⇒ identical
+op order; max error 0.0e0). `M±` is literally *what has been written to each oriented
+axis so far* — the document accumulates into the vocabulary. TBPTT-1 discipline:
+gradients flow within a segment; values flow forever. Context is unbounded at constant
+attention memory. **Differentiation:** the autoencoder has no temporal state; this
+statistic class is routing-only.
+
+**The occupancy statistic (the compressibility meter).**
+
+```
+occupancy = (erank(M₊) + erank(M₋)) / (2·min(K, d_head)),   erank = exp(H(σ/Σσ))
+```
+
+(fp64 singular values, per the house SVD invariant). Measured at 6,144 bytes of
+streamed context: **text 16% (≈10/64 effective dimensions) vs noise 45% (≈29/64)** —
+language concentrates into a handful of axis-directions; incompressible noise sprawls.
+The streaming state is an entropy-rate proxy delivered by the architecture for free,
+and it implies large context headroom for language at K=64. **Differentiation:** the
+memory-side twin of the depth-funnel result (#31): the trained system *organizes* text
+and *releases* noise, in both space (layers) and time (state).
+
+**Confidence is a kernel invariant (the 0.857 monitor, closed).**
+
+```
+conf(x) = ‖(p₊(x) − p₋(x)) · A‖  =  f(τ, K, D)        # data-independent
+```
+
+τ-sweep on the trained model, an untrained twin, and pure random rows agree to three
+decimals at every τ (0.8532 / 0.8543 / 0.8547 at τ=0.1). Confidence is address
+*physics* — the norm of the soft codebook reconstruction of a generic unit row —
+and carries zero learned information. Monitor reclassified: sanity check, not signal.
+
+**The codebook under routing gradients (the restoring force, #26).** Shared across
+all 4 layers at **zero quality cost** (the only-delta control: bpb 2.835 vs 2.836),
+concentrating address pressure 4×. Under that pressure the random-init codebook's
+uniformity deviation traced **−0.0022 → −0.0070 (step 2000) → −0.0004 (step 10000)** —
+pushed out, pulled back, ending *closer to uniform than it started*, with the recovery
+beginning at ~84% of base lr (not a decay artifact). Simultaneously the antipodal
+parameter-pair fraction fell monotonically **53% → 38%** at constant uniform spread
+with rising address margin: near-antipodal parameter pairs are projectively redundant
+(`+A` already serves `−A` through the sign channel), and training prunes them —
+vocabulary-coverage optimization. The learned routing codebook converges on the same
+"near-uniform, alive, decisive" endpoint the recon-aleph reaches unforced.
+
+**The type codebook (the extraction analogue, [XB2]).**
+
+```
+T_t = normalize( mean over occurrences of trigram type t of k̂ )    # the data's vocabulary
+axes = collapse_to_axes(identify_antipodal_pairs(T))                # the program's exact rule
+profile = persistence(axes; canon'd arccos(dot); θ ∈ {20,30,45,60}°)
+```
+
+The published β₂ references (0.56 recon-aleph / 0.08 SVAE) are **extracted** codebooks;
+the type codebook is the routing-side analogue with the extraction performed by the
+shipping `inference/codebook.py` rule, replicated verbatim. Measured: text types
+**degenerate-class (dev −0.0624)** — the first formal statute-boundary crossing in the
+routing system — vs noise types uniform (−0.0062); β₂ text 0.018 ≈ noise 0.019 (both
+void-sparse). Caveats on record: head-averaged addresses may compress spread (per-head
+variant cleaner); frequent English trigrams share bytes (compositional-correlation
+confound); the type-level untrained control is pending (the cloud-level control was
+decisive: untrained = flat zero at all layers, both calibrations).
+
+**The two-hemisphere law (refines discovery #20).** Same substrate, same instrument,
+opposite writing:
+
+| | objective | in-dist extraction deviation | statute | β₂/axis | pressure |
+|---|---|---|---|---|---|
+| reconstruction | separate every code | **+0.083** | polytope | **0.56** (void-rich) | repulsive |
+| routing | associate related tokens | **−0.062** | degenerate-ward | **≤0.02** (void-sparse) | attractive |
+
+Mechanism: H₂ voids require points scaffolded *around* holes — repulsive polytope
+packing builds that scaffolding; attractive clumping collapses it. Therefore: *within*
+the reconstruction family (objective-sign constant) voids fingerprint the substrate
+(#20 stands); *across* objective families voids fingerprint **substrate × objective-
+sign**. The objective decides which way the language bends against the frame; both
+learned frames inhabit the same near-uniform attractor. The shared scaffold physics
+also extends quantitatively: the address projections' raw-weight column CV lands at
+0.136/0.158 — inside the CM band (#4) on an architecture class that did not exist
+before this session — and the projective margins (q 0.9457 / k 0.9476) sit between
+the faux-embedding batteries (0.929) and the recon-real gate (0.967).
+
+**Cross-jar identity (open).** ICP Procrustes (sign-aware assignment + orthogonal
+alignment, fp64 SVD) of the routing codebook against the hosted
+`aleph_byte_trigram_tied_hard_K64` codebook: residual 19.22° vs uniform-pair null
+21.28 ± 1.43° — **z = −1.43, suggestive, not significant**. The sharpened successor
+experiment is **type-matched**: the same 64 trigram types represented in both systems
+with correspondence *known* (no assignment ambiguity); if the relational geometry
+among the types transfers across jars beyond the rotation null while the surface signs
+flip, the conserved object — the lightning — is the type relation structure. Queued.
+
 ---
 
 ## 4. The data types, and why they are shaped this way
@@ -401,6 +575,19 @@ Behind the architecture sits the empirical battery — hundreds of trained model
 - **The same constant keeps surfacing.** 0.29154 appears as the CM CV phase boundary, the Nikola resonance gate, and the Constellation anchor-drift threshold — five architectures across three paradigms. The program records two honest framings: (A) a genuine constant of a universal geometric substrate, or (B) a strong shared prior many architectures converge to. The evidence tilts A but is not conclusive, and the published material says so plainly.
 - **Perplexity says the codebook is alive.** 125–126 of 128 oriented axes in soft use, 112–122 by hard argmax, margin stable — across both substrates and all three hosted runs, with `div_weight=0`. The near-uniform attractor the diagnostics kept finding in *extracted* codebooks shows up unforced in the *learned* one.
 
+**[2026-06-09 update — the statute mechanism extends to attention, with a depth
+dynamic the per-patch systems could not show.]** The routing system's layer-0 address
+clouds read uniform for both text and noise — but the trained-vs-untrained control is
+decisive (untrained: dev ≈ 0 at *all* layers, both calibrations), so the in-distribution
+deviation that exists (text −0.019 at L0) is 100% learned. With depth, the trained
+tower is a **funnel**: text organizes monotonically (−0.019 → −0.043 → −0.057 → −0.081,
+L0→L3) while noise is transiently clumped mid-tower and then *released* back toward
+uniform (−0.0005 → −0.071 → −0.057 → −0.041). The substrate signature lives in the
+trend direction at depth, not the level at any layer. The mundane component is known
+transformer anisotropy; the content-dependent differential release is not. At the type
+level the boundary formally breaks: text type codebook −0.0624 (degenerate-ward) vs
+noise −0.0062 — the attractive hemisphere of the two-hemisphere law (§3.13, #27).
+
 ---
 
 ## 9. The ease-of-use system
@@ -484,6 +671,13 @@ plus `SentenceEncoder` for text similarity/recovery (`mode='M'` raw rows or `mod
 - **The collective substrate (Beatrix).** geofractal v1.2.0 already ships the routers, ports, fusion strategies, and address components; WideCompiler already makes N frozen experts cost ~N/speedup in wall-time (primitive speedups measured up to 174× on A100-class hardware, near-linear tower scaling measured 4→32 towers). The aleph supplies what that machinery was waiting for: a compact, discrete, void-structured codebook that different experts can be aligned *to*.
 - **Vocabulary patchworks beyond text.** SentencePiece bits, binary trees, and ternary codes are validated substrates; `codebook_init` accepts geovocab pentachoron vertices directly; `'rotor'`/`'cayley'` decoders and the `'svd'` readout are reserved seams in the shipping code.
 
+- **[2026-06-09]** **The codebook as the medium of attention.** Aleph-routed
+  attention (§3.13) is running: O(n·K) GEMM-only routing at softmax parity, with the
+  codebook shared across layers at zero cost and a constant-size streaming memory whose
+  occupancy meters compressibility. The type-matched cross-jar alignment (same 64
+  trigram types in the recon and routing systems, correspondence known) is the queued
+  experiment for locating what is conserved between jars.
+
 ---
 
 ## 11. The discovery catalog
@@ -506,16 +700,23 @@ The condensed historical record across the geometric program — geolip, geofrac
 | 12 | fp64 SVD with autocast disabled is load-bearing; Triton fused thin-SVD (5000×) and FLEigh make it affordable | svd-triton articles, linalg-eigh-rehaul |
 | 13 | **Trained sphere-solvers are projective codebooks**: antipodal mutual-strongest collapse reads near-uniform ℝP^(D−1) axes out of every healthy solver (19 models D=3/4/5; h2-64 array dev +0.010 ± 0.013) | geometric-tri-band-ft2, implicit-solver-experiments |
 | 14 | `patch_idx=0` was a silent ~88% signal loss; patch aggregation must default to mean | inference rebuild postmortem |
-| 15 | **Statute classes**: uniform vs polytope vs degenerate, sign of deviation matters; statute is (model × calibration) | tri-frequency-ft3 + 000115 session |
+| 15 | **Statute classes**: uniform vs polytope vs degenerate, sign of deviation matters; statute is (model × calibration) **[2026-06-09: extends to attention address clouds; first in-distribution crossing in the NEGATIVE direction at the type level (−0.062, degenerate-ward) — see #27, #31]** | tri-frequency-ft3 + 000115 session |
 | 16 | Byte-trigram substrate engagement; "every float must carry signal" (hard-zero padding starves patches); channel count = n-gram order | byte_trigram sessions, geolip-svae-text |
 | 17 | 99.6% byte n-gram recall; 16.77M vocabulary potential; SentencePiece/bintree/ternary validated | May 1 findings post |
 | 18 | Frozen-battery transfer: Omega v2 76.0% CIFAR-10; end-to-end SVDTransformer 67.7% at 452K (5× smaller); S-class single instances don't teach | omega processor + SVD-transformer line |
 | 19 | D=24 is simultaneously the geometric phase boundary and the computational SVD-kernel cliff — the recurring dimension choice is not arbitrary | CM CV framework + kernel sweeps |
-| 20 | **Voids are a substrate fingerprint**: symbolic codebooks void-rich, continuous void-sparse, at fixed D; requires measuring persistence on ℝP, not S (metric-alignment fix); `omega_phase_v2` taxonomy | reading-voids-ft1 (May 31) |
+| 20 | **Voids are a substrate fingerprint**: symbolic codebooks void-rich, continuous void-sparse, at fixed D; requires measuring persistence on ℝP, not S (metric-alignment fix); `omega_phase_v2` taxonomy **[2026-06-09: refined — within the reconstruction family voids fingerprint SUBSTRATE; across objective families voids fingerprint substrate × OBJECTIVE-SIGN; see #27]** | reading-voids-ft1 (May 31) |
 | 21 | **The gate: M is recon-real** — tied linear decode at cosine ≈ 0.9997 on byte-trigram with no accumulator | aleph gate experiments (June) |
 | 22 | **The aleph address**: exact antipodal-softmax closed form (sinh/cosh ratio) makes a learned 2K-oriented-axis bottleneck trainable at 16.7M rows/step; recon survives full discretization (hard cos 0.992–0.997); codebook stays near-uniformly alive (ppl 125+/128) without regularization | aleph_model.py + geolip-aleph-void final_reports |
 | 23 | Recon-real codebooks address more sharply (margin 0.967 vs 0.929) and are ~7× void-richer (β₂/axis 0.56 vs 0.08) than faux-embedding ancestors | aleph gate vs battery comparison |
 | 24 | Infrastructure tier: WideCompiler N-first fusion (24 primitives + 5 Flux blocks; primitive speedups up to 174× measured on A100) ; geofractal geometric routing (near-linear 4→32 towers); geovocab2 formula library (cantor/cayley-menger/nikola/euler/hooke/newton/einstein/hawking) with pentachoron lexical synthesis and transfinite (ℵ) arithmetic | WideCompiler v0.7.0, geofractal v1.2.0, lattice_vocabulary v0.1.2 |
+| 25 | **The aleph address is a valid attention feature map** (2026-06-09): score = ⟨p(q̂), p(k̂)⟩ over 2K oriented axes, antipodally factored to K-wide GEMM; strictly positive denominator; softmax parity on recall and byte-trigram LM (bpb 2.835 vs 2.836); linear wall-clock to 65,536 tokens where softmax OOMs at 16,384 | session artifacts + logged A100/Blackwell runs 2026-06-09 |
+| 26 | **One vocabulary, many speakers + the restoring force** (2026-06-09): one codebook shared across all layers at zero quality cost; under 4× concentrated pressure the random-init codebook is pushed out (dev → −0.0070) and pulled back to −0.0004 — uniform locally ATTRACTS under attention gradients; antipodal parameter redundancy pruned 53% → 38% with rising margin | shared-codebook only-delta run, statute trajectory log |
+| 27 | **The two-hemisphere law** (2026-06-09): the objective sets the sign of in-distribution writing against the uniform frame — separation (recon) → repulsive → polytope (+0.083) + void-rich (0.56); association (routing) → attractive → degenerate-ward (−0.062) + void-sparse (≤0.02). Refines #20 to substrate × objective-sign | [XB2] type-codebook extraction vs aleph-gate comparison |
+| 28 | **Streaming codebook memory** (2026-06-09): the hub causal form is a recurrence with constant-size state (M±, z±), bit-exact vs the full pass; erank occupancy is a compressibility meter — text 16% vs noise 45% of memory bandwidth at 6,144 bytes of context | forward_stream exactness test + [ER] probe |
+| 29 | **Address confidence is a kernel invariant of (τ, K, D)** (2026-06-09): ‖(p₊−p₋)A‖ identical for trained / untrained / random rows at every τ — the 0.857 monitor closed as frame physics, zero learned information | [TAU] sweep, trained and control models |
+| 30 | **The CM band extends to attention address projections** (2026-06-09): q_addr/k_addr column-norm CV 0.136 / 0.158, inside 0.13–0.30, on an architecture class outside the original 65,536-config sweep (definition indicative; row CV is an orthogonal-init artifact) | [CV] probe |
+| 31 | **The trained depth funnel** (2026-06-09): mid-tower clumps all content, deep layers differentiate — text organizes monotonically (−0.019 → −0.081, L0→L3), noise is released back toward uniform; untrained control flat zero everywhere, so the organization is 100% learned | depth-profile probe + untrained control |
 
 ---
 
@@ -525,6 +726,14 @@ The condensed historical record across the geometric program — geolip, geofrac
 - Pure-cosine training is scale-blind (use `cosine_mse` when amplitude matters). Codebook collapse is the structural failure mode; it is monitored (perplexity/margin every eval) and treatable (`div_weight`), and has not occurred in published runs — but K, τ, and substrate combinations beyond those published are unmeasured.
 - Reconstruction targets the training substrates. This is a research artifact for geometric representation learning, not a general-purpose generative model.
 - The β₂ and margin comparisons quote the gate-regime codebook analysis; topological statistics at other (K, D, substrate) corners remain to be mapped with the same 15-signal battery.
+- **[2026-06-09]** Routing-side limitations, honestly: the bucket (hard-address) variant
+  is gradient-starved from cold start and unrescued (curriculum untested); the codebook-vs-
+  codebook Procrustes is suggestive only (z = −1.43); the type-codebook extraction carries
+  two unresolved caveats (head-averaging, frequent-trigram byte-sharing) and its untrained
+  control has not been run; the two "margins" of §3.10 remain non-interchangeable and the
+  routing monitors detect collapse only — structure evidence lives in deviation/statute/β₂;
+  the CM-band reading on address projections uses an indicative CV definition, not the
+  original sweep pipeline.
 
 ---
 
