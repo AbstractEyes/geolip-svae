@@ -2,7 +2,7 @@
 
 *A spherical autoencoder whose latent bottleneck **is** a learned projective address. Every formula in this article was read directly from the shipping code in [`geolip-svae`](https://github.com/AbstractEyes/geolip-svae); every number was read from a `final_report.json`, a model card, or a logged experiment.*
 
-*Revision 2026-06-09 22:30 UTC: §3.13 added (aleph-routed attention — the address as a feature map); discovery catalog extended #25–#31; dated updates in §2, §8, §10, §12 and catalog rows #15/#20. All new numbers are from logged 2026-06-09 session runs (RTX PRO 6000 Blackwell / A100-80GB); session artifacts: `aleph_routed_attention.py`, `aleph_trigram_lm.py`, `aleph_probe_battery.py`.*
+*Revision 2026-06-09 22:30 UTC: §3.13 added (aleph-routed attention — the address as a feature map); discovery catalog extended #25–#26; dated updates in §2, §8, §10, §12 and catalog rows #15/#20. All new numbers are from logged 2026-06-09 session runs (RTX PRO 6000 Blackwell / A100-80GB); session artifacts: `aleph_routed_attention.py`, `aleph_trigram_lm.py`, `aleph_probe_battery.py`.*
 
 **Model:** [AbstractPhil/geolip-aleph-void](https://huggingface.co/AbstractPhil/geolip-aleph-void) · **Code:** [AbstractEyes/geolip-svae](https://github.com/AbstractEyes/geolip-svae) · **Battery lineage:** [AbstractPhil/geolip-SVAE](https://huggingface.co/AbstractPhil/geolip-SVAE)
 
@@ -98,7 +98,7 @@ The model was not designed; it was cornered. Twenty research articles, ~191 mode
   linear wall-clock to 65,536 tokens where softmax attention OOMs at 16,384.
 - The probe battery (statutes, projective margins, Procrustes, CM band, persistence,
   state erank) was pointed at the new system; the verdict is the **two-hemisphere
-  law** (#27) and the **codebook-as-medium** synthesis of §3.13.
+  law** (#26) and the **codebook-as-medium** synthesis of §3.13.
 
 ---
 
@@ -378,7 +378,7 @@ outᵢ = (p₊(q̂ᵢ)M₊ + p₋(q̂ᵢ)M₋) / (p₊(q̂ᵢ)z₊ + p₋(q̂ᵢ
   is at most `2K`: **K is the bandwidth knob, τ is the hardness knob** (τ→0 recovers
   discrete bucket routing; τ→∞ collapses to mean-pooling).
 - *Quality* — softmax parity on associative recall and on the byte-trigram causal LM
-  (bpb 2.835 vs 2.836 at 10k steps, 6.7M params, the only-delta control of #26).
+  (bpb 2.835 vs 2.836 at 10k steps, 6.7M params, the only-delta control of #25).
 
 **Differentiation:** in the autoencoder the address produces `M̂`, the decode source
 (gradient: recon → M̂ → codebook). In routing the address produces a *communication
@@ -419,7 +419,7 @@ streamed context: **text 16% (≈10/64 effective dimensions) vs noise 45% (≈29
 language concentrates into a handful of axis-directions; incompressible noise sprawls.
 The streaming state is an entropy-rate proxy delivered by the architecture for free,
 and it implies large context headroom for language at K=64. **Differentiation:** the
-memory-side twin of the depth-funnel result (#31): the trained system *organizes* text
+memory-side twin of the depth-funnel result (#26): the trained system *organizes* text
 and *releases* noise, in both space (layers) and time (state).
 
 **Confidence is a kernel invariant (the 0.857 monitor, closed).**
@@ -433,7 +433,7 @@ decimals at every τ (0.8532 / 0.8543 / 0.8547 at τ=0.1). Confidence is address
 *physics* — the norm of the soft codebook reconstruction of a generic unit row —
 and carries zero learned information. Monitor reclassified: sanity check, not signal.
 
-**The codebook under routing gradients (the restoring force, #26).** Shared across
+**The codebook under routing gradients (the restoring force, #25).** Shared across
 all 4 layers at **zero quality cost** (the only-delta control: bpb 2.835 vs 2.836),
 concentrating address pressure 4×. Under that pressure the random-init codebook's
 uniformity deviation traced **−0.0022 → −0.0070 (step 2000) → −0.0004 (step 10000)** —
@@ -490,6 +490,36 @@ experiment is **type-matched**: the same 64 trigram types represented in both sy
 with correspondence *known* (no assignment ambiguity); if the relational geometry
 among the types transfers across jars beyond the rotation null while the surface signs
 flip, the conserved object — the lightning — is the type relation structure. Queued.
+
+**exp_007 — the seed battery (2026-06-11, 18 runs, 9 conditions x 2 seeds, full
+artifacts at `geolip-aleph-void/experiments/exp_007_aleph_routed_attention/`).**
+Three verdicts, each replicated across seeds:
+
+*1. The statute dose-response is REAL and three-tiered.* Measuring Δdev from each
+seed's own statute init (s1234 −0.0022, s5678 +0.0067), the group means order
+identically in both seeds: **zero-discrimination (byte, pointer) < pmix
+(discrimination without codebook gradient) < kernel (discrimination through the
+codebook)** — s1234: +0.0038 < +0.0079 < +0.0139; s5678: −0.0011 < +0.0013 <
++0.0048. Magnitude is seed-dependent (~3x larger from the s1234 init), ordering is
+not. The middle tier vindicates the failed preregistration of 06-10 by giving it a
+mechanism: pmix transmits **representation-mediated pressure** — the discrimination
+objective shapes h, and shaped h pressures the codebook through routing alone, at
+roughly half the direct-gradient dose. Fine structure *within* the kernel group
+(bank type) does not replicate and is noise.
+
+*2. The T7 bottleneck made visible (the 2x2 crossover).* Scorer gain at the
+515-bank: 0.172 bpb; at the 5783-bank: 0.464 bpb — interaction 0.292. Equivalently:
+the dense bank makes the kernel scorer WORSE (+0.165, landing at 2.825 ≈ the 2.826
+byte floor) and the pmix scorer BETTER (−0.127). This is the rank-(2K) bottleneck
+binding exactly where the theorem says it must — a rank-128 logit map cannot shape a
+5783-way distribution — and the MoS escape exploiting exactly what the kernel
+cannot. The interaction is the theorem, photographed.
+
+*3. Champion and the open throttle.* pmix8_dense: **2.323 bpb mean (2.302 best
+seed, 2.267 touched)** — 0.50 off the byte floor at matched ~6.8M params. mixH at
+J=8 still 0.97–0.99: all eight components saturated, so the measured branching
+factor of English at trigram granularity exceeds 8; J=16 is the next probe (note
+throughput: 285k→201k→147k tri/s for kernel→J4→J8; the JxM einsum is the cost).
 
 ---
 
@@ -586,7 +616,7 @@ uniform (−0.0005 → −0.071 → −0.057 → −0.041). The substrate signat
 trend direction at depth, not the level at any layer. The mundane component is known
 transformer anisotropy; the content-dependent differential release is not. At the type
 level the boundary formally breaks: text type codebook −0.0624 (degenerate-ward) vs
-noise −0.0062 — the attractive hemisphere of the two-hemisphere law (§3.13, #27).
+noise −0.0062 — the attractive hemisphere of the two-hemisphere law (§3.13, #26).
 
 ---
 
@@ -700,25 +730,21 @@ The condensed historical record across the geometric program — geolip, geofrac
 | 12 | fp64 SVD with autocast disabled is load-bearing; Triton fused thin-SVD (5000×) and FLEigh make it affordable | svd-triton articles, linalg-eigh-rehaul |
 | 13 | **Trained sphere-solvers are projective codebooks**: antipodal mutual-strongest collapse reads near-uniform ℝP^(D−1) axes out of every healthy solver (19 models D=3/4/5; h2-64 array dev +0.010 ± 0.013) | geometric-tri-band-ft2, implicit-solver-experiments |
 | 14 | `patch_idx=0` was a silent ~88% signal loss; patch aggregation must default to mean | inference rebuild postmortem |
-| 15 | **Statute classes**: uniform vs polytope vs degenerate, sign of deviation matters; statute is (model × calibration) **[2026-06-09: extends to attention address clouds; first in-distribution crossing in the NEGATIVE direction at the type level (−0.062, degenerate-ward) — see #27, #31]** | tri-frequency-ft3 + 000115 session |
+| 15 | **Statute classes**: uniform vs polytope vs degenerate, sign of deviation matters; statute is (model × calibration) **[2026-06-09: extends to attention address clouds; first in-distribution crossing in the NEGATIVE direction at the type level (−0.062, degenerate-ward) — see #26]** | tri-frequency-ft3 + 000115 session |
 | 16 | Byte-trigram substrate engagement; "every float must carry signal" (hard-zero padding starves patches); channel count = n-gram order | byte_trigram sessions, geolip-svae-text |
 | 17 | 99.6% byte n-gram recall; 16.77M vocabulary potential; SentencePiece/bintree/ternary validated | May 1 findings post |
 | 18 | Frozen-battery transfer: Omega v2 76.0% CIFAR-10; end-to-end SVDTransformer 67.7% at 452K (5× smaller); S-class single instances don't teach | omega processor + SVD-transformer line |
 | 19 | D=24 is simultaneously the geometric phase boundary and the computational SVD-kernel cliff — the recurring dimension choice is not arbitrary | CM CV framework + kernel sweeps |
-| 20 | **Voids are a substrate fingerprint**: symbolic codebooks void-rich, continuous void-sparse, at fixed D; requires measuring persistence on ℝP, not S (metric-alignment fix); `omega_phase_v2` taxonomy **[2026-06-09: refined — within the reconstruction family voids fingerprint SUBSTRATE; across objective families voids fingerprint substrate × OBJECTIVE-SIGN; see #27]** | reading-voids-ft1 (May 31) |
+| 20 | **Voids are a substrate fingerprint**: symbolic codebooks void-rich, continuous void-sparse, at fixed D; requires measuring persistence on ℝP, not S (metric-alignment fix); `omega_phase_v2` taxonomy **[2026-06-09: refined — within the reconstruction family voids fingerprint SUBSTRATE; across objective families voids fingerprint substrate × OBJECTIVE-SIGN; see #26]** | reading-voids-ft1 (May 31) |
 | 21 | **The gate: M is recon-real** — tied linear decode at cosine ≈ 0.9997 on byte-trigram with no accumulator | aleph gate experiments (June) |
 | 22 | **The aleph address**: exact antipodal-softmax closed form (sinh/cosh ratio) makes a learned 2K-oriented-axis bottleneck trainable at 16.7M rows/step; recon survives full discretization (hard cos 0.992–0.997); codebook stays near-uniformly alive (ppl 125+/128) without regularization | aleph_model.py + geolip-aleph-void final_reports |
 | 23 | Recon-real codebooks address more sharply (margin 0.967 vs 0.929) and are ~7× void-richer (β₂/axis 0.56 vs 0.08) than faux-embedding ancestors | aleph gate vs battery comparison |
 | 24 | Infrastructure tier: WideCompiler N-first fusion (24 primitives + 5 Flux blocks; primitive speedups up to 174× measured on A100) ; geofractal geometric routing (near-linear 4→32 towers); geovocab2 formula library (cantor/cayley-menger/nikola/euler/hooke/newton/einstein/hawking) with pentachoron lexical synthesis and transfinite (ℵ) arithmetic | WideCompiler v0.7.0, geofractal v1.2.0, lattice_vocabulary v0.1.2 |
-| 25 | **The aleph address is a valid attention feature map** (2026-06-09): score = ⟨p(q̂), p(k̂)⟩ over 2K oriented axes, antipodally factored to K-wide GEMM; strictly positive denominator; softmax parity on recall and byte-trigram LM (bpb 2.835 vs 2.836); linear wall-clock to 65,536 tokens where softmax OOMs at 16,384 | session artifacts + logged A100/Blackwell runs 2026-06-09 |
-| 26 | **One vocabulary, many speakers + the restoring force** (2026-06-09): one codebook shared across all layers at zero quality cost; under 4× concentrated pressure the random-init codebook is pushed out (dev → −0.0070) and pulled back to −0.0004 — uniform locally ATTRACTS under attention gradients; antipodal parameter redundancy pruned 53% → 38% with rising margin | shared-codebook only-delta run, statute trajectory log |
-| 27 | **The two-hemisphere law** (2026-06-09): the objective sets the sign of in-distribution writing against the uniform frame — separation (recon) → repulsive → polytope (+0.083) + void-rich (0.56); association (routing) → attractive → degenerate-ward (−0.062) + void-sparse (≤0.02). Refines #20 to substrate × objective-sign | [XB2] type-codebook extraction vs aleph-gate comparison |
-| 28 | **Streaming codebook memory** (2026-06-09): the hub causal form is a recurrence with constant-size state (M±, z±), bit-exact vs the full pass; erank occupancy is a compressibility meter — text 16% vs noise 45% of memory bandwidth at 6,144 bytes of context | forward_stream exactness test + [ER] probe |
-| 29 | **Address confidence is a kernel invariant of (τ, K, D)** (2026-06-09): ‖(p₊−p₋)A‖ identical for trained / untrained / random rows at every τ — the 0.857 monitor closed as frame physics, zero learned information | [TAU] sweep, trained and control models |
-| 30 | **The CM band extends to attention address projections** (2026-06-09): q_addr/k_addr column-norm CV 0.136 / 0.158, inside 0.13–0.30, on an architecture class outside the original 65,536-config sweep (definition indicative; row CV is an orthogonal-init artifact) | [CV] probe |
-| 31 | **The trained depth funnel** (2026-06-09): mid-tower clumps all content, deep layers differentiate — text organizes monotonically (−0.019 → −0.081, L0→L3), noise is released back toward uniform; untrained control flat zero everywhere, so the organization is 100% learned | depth-profile probe + untrained control |
+| 25 | **The aleph address is a valid attention feature map** (2026-06-09): score = ⟨p(q̂), p(k̂)⟩ over 2K oriented axes, K-wide GEMM, positive denominator; softmax parity (bpb 2.835 vs 2.836), linear to 65,536 tokens where softmax OOMs; codebook shared across all layers at zero cost, with an observed restoring force into uniform and antipodal-redundancy pruning (53%→38%); constant-size streaming memory whose erank occupancy meters compressibility (text 16% vs noise 45%); confidence closed as a kernel invariant of (τ,K,D); CM band holds on the address projections. Full formulas §3.13 | session artifacts + logged A100/Blackwell runs 2026-06-09 |
+| 26 | **The two-hemisphere law** (2026-06-09): the objective sets the sign of in-distribution writing against the uniform frame — separation (recon) → repulsive → polytope (+0.083) + void-rich (0.56); association (routing) → attractive → degenerate-ward (−0.062) + void-sparse (≤0.02). Refines #20 to substrate × objective-sign. Corroborated by the trained depth funnel (text organizes monotonically L0→L3, noise is released; untrained control flat zero — organization 100% learned) | [XB2] + depth-profile probe + untrained control, 2026-06-09 |
 
 ---
+| #27 | exp_007 seed battery: statute dose-response replicates three-tiered (zero < representation-mediated < direct); 2x2 scorer-bank crossover confirms T7 (kernel+dense = byte floor, pmix+dense = champion 2.323); J=8 saturated | seed-replicated, 18 runs | 2026-06-11 |
 
 ## 12. Limitations, honestly
 
