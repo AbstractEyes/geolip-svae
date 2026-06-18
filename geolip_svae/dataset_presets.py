@@ -16,6 +16,7 @@ Public surface:
         BinaryTreeDataset             (+ decode_image_to_trees, bit_recovery_metrics)
         SentencePieceBitDataset       (+ decode_image_to_tokens, token_bit_recovery_metrics)
         ByteTrigramDataset            (+ byte_recovery_metrics)
+        BertEmbeddingDataset          (+ embedding_recovery_metrics)
 
     Constants:
         NOISE_NAMES, TIERS
@@ -35,8 +36,8 @@ The factory layer is the single dispatch surface the trainer uses:
     bundle = get_dataset_bundle(cfg, channels=channels)
     bundle.train_loader   bundle.test_loader
     bundle.is_noise / is_text / is_image / is_tree / is_sentencepiece /
-        is_byte_trigram   — kind flags consumed by the trainer's
-                            per-kind logging / eval branches
+        is_byte_trigram / is_embedding   — kind flags consumed by the
+                            trainer's per-kind logging / eval branches
 """
 
 from __future__ import annotations
@@ -901,6 +902,175 @@ def byte_recovery_metrics(orig_bytes: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# BERT-EMBEDDING DATASET — semantic-embedding substrate
+# ═══════════════════════════════════════════════════════════════════
+
+class BertEmbeddingDataset(torch.utils.data.Dataset):
+    """Pooled BERT-family embeddings packed as (channels, img_size, img_size)
+    float tensors for the patch autoencoder's float-bus.
+
+    Each row of a {family}_NNN.pt shard of
+    ``AbstractPhil/conceptual-captions-12m-webdataset-berts`` is one 768-d
+    caption embedding. It is centered (anisotropy fix), normalized, and
+    reshaped to (C, H, W) with C·H·W == embed_dim. The mapping is exactly
+    invertible (see ``embedding_recovery_metrics``), so the SVAE / AlephModel
+    reconstructs semantic embeddings through the same pipeline as bytes/noise,
+    and reconstruction cosine is measurable.
+
+    BERT anisotropy (load-bearing): raw pooled embeddings are anisotropic — a
+    cosine/projective codebook over them mode-collapses (verified: ~49/64 axes
+    dead on raw pooled BERT). ``center='mean'`` (default) subtracts the shard
+    mean — the documented fix (0 dead, coherent clusters). ``center='whiten'``
+    additionally decorrelates (most uniform usage, but strips scale → low
+    absolute cosine). ``norm='l2'`` (default) puts each centered embedding on
+    the unit sphere, the directional quantity an embedding encodes — pair it
+    with loss_mode='cosine'. ``norm='standardize'`` z-scores per dim (MSE).
+
+    Args:
+        size: dataset length (samples yielded per epoch).
+        embed_dim: embedding dimension (768 for the published shards).
+        img_size, patch_size, channels: float-bus geometry; channels·img_size²
+            must equal embed_dim and img_size must be divisible by patch_size.
+            Default 3 / 16 / 4 → 768 = 3·16·16, 16 patches of 48.
+        family: bert | albert | distil | roberta | modern.
+        shard: shard index NNN.
+        center: 'mean' (default, anisotropy fix) | 'whiten' | 'none'.
+        norm: 'l2' (default, unit sphere; loss_mode='cosine') |
+              'standardize' (per-dim z-score; MSE) | 'none'.
+        repo: HF dataset repo id.
+        max_rows: subsample this many rows from the shard (RAM + centering-stat
+            budget). None = use all 500k (≈1.5 GB resident).
+        seed: window-sampling RNG seed (train 42 / val 999 convention).
+        synthetic_on_fail: if the shard can't be fetched, fall back to a
+            synthetic anisotropic gaussian so smoke runs stay offline-safe.
+    """
+
+    def __init__(self, size=100_000, embed_dim=768, img_size=16, patch_size=4,
+                 channels=3, family='bert', shard=0, center='mean', norm='l2',
+                 repo='AbstractPhil/conceptual-captions-12m-webdataset-berts',
+                 max_rows=100_000, seed=42, synthetic_on_fail=True):
+        self.size = size
+        self.embed_dim = embed_dim
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.channels = channels
+        self.center_mode = center
+        self.norm_mode = norm
+        if channels * img_size * img_size != embed_dim:
+            raise ValueError(
+                f"channels*img_size^2 ({channels}*{img_size}^2="
+                f"{channels * img_size * img_size}) must equal embed_dim={embed_dim}. "
+                f"For 768-d: channels=3,img_size=16 (or 12/8, 48/4, ...).")
+        if img_size % patch_size != 0:
+            raise ValueError(
+                f"img_size={img_size} must be divisible by patch_size={patch_size}")
+        self._rng = np.random.default_rng(seed)
+        self._call_count = 0
+
+        emb = self._load_shard(repo, family, shard, max_rows, embed_dim,
+                               synthetic_on_fail, seed).float()
+        self.n_rows = emb.shape[0]
+
+        # ── centering stats (anisotropy fix) computed on the loaded rows ──
+        self.mean = emb.mean(dim=0, keepdim=True)                    # (1, D)
+        self.whiten_mat = None
+        if center == 'whiten':
+            xc = emb - self.mean
+            cov = (xc.t() @ xc) / max(1, xc.shape[0] - 1)            # (D, D)
+            cov = cov + 1e-5 * torch.eye(embed_dim)
+            evals, evecs = torch.linalg.eigh(cov)                   # ascending
+            inv_sqrt = evals.clamp_min(1e-8) ** -0.5
+            self.whiten_mat = (evecs * inv_sqrt.unsqueeze(0)) @ evecs.t()  # ZCA (D, D)
+        # per-dim std AFTER centering (for 'standardize' norm)
+        self.std = (emb - self.mean).std(dim=0, keepdim=True).clamp_min(1e-6)  # (1, D)
+
+        self.emb = emb                                              # [n_rows, D] cpu
+        print(f"  [BertEmbeddingDataset] {family} shard {shard}: {self.n_rows:,} rows "
+              f"x {embed_dim}d → ({channels},{img_size},{img_size}); "
+              f"center={center} norm={norm}")
+
+    # ── shard loading (mmap subsample; synthetic fallback) ─────────────────
+    @staticmethod
+    def _load_shard(repo, family, shard, max_rows, embed_dim,
+                    synthetic_on_fail, seed):
+        fname = f"{family}_{shard:03d}.pt"
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=repo, filename=fname, repo_type='dataset')
+            try:
+                t = torch.load(path, map_location='cpu', mmap=True)  # lazy storage
+            except (TypeError, RuntimeError):
+                t = torch.load(path, map_location='cpu')             # older torch
+            if isinstance(t, dict):                                  # tolerate wrapped saves
+                t = next(v for v in t.values() if torch.is_tensor(v) and v.ndim == 2)
+            if max_rows is not None and t.shape[0] > max_rows:
+                g = torch.Generator().manual_seed(seed)
+                idx = torch.randperm(t.shape[0], generator=g)[:max_rows]
+                t = t[idx].clone()                                   # detach from mmap
+            return t
+        except Exception as e:
+            if not synthetic_on_fail:
+                raise
+            n = max_rows or 50_000
+            print(f"  [BertEmbeddingDataset] shard fetch failed "
+                  f"({type(e).__name__}); using synthetic anisotropic fallback "
+                  f"[{n}, {embed_dim}]")
+            g = torch.Generator().manual_seed(seed)
+            x = torch.randn(n, embed_dim, generator=g)
+            bias = torch.randn(1, embed_dim, generator=g) * 3.0      # dominant direction
+            scale = torch.linspace(3.0, 0.3, embed_dim).unsqueeze(0)  # anisotropic spectrum
+            return x * scale + bias
+
+    def __len__(self):
+        return self.size
+
+    def _prep(self, v: torch.Tensor) -> torch.Tensor:
+        """One embedding (D,) → (C, H, W) after center + norm."""
+        v = v.unsqueeze(0)                                          # (1, D)
+        if self.center_mode == 'whiten' and self.whiten_mat is not None:
+            v = (v - self.mean) @ self.whiten_mat
+        elif self.center_mode == 'mean':
+            v = v - self.mean
+        if self.norm_mode == 'l2':
+            v = F.normalize(v, dim=-1)
+        elif self.norm_mode == 'standardize':
+            v = v / self.std
+        return v.reshape(self.channels, self.img_size, self.img_size)
+
+    def __getitem__(self, idx):
+        self._call_count += 1
+        if self._call_count % 1000 == 0:
+            self._rng = np.random.default_rng(int.from_bytes(os.urandom(4), 'big'))
+        row = int(self._rng.integers(0, self.n_rows))
+        return self._prep(self.emb[row]), 0
+
+
+def embedding_recovery_metrics(orig_imgs: torch.Tensor,
+                               recon_imgs: torch.Tensor) -> Dict[str, Any]:
+    """Reconstruction quality for the BERT-embedding substrate.
+
+    Both args are ``[B, C, H, W]``; each is flattened back to the ``[B, D]``
+    embedding (inverse of the ``BertEmbeddingDataset`` packing) and compared.
+
+    Returns:
+        mean_cosine:    mean cosine similarity orig↔recon (the directional metric)
+        median_cosine:  median cosine (distribution centre)
+        p10_cosine:     10th-percentile cosine (worst-recovered tail)
+        mean_l2:        mean L2 distance between flattened embeddings
+    """
+    o = orig_imgs.flatten(1)
+    r = recon_imgs.flatten(1)
+    cos = F.cosine_similarity(o, r, dim=1)
+    l2 = (o - r).norm(dim=1)
+    return {
+        'mean_cosine': cos.mean().item(),
+        'median_cosine': cos.median().item(),
+        'p10_cosine': torch.quantile(cos, 0.10).item(),
+        'mean_l2': l2.mean().item(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # PER-TYPE EVALUATION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -946,6 +1116,7 @@ class DatasetBundle:
     is_tree:          bool = False
     is_sentencepiece: bool = False
     is_byte_trigram:  bool = False
+    is_embedding:     bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1139,6 +1310,43 @@ def _byte_trigram_factory(cfg: Dict[str, Any], channels: int) -> DatasetBundle:
     )
 
 
+def _bert_embedding_factory(cfg: Dict[str, Any], channels: int) -> DatasetBundle:
+    """Factory for the 'cc12m_bert' dataset (pooled BERT-family embeddings
+    packed into the float-bus). Reads bert_* keys from cfg."""
+    ds_size = cfg.get('ds_size', 100_000)
+    val_size = cfg.get('val_size', 2_000)
+    img_size = cfg['img_size']
+    bs = cfg['batch_size']
+    patch_size = cfg['patch_size']
+    common = dict(
+        embed_dim=cfg.get('bert_embed_dim', 768),
+        img_size=img_size, patch_size=patch_size, channels=channels,
+        family=cfg.get('bert_family', 'bert'),
+        shard=cfg.get('bert_shard', 0),
+        center=cfg.get('bert_center', 'mean'),
+        norm=cfg.get('bert_norm', 'l2'),
+        repo=cfg.get('bert_repo',
+                     'AbstractPhil/conceptual-captions-12m-webdataset-berts'),
+        max_rows=cfg.get('bert_max_rows', 100_000),
+        synthetic_on_fail=cfg.get('bert_synthetic_on_fail', True),
+    )
+    train_ds = BertEmbeddingDataset(size=ds_size, seed=42, **common)
+    val_ds = BertEmbeddingDataset(size=val_size, seed=999, **common)
+    # num_workers=0: the embedding matrix is large; __getitem__ is a cheap index.
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=bs, shuffle=True,
+        num_workers=0, pin_memory=True, drop_last=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=bs, shuffle=False,
+        num_workers=0, pin_memory=True,
+    )
+    return DatasetBundle(
+        train_loader=train_loader, test_loader=test_loader, is_embedding=True,
+        extra={'embed_dim': common['embed_dim'], 'family': common['family']},
+    )
+
+
 # ── Registry ────────────────────────────────────────────────────────
 
 DATASET_FACTORIES: Dict[str, Callable[[Dict[str, Any], int], DatasetBundle]] = {
@@ -1155,6 +1363,8 @@ DATASET_FACTORIES: Dict[str, Callable[[Dict[str, Any], int], DatasetBundle]] = {
     'binary_tree':       _binary_tree_factory,
     'sentencepiece_bits':_sentencepiece_factory,
     'byte_trigram':      _byte_trigram_factory,
+    # Semantic embeddings
+    'cc12m_bert':        _bert_embedding_factory,
 }
 
 
@@ -1163,9 +1373,9 @@ def get_dataset_bundle(cfg: Dict[str, Any], channels: int = 3) -> DatasetBundle:
 
     Replaces the if/elif dataset-dispatch block the trainer used to carry
     inline. Channel count is threaded through to every factory so
-    channel-aware datasets (noise, byte_trigram) emit C-channel tensors;
-    channel-agnostic ones (image / text / tree / sentencepiece) ignore
-    the kwarg.
+    channel-aware datasets (noise, byte_trigram, cc12m_bert) emit C-channel
+    tensors; channel-agnostic ones (image / text / tree / sentencepiece)
+    ignore the kwarg.
     """
     name = cfg.get('dataset')
     if name not in DATASET_FACTORIES:
@@ -1191,6 +1401,7 @@ __all__ = [
     'SentencePieceBitDataset', 'decode_image_to_tokens',
     'token_bit_recovery_metrics',
     'ByteTrigramDataset', 'byte_recovery_metrics',
+    'BertEmbeddingDataset', 'embedding_recovery_metrics',
     # Eval
     'eval_per_type',
     # Factory layer
